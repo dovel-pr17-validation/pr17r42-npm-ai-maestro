@@ -1,0 +1,114 @@
+'use client'
+
+import { useEffect, useRef, useCallback, useState } from 'react'
+
+interface UseCompanionWebSocketOptions {
+  agentId: string | null
+  onSpeech: (text: string) => void
+  onInterrupt?: () => void
+}
+
+/**
+ * Hook for bidirectional communication with the server's cerebellum voice subsystem.
+ * Connects to /companion-ws?agent={agentId}, receives speech events,
+ * and can send user messages back to the voice subsystem.
+ */
+export type CompanionWsStatus = 'connecting' | 'open' | 'failed'
+
+export function useCompanionWebSocket({ agentId, onSpeech, onInterrupt }: UseCompanionWebSocketOptions) {
+  const onSpeechRef = useRef(onSpeech)
+  onSpeechRef.current = onSpeech
+  const onInterruptRef = useRef(onInterrupt)
+  onInterruptRef.current = onInterrupt
+
+  const wsRef = useRef<WebSocket | null>(null)
+  // 'failed' once the retries are used up; 'connecting' covers the first attempt and reconnects
+  const [status, setStatus] = useState<CompanionWsStatus>('connecting')
+
+  const send = useCallback((data: Record<string, unknown>) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      try {
+        wsRef.current.send(JSON.stringify(data))
+      } catch {
+        // Ignore send errors
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!agentId) return
+    setStatus('connecting')
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const wsUrl = `${protocol}//${window.location.host}/companion-ws?agent=${encodeURIComponent(agentId)}`
+
+    let ws: WebSocket | null = null
+    let mounted = true
+    let retryCount = 0
+    const maxRetries = 5
+    const retryDelays = [1000, 2000, 3000, 5000, 10000]
+
+    function connect() {
+      if (!mounted) return
+
+      // Close any existing socket to prevent orphaned connections
+      if (ws && ws.readyState !== WebSocket.CLOSED) {
+        ws.close()
+      }
+
+      ws = new WebSocket(wsUrl)
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        retryCount = 0
+        setStatus('open')
+        console.log('[CompanionWS] Connected for agent', agentId?.substring(0, 8))
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          if (data.type === 'speech' && data.text) {
+            onSpeechRef.current(data.text)
+          } else if (data.type === 'interrupt') {
+            onInterruptRef.current?.()
+          }
+        } catch {
+          // Ignore non-JSON messages
+        }
+      }
+
+      ws.onclose = () => {
+        // Guard against stale closures from orphaned sockets
+        if (wsRef.current !== ws) return
+        wsRef.current = null
+        if (!mounted) return
+        if (retryCount < maxRetries) {
+          const delay = retryDelays[retryCount] || retryDelays[retryDelays.length - 1]
+          retryCount++
+          setStatus('connecting')
+          setTimeout(connect, delay)
+        } else {
+          setStatus('failed')
+        }
+      }
+
+      ws.onerror = () => {
+        // onclose will handle reconnection
+      }
+    }
+
+    connect()
+
+    return () => {
+      mounted = false
+      if (ws) {
+        ws.close()
+        ws = null
+      }
+      wsRef.current = null
+    }
+  }, [agentId])
+
+  return { send, status }
+}

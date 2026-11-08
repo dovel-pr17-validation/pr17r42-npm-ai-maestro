@@ -1,0 +1,1060 @@
+/**
+ * Delta Indexing Engine
+ *
+ * Core logic for discovering and indexing new conversation messages.
+ * Extracted from the API route to be callable directly (no HTTP overhead).
+ *
+ * Performance optimizations:
+ * - fs.statSync().size for delta detection (no file reads for unchanged files)
+ * - Global project discovery cache (scan once, share across agents)
+ * - Single file read per conversation (no triple reads)
+ * - Throttled to MAX_CONCURRENT_INDEX=1 to prevent CPU overload
+ */
+
+import { agentRegistry } from '@/lib/agent'
+import { AgentDatabase } from '@/lib/cozo-db'
+import { getConversations, recordConversation, recordProject, getProjects, getSessions } from '@/lib/cozo-schema-simple'
+import { indexConversationDelta } from '@/lib/rag/ingest'
+import { getAgent as getRegistryAgent, getAgentBySession, updateAgentWorkingDirectory, listAgents } from '@/lib/agent-registry'
+import { computeSessionName } from '@/types/agent'
+import * as fs from 'fs'
+import * as path from 'path'
+import * as os from 'os'
+import { shouldLogChange } from './log-on-change'
+import { listCopilotSessions, realDir, isCopilotAgent, copilotHomeOf, isCopilotLine } from '@/lib/transcript-copilot.mjs'
+import { summarizeJsonl } from './jsonl'
+
+// ============================================================================
+// THROTTLING: Limit concurrent Delta Index operations to prevent CPU overload
+// ============================================================================
+const MAX_CONCURRENT_INDEX = 1
+// One throttle for the whole process: Next can bundle this module more than once, and a counter per
+// bundle let several indexes run at once
+type IndexQueueEntry = { resolve: () => void; agentId: string; timestamp: number }
+const throttle: { active: number; queue: IndexQueueEntry[]; waiting: Map<string, Promise<IndexDeltaResult>> } =
+  ((globalThis as any)._aimDeltaThrottle ??= { active: 0, queue: [], waiting: new Map() })
+const indexQueue = throttle.queue
+
+async function acquireIndexSlot(agentId: string): Promise<() => void> {
+  if (throttle.active < MAX_CONCURRENT_INDEX) {
+    throttle.active++
+    console.log(`[Delta Index Throttle] Acquired slot for ${agentId.substring(0, 8)} (${throttle.active}/${MAX_CONCURRENT_INDEX} active)`)
+    return () => releaseIndexSlot(agentId)
+  }
+
+  console.log(`[Delta Index Throttle] ${agentId.substring(0, 8)} queued (${indexQueue.length + 1} waiting)`)
+
+  return new Promise((resolve) => {
+    indexQueue.push({
+      resolve: () => {
+        throttle.active++
+        console.log(`[Delta Index Throttle] Acquired slot for ${agentId.substring(0, 8)} from queue (${throttle.active}/${MAX_CONCURRENT_INDEX} active)`)
+        resolve(() => releaseIndexSlot(agentId))
+      },
+      agentId,
+      timestamp: Date.now()
+    })
+  })
+}
+
+function releaseIndexSlot(agentId: string) {
+  throttle.active--
+  console.log(`[Delta Index Throttle] Released slot for ${agentId.substring(0, 8)} (${throttle.active}/${MAX_CONCURRENT_INDEX} active, ${indexQueue.length} queued)`)
+
+  if (indexQueue.length > 0) {
+    const next = indexQueue.shift()!
+    const waitTime = Date.now() - next.timestamp
+    console.log(`[Delta Index Throttle] Processing queued ${next.agentId.substring(0, 8)} (waited ${waitTime}ms)`)
+    next.resolve()
+  }
+}
+
+// ============================================================================
+// FILE SIZE CACHE: Track file sizes to avoid reading unchanged files
+// ============================================================================
+const fileSizeCache = new Map<string, number>()
+
+function hasFileChanged(filePath: string): boolean {
+  try {
+    const currentSize = fs.statSync(filePath).size
+    const cachedSize = fileSizeCache.get(filePath)
+    if (cachedSize !== undefined && cachedSize === currentSize) {
+      return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
+
+function updateFileSizeCache(filePath: string, indexedSize?: number) {
+  try {
+    const size = fs.statSync(filePath).size
+    // If the file grew while embeddings were running, its appended lines were
+    // outside the ingestion snapshot. Do not mark those new bytes as indexed.
+    if (indexedSize !== undefined && size !== indexedSize) {
+      fileSizeCache.delete(filePath)
+      return
+    }
+    fileSizeCache.set(filePath, size)
+  } catch {
+    // ignore
+  }
+}
+
+// ============================================================================
+// PROJECT DISCOVERY CACHE: Scan ~/.claude/projects/ once, share across agents
+// ============================================================================
+interface CachedJsonlFile {
+  path: string
+  sessionId: string | null
+  cwd: string | null
+}
+
+let projectDiscoveryCache: {
+  files: CachedJsonlFile[]
+  timestamp: number
+} | null = null
+
+const PROJECT_CACHE_TTL = 10 * 60 * 1000 // 10 minutes
+
+function getCachedProjectFiles(): CachedJsonlFile[] {
+  const now = Date.now()
+  if (projectDiscoveryCache && (now - projectDiscoveryCache.timestamp) < PROJECT_CACHE_TTL) {
+    return projectDiscoveryCache.files
+  }
+
+  // Rebuild cache
+  const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects')
+  if (!fs.existsSync(claudeProjectsDir)) {
+    projectDiscoveryCache = { files: [], timestamp: now }
+    return []
+  }
+
+  const findJsonlFiles = (dir: string): string[] => {
+    const files: string[] = []
+    try {
+      const items = fs.readdirSync(dir)
+      for (const item of items) {
+        const itemPath = path.join(dir, item)
+        try {
+          const stats = fs.statSync(itemPath)
+          if (stats.isDirectory()) {
+            files.push(...findJsonlFiles(itemPath))
+          } else if (item.endsWith('.jsonl')) {
+            files.push(itemPath)
+          }
+        } catch {
+          // Skip
+        }
+      }
+    } catch {
+      // Skip
+    }
+    return files
+  }
+
+  const allPaths = findJsonlFiles(claudeProjectsDir)
+  const files: CachedJsonlFile[] = []
+
+  for (const jsonlPath of allPaths) {
+    try {
+      // Read only the first 4KB to extract metadata (sessionId, cwd)
+      const fd = fs.openSync(jsonlPath, 'r')
+      const buf = Buffer.alloc(4096)
+      const bytesRead = fs.readSync(fd, buf, 0, 4096, 0)
+      fs.closeSync(fd)
+
+      const header = buf.toString('utf-8', 0, bytesRead)
+      const firstLines = header.split('\n').slice(0, 20)
+
+      let sessionId: string | null = null
+      let cwd: string | null = null
+
+      for (const line of firstLines) {
+        if (!line.trim()) continue
+        try {
+          const message = JSON.parse(line)
+          if (message.sessionId && !sessionId) sessionId = message.sessionId
+          if (message.cwd && !cwd) cwd = message.cwd
+        } catch {
+          // Skip malformed
+        }
+      }
+
+      files.push({ path: jsonlPath, sessionId, cwd })
+    } catch {
+      // Skip
+    }
+  }
+
+  console.log(`[Delta Index] Project discovery cache rebuilt: ${files.length} files (TTL: ${PROJECT_CACHE_TTL / 60000}m)`)
+  projectDiscoveryCache = { files, timestamp: now }
+  return files
+}
+
+// ============================================================================
+// COPILOT SESSIONS (~/.copilot/session-state/<session>/events.jsonl)
+// ============================================================================
+// A Copilot agent's conversations live in a different place and format than Claude's. The
+// agent's memory is built on the host where the agent lives, from files on this host, so
+// nothing here crosses hosts. Sessions are matched to an agent by the working directory the
+// session started in (session.start data.context.cwd), all of them, not only the newest.
+
+interface CopilotSession { path: string; sessionId: string; cwd: string; mtimeMs: number }
+
+// One cache entry per Copilot home: an agent with its own COPILOT_HOME keeps its sessions there.
+const copilotSessionCache = new Map<string, { sessions: CopilotSession[]; timestamp: number }>()
+const COPILOT_CACHE_TTL = 2 * 60 * 1000 // a new session shows up within two minutes
+
+function getCopilotSessions(home?: string | null): CopilotSession[] {
+  const now = Date.now()
+  const key = home || ''
+  const hit = copilotSessionCache.get(key)
+  if (hit && now - hit.timestamp < COPILOT_CACHE_TTL) return hit.sessions
+  const sessions = listCopilotSessions(home || undefined) as CopilotSession[]
+  copilotSessionCache.set(key, { sessions, timestamp: now })
+  return sessions
+}
+
+/** For tests: forget the cached session list. */
+export function resetCopilotSessionCache(): void {
+  copilotSessionCache.clear()
+}
+
+/** Is this agent a GitHub Copilot CLI agent? */
+function agentIsCopilot(agentId: string): boolean {
+  try {
+    const a = getRegistryAgent(agentId) || getAgentBySession(agentId)
+    return !!a && isCopilotAgent(a)
+  } catch {
+    return false
+  }
+}
+
+/** The agent's own COPILOT_HOME, or null for the shared default. */
+function agentCopilotHome(agentId: string): string | null {
+  try {
+    const a = getRegistryAgent(agentId) || getAgentBySession(agentId)
+    return a ? copilotHomeOf(a) : null
+  } catch {
+    return null
+  }
+}
+
+/** cwdBelongsTo, also when one side is reached through a symlink (macOS /tmp -> /private/tmp) */
+function copilotCwdBelongsTo(cwd: string, agentWd: string, otherWds: string[]): boolean {
+  if (cwdBelongsTo(cwd, agentWd, otherWds)) return true
+  return cwdBelongsTo(realDir(cwd), realDir(agentWd), otherWds.map(realDir))
+}
+
+/** The Copilot sessions that belong to an agent working in any of `wds` (all of them). */
+function copilotSessionsFor(agentId: string, wds: string[]): CopilotSession[] {
+  const otherWds = otherAgentWorkingDirs(agentId)
+  return getCopilotSessions(agentCopilotHome(agentId)).filter((s) => wds.some((wd) => copilotCwdBelongsTo(s.cwd, wd, otherWds)))
+}
+
+// ============================================================================
+// AUTO-DISCOVER PROJECTS (uses global cache)
+// ============================================================================
+/**
+ * The top-level Claude project directory for a working directory.
+ *
+ * Claude Code encodes a cwd by replacing separators with '-', so
+ * /Users/me/repo lives at ~/.claude/projects/-Users-me-repo.
+ */
+function topLevelClaudeDir(projectPath: string): string {
+  return path.join(os.homedir(), '.claude', 'projects', projectPath.replace(/\//g, '-'))
+}
+
+/**
+ * Working directories of every OTHER registered agent, longest first.
+ *
+ * Used to resolve ownership when directories nest: if agent A works in
+ * /repo and agent B in /repo/service, a conversation started in
+ * /repo/service belongs to B, not both. Without this, prefix matching would
+ * let the outer agent swallow every inner agent's conversations.
+ */
+function otherAgentWorkingDirs(agentId: string): string[] {
+  try {
+    return listAgents()
+      .filter((a: any) => a.id !== agentId)
+      .flatMap((a: any) => [a.workingDirectory, a.sessions?.[0]?.workingDirectory])
+      .filter((d: any): d is string => typeof d === 'string' && d.length > 0)
+      .sort((a, b) => b.length - a.length)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Does `cwd` belong to an agent working in `agentWd`?
+ *
+ * Exact match, or a DESCENDANT of it — a subagent or a session started in a
+ * child directory has a deeper cwd (e.g. an agent in /repo and a subagent in
+ * /repo/packages/api), and exact-equality matching made those conversations
+ * invisible to the agent that owns them. Surveyed across the fleet, this and
+ * stale bindings accounted for 87 of 163 agents having wrong or incomplete
+ * memory.
+ *
+ * A descendant is NOT claimed when another agent sits closer to it.
+ */
+function cwdBelongsTo(cwd: string, agentWd: string, otherWds: string[]): boolean {
+  if (cwd === agentWd) return true
+  if (!cwd.startsWith(agentWd.endsWith('/') ? agentWd : agentWd + '/')) return false
+  // otherWds is sorted longest-first; a longer match is a more specific owner.
+  return !otherWds.some(
+    (o) => o.length > agentWd.length && (cwd === o || cwd.startsWith(o.endsWith('/') ? o : o + '/'))
+  )
+}
+
+async function autoDiscoverProjects(
+  agentDb: AgentDatabase,
+  agentId: string,
+  workingDirectories: Set<string>
+): Promise<number> {
+  console.log(`[Delta Index] Auto-discovering projects for agent ${agentId.substring(0, 8)}...`)
+
+  const agentSessionIds = new Set<string>()
+  try {
+    const sessionsResult = await getSessions(agentDb, agentId)
+    for (const row of sessionsResult.rows) {
+      agentSessionIds.add(row[0] as string)
+    }
+  } catch {
+    // Sessions table might not exist
+  }
+
+  // Use global cache instead of scanning per-agent
+  const allFiles = getCachedProjectFiles()
+
+  const discoveredProjects = new Map<string, { projectName: string; claudeDir?: string }>()
+  let matchedConversations = 0
+
+  const otherWds = otherAgentWorkingDirs(agentId)
+  const ownWds = Array.from(workingDirectories)
+
+  for (const file of allFiles) {
+    const belongsToAgent =
+      (file.sessionId && agentSessionIds.has(file.sessionId)) ||
+      (file.cwd && ownWds.some((wd) => cwdBelongsTo(file.cwd as string, wd, otherWds))) ||
+      file.path.includes(agentId) ||
+      (file.cwd && file.cwd.includes(agentId))
+
+    if (belongsToAgent && file.cwd) {
+      matchedConversations++
+      if (!discoveredProjects.has(file.cwd)) {
+        const projectName = file.cwd.split('/').pop() || 'unknown'
+        // Derive the top-level Claude project directory, not a subdirectory.
+        // Files may be nested (e.g. <project-slug>/<session>/subagents/agent.jsonl)
+        // but the project dir is always ~/.claude/projects/<project-slug>/
+        const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects')
+        const relToProjects = path.relative(claudeProjectsDir, file.path)
+        const projectSlug = relToProjects.split(path.sep)[0]
+        const claudeDir = path.join(claudeProjectsDir, projectSlug)
+        discoveredProjects.set(file.cwd, { projectName, claudeDir })
+        console.log(`[Delta Index] Auto-discovered project: ${projectName} (${file.cwd})`)
+      }
+    }
+  }
+
+  // A Copilot agent's projects come from its Copilot sessions, which have no Claude directory
+  // (claude_dir stays unset). A session started in a sub-directory binds the project to that
+  // directory, as a Claude conversation does.
+  if (agentIsCopilot(agentId)) {
+    for (const session of copilotSessionsFor(agentId, ownWds)) {
+      matchedConversations++
+      if (!discoveredProjects.has(session.cwd)) {
+        discoveredProjects.set(session.cwd, { projectName: session.cwd.split('/').pop() || 'unknown' })
+        console.log(`[Delta Index] Auto-discovered Copilot project: ${session.cwd}`)
+      }
+    }
+  }
+
+  for (const [projectPath, { projectName, claudeDir }] of discoveredProjects) {
+    try {
+      await recordProject(agentDb, {
+        project_path: projectPath,
+        project_name: projectName,
+        claude_dir: claudeDir
+      })
+    } catch (err) {
+      console.error(`[Delta Index] Failed to record project ${projectName}:`, err)
+    }
+  }
+
+  console.log(`[Delta Index] Auto-discovered ${discoveredProjects.size} project(s) from ${matchedConversations} conversation(s)`)
+  return discoveredProjects.size
+}
+
+// ============================================================================
+// GET LIVE TMUX WORKING DIRECTORY
+// ============================================================================
+/**
+ * Whether the stored working directory should follow the live tmux directory.
+ * Never when the live directory is the home folder: that is where tmux puts a
+ * session whose folder was missing at wake, not where the agent works. Copying
+ * it into the record sent the next wake to the home folder again.
+ */
+export function shouldSyncWorkingDirectory(stored: string | undefined, live: string | null, home: string = os.homedir()): boolean {
+  if (!live || !stored || live === stored) return false
+  if (path.resolve(live) === path.resolve(home)) return false
+  return true
+}
+
+async function getLiveTmuxWorkingDirectory(sessionName: string): Promise<string | null> {
+  try {
+    const { getRuntime } = await import('@/lib/agent-runtime')
+    const runtime = getRuntime()
+    const pwd = await runtime.getWorkingDirectory(sessionName)
+    return pwd || null
+  } catch {
+    return null
+  }
+}
+
+// ============================================================================
+// EXTRACT COPILOT CONVERSATION METADATA
+// ============================================================================
+function extractCopilotMetadata(
+  jsonlPath: string,
+  summary: { head: string[]; tail: string[]; messageCount: number },
+  projectPath: string,
+): Awaited<ReturnType<typeof extractConversationMetadata>> {
+  const { head, tail, messageCount } = summary
+  let sessionId: string | null = null
+  let cwd: string | null = null
+  let firstUserMessage: string | null = null
+  let copilotVersion: string | null = null
+  let firstMessageAt: number | null = null
+  let lastMessageAt: number | null = null
+  const models = new Set<string>()
+
+  const parse = (line: string): any => { try { return JSON.parse(line) } catch { return null } }
+
+  for (const line of head) {
+    const ev = parse(line)
+    if (!ev || !isCopilotLine(ev)) continue
+    if (ev.type === 'session.start') {
+      sessionId = ev.data?.sessionId || sessionId
+      cwd = ev.data?.context?.cwd || cwd
+      copilotVersion = ev.data?.copilotVersion ? `Copilot ${ev.data.copilotVersion}` : copilotVersion
+      if (ev.data?.selectedModel) models.add(String(ev.data.selectedModel))
+    }
+    if (ev.timestamp) {
+      const ts = new Date(ev.timestamp).getTime()
+      if (!Number.isNaN(ts) && (!firstMessageAt || ts < firstMessageAt)) firstMessageAt = ts
+    }
+    if (ev.type === 'user.message' && !firstUserMessage && typeof ev.data?.content === 'string') {
+      firstUserMessage = ev.data.content.substring(0, 100).replace(/[\n\r]/g, ' ').trim()
+    }
+  }
+  for (let i = tail.length - 1; i >= 0; i--) {
+    const ev = parse(tail[i])
+    if (ev?.timestamp) {
+      const ts = new Date(ev.timestamp).getTime()
+      if (!Number.isNaN(ts)) { lastMessageAt = ts; break }
+    }
+  }
+
+  return {
+    // The session id is the folder name; it matches data.sessionId in a real session
+    sessionId: sessionId || path.basename(path.dirname(jsonlPath)),
+    cwd: cwd || projectPath,
+    firstUserMessage,
+    gitBranch: null,
+    claudeVersion: copilotVersion,
+    firstMessageAt,
+    lastMessageAt,
+    modelNames: Array.from(models).join(', '),
+    messageCount,
+  }
+}
+
+// ============================================================================
+// EXTRACT CONVERSATION METADATA (reads file once, extracts everything)
+// ============================================================================
+export async function extractConversationMetadata(jsonlPath: string, projectPath: string): Promise<{
+  sessionId: string | null
+  cwd: string | null
+  firstUserMessage: string | null
+  gitBranch: string | null
+  claudeVersion: string | null
+  firstMessageAt: number | null
+  lastMessageAt: number | null
+  modelNames: string
+  messageCount: number
+}> {
+  const summary = await summarizeJsonl(jsonlPath)
+  const { head, tail, messageCount } = summary
+
+  // A Copilot events.jsonl (dotted event types, session.start first) has its own metadata
+  try {
+    if (isCopilotLine(JSON.parse(head[0] || ''))) return extractCopilotMetadata(jsonlPath, summary, projectPath)
+  } catch { /* not a Copilot file: read it as a Claude transcript */ }
+
+  let sessionId: string | null = null
+  let cwd: string | null = null
+  let firstUserMessage: string | null = null
+  let gitBranch: string | null = null
+  let claudeVersion: string | null = null
+  let firstMessageAt: number | null = null
+  let lastMessageAt: number | null = null
+  const modelSet = new Set<string>()
+
+  const metadataLines = head
+  for (const line of metadataLines) {
+    try {
+      const message = JSON.parse(line)
+      if (message.sessionId && !sessionId) sessionId = message.sessionId
+      if (message.cwd && !cwd) cwd = message.cwd
+      if (message.gitBranch && !gitBranch) gitBranch = message.gitBranch
+      if (message.version && !claudeVersion) claudeVersion = message.version
+      if (message.timestamp) {
+        const ts = new Date(message.timestamp).getTime()
+        if (!firstMessageAt || ts < firstMessageAt) firstMessageAt = ts
+      }
+      if (message.type === 'user' && message.message?.content && !firstUserMessage) {
+        const content = message.message.content
+        firstUserMessage = content.substring(0, 100).replace(/[\n\r]/g, ' ').trim()
+      }
+      if (message.type === 'assistant' && message.message?.model) {
+        const model = message.message.model
+        if (model.includes('sonnet')) modelSet.add('Sonnet 4.5')
+        else if (model.includes('haiku')) modelSet.add('Haiku 4.5')
+        else if (model.includes('opus')) modelSet.add('Opus 4.5')
+      }
+    } catch {
+      // Skip malformed
+    }
+  }
+
+  for (let i = tail.length - 1; i >= 0; i--) {
+    try {
+      const message = JSON.parse(tail[i])
+      if (message.timestamp) {
+        lastMessageAt = new Date(message.timestamp).getTime()
+        break
+      }
+    } catch {
+      // Skip
+    }
+  }
+
+  return {
+    sessionId,
+    cwd: cwd || projectPath,
+    firstUserMessage,
+    gitBranch,
+    claudeVersion,
+    firstMessageAt,
+    lastMessageAt,
+    modelNames: Array.from(modelSet).join(', '),
+    messageCount
+  }
+}
+
+// ============================================================================
+// STREAMING LINE COUNTER (avoids loading entire file into memory)
+// ============================================================================
+function countFileLines(filePath: string): number {
+  const buffer = Buffer.alloc(64 * 1024) // 64KB read buffer
+  const fd = fs.openSync(filePath, 'r')
+  let count = 0
+  let bytesRead: number
+  let leftover = ''
+
+  try {
+    while ((bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+      const chunk = leftover + buffer.toString('utf-8', 0, bytesRead)
+      const lines = chunk.split('\n')
+      leftover = lines.pop() || ''
+      for (const line of lines) {
+        if (line.trim()) count++
+      }
+    }
+    if (leftover.trim()) count++
+  } finally {
+    fs.closeSync(fd)
+  }
+  return count
+}
+
+// ============================================================================
+// MAIN ENTRY: runIndexDelta — callable directly (no HTTP)
+// ============================================================================
+export interface IndexDeltaResult {
+  success: boolean
+  agent_id: string
+  message?: string
+  dry_run?: boolean
+  new_conversations_discovered: number
+  conversations_indexed?: number
+  conversations_needing_index?: number
+  total_messages_processed: number
+  total_duration_ms?: number
+  results?: Array<{
+    file: string
+    delta: number
+    processed: number
+    duration_ms: number
+  }>
+  report?: Array<{
+    file: string
+    last_indexed: number
+    current_messages: number
+    delta_to_index: number
+  }>
+  error?: string
+}
+
+export function runIndexDelta(
+  agentId: string,
+  options: { dryRun?: boolean; batchSize?: number } = {}
+): Promise<IndexDeltaResult> {
+  if (options.dryRun) return runInSlot(agentId, options)
+  // Every trigger (the agent's timer, idle transitions, host hints, the API, the night sweep) that
+  // arrives while a run for this agent is still waiting for the slot joins that run. Without this
+  // each trigger queued another full run and, after a boot, the queue grew faster than it drained
+  // (incident 2026-10-29: 20 waiting, then 56, four hours later).
+  const waiting = throttle.waiting.get(agentId)
+  if (waiting) return waiting
+  const run = runInSlot(agentId, options, () => throttle.waiting.delete(agentId))
+  throttle.waiting.set(agentId, run)
+  return run
+}
+
+/**
+ * Wait for the slot, then pin the agent and index. The slot comes first: pinning loads the agent and
+ * opens its database, and a queue of pinned agents kept every waiting database open.
+ */
+async function runInSlot(
+  agentId: string,
+  options: { dryRun?: boolean; batchSize?: number },
+  onStart?: () => void,
+): Promise<IndexDeltaResult> {
+  const releaseSlot = await acquireIndexSlot(agentId)
+  onStart?.() // started: a trigger from now on may queue one follow-up run
+  try {
+    // Pinned for the whole run: a large index (1,700+ batches) outlives many
+    // LRU evictions, and eviction closes the agent's database mid-write.
+    return await agentRegistry.withAgent(agentId, () => runIndexDeltaPinned(agentId, options))
+  } finally {
+    releaseSlot()
+  }
+}
+
+async function runIndexDeltaPinned(
+  agentId: string,
+  options: { dryRun?: boolean; batchSize?: number }
+): Promise<IndexDeltaResult> {
+  const { dryRun = false, batchSize = 2 } = options
+
+  try {
+    console.log(`[Delta Index] Processing agent ${agentId.substring(0, 8)} (dryRun: ${dryRun})`)
+
+    const agent = await agentRegistry.getAgent(agentId)
+    const agentDb = await agent.getDatabase()
+
+    // SYNC WORKING DIRECTORY
+    let liveTmuxWd: string | null = null
+    let registryAgent = getRegistryAgent(agentId) || getAgentBySession(agentId)
+    if (registryAgent) {
+      const agentName = registryAgent.name || registryAgent.alias
+      const sessionName = agentName ? computeSessionName(agentName, 0) : undefined
+      const storedWd = registryAgent.workingDirectory ||
+                       registryAgent.sessions?.[0]?.workingDirectory
+      if (sessionName) {
+        liveTmuxWd = await getLiveTmuxWorkingDirectory(sessionName)
+        if (liveTmuxWd && shouldSyncWorkingDirectory(storedWd, liveTmuxWd)) {
+          console.log(`[Delta Index] Syncing workingDirectory: ${storedWd} -> ${liveTmuxWd}`)
+          updateAgentWorkingDirectory(agentId, liveTmuxWd)
+          registryAgent = getRegistryAgent(agentId) || getAgentBySession(agentId)
+        }
+      }
+    }
+
+    // Get projects
+    let projectsResult
+    try {
+      projectsResult = await getProjects(agentDb)
+    } catch (error: any) {
+      if (error.code === 'query::relation_not_found' || error.message?.includes('relation_not_found')) {
+        console.log(`[Delta Index] Schema not initialized for agent ${agentId.substring(0, 8)} - skipping`)
+        return {
+          success: true,
+          agent_id: agentId,
+          message: 'Schema not initialized yet - will retry on next cycle',
+          new_conversations_discovered: 0,
+          total_messages_processed: 0,
+        }
+      }
+      throw error
+    }
+
+    // AUTO-DISCOVER when there are no projects, OR when the recorded binding no
+    // longer reconciles with reality.
+    //
+    // Discovery used to run ONLY when zero projects were recorded, which made a
+    // wrong binding permanent: an agent bound to a directory it no longer works
+    // in kept reporting "0 messages, success" forever. pas-lola was bound to
+    // /home/jpelaez with four conversations that had not existed for months,
+    // while its real ones sat in -home-jpelaez-lola. Across the fleet, 87 of 163
+    // agents were mis-bound this way.
+    //
+    // "No longer reconciles" = every recorded project is unrelated to the
+    // agent's current working directory. That is cheap to check and cannot
+    // mistake a merely-idle agent for a broken one.
+    const boundPaths = projectsResult.rows.map((r: any[]) => String(r[0]))
+    const currentWds = Array.from(
+      new Set(
+        [
+          liveTmuxWd,
+          registryAgent?.workingDirectory,
+          registryAgent?.sessions?.[0]?.workingDirectory,
+          registryAgent?.preferences?.defaultWorkingDirectory,
+        ].filter((d): d is string => typeof d === 'string' && d.length > 0)
+      )
+    )
+    // A binding is only useful if it points AT the agent's working directory or
+    // BELOW it. An ancestor binding is too broad and indexes the wrong project:
+    // pas-lola was bound to /home/jpelaez while working in /home/jpelaez/lola,
+    // so it scanned ~/.claude/projects/-home-jpelaez (four conversations, all
+    // long deleted) and never touched -home-jpelaez-lola, where its real 23
+    // conversations live. Treating the ancestor as "related" kept it broken.
+    const bindingLooksStale =
+      boundPaths.length > 0 &&
+      currentWds.length > 0 &&
+      !boundPaths.some((b: string) =>
+        currentWds.some((wd) => b === wd || b.startsWith(wd + '/'))
+      )
+
+    if (bindingLooksStale) {
+      console.warn(
+        `[Delta Index] Agent ${agentId.substring(0, 8)} bound to [${boundPaths.join(', ')}] ` +
+        `but works in [${currentWds.join(', ')}] — re-discovering`
+      )
+    }
+
+    if (projectsResult.rows.length === 0 || bindingLooksStale) {
+      console.log(`[Delta Index] Re-discovering projects for agent ${agentId.substring(0, 8)}`)
+
+      const workingDirectories = new Set<string>()
+      if (registryAgent) {
+        if (liveTmuxWd) workingDirectories.add(liveTmuxWd)
+        const storedWd = registryAgent.workingDirectory || registryAgent.sessions?.[0]?.workingDirectory
+        if (storedWd) workingDirectories.add(storedWd)
+        const preferenceWd = registryAgent.preferences?.defaultWorkingDirectory
+        if (preferenceWd) workingDirectories.add(preferenceWd)
+      }
+
+      const autoDiscoveredCount = await autoDiscoverProjects(agentDb, agentId, workingDirectories)
+
+      if (autoDiscoveredCount > 0) {
+        projectsResult = await getProjects(agentDb)
+      } else {
+        return {
+          success: true,
+          agent_id: agentId,
+          message: 'No projects found for this agent',
+          new_conversations_discovered: 0,
+          total_messages_processed: 0,
+        }
+      }
+    }
+
+    // Phase 1: DISCOVER new conversation files
+    let newConversationsDiscovered = 0
+
+    // A Copilot agent also has conversations under ~/.copilot/session-state. A session belongs
+    // to ONE project: the files already recorded under any project of this agent are not
+    // recorded again under another (a session in /repo/sub matches both /repo and /repo/sub).
+    const copilotAgent = agentIsCopilot(agentId)
+    const copilotKnownFiles = new Set<string>()
+    if (copilotAgent) {
+      for (const projectRow of projectsResult.rows) {
+        const rows = (await getConversations(agentDb, projectRow[0] as string)).rows
+        for (const row of rows) copilotKnownFiles.add(row[0] as string)
+      }
+    }
+
+    for (const projectRow of projectsResult.rows) {
+      const projectPath = projectRow[0] as string
+      let claudeDir = projectRow[2] as string
+
+      // Repair a claude_dir that points somewhere unusable instead of skipping
+      // the project forever.
+      //
+      // Older records stored a NESTED path — e.g. <project>/<session>/subagents
+      // — rather than the project root. Once that directory was rotated away,
+      // `continue` skipped the project on every run, so the agent could never
+      // discover its own conversations again and reported "0 new" indefinitely.
+      // Observed on the `maestro` agent: claude_dir pointed at a subagents
+      // directory that no longer existed, while 47 conversations sat unread in
+      // the project root.
+      //
+      // The correct directory is derivable from project_path, so derive it,
+      // persist the correction, and carry on.
+      const derived = topLevelClaudeDir(projectPath)
+      if ((!claudeDir || !fs.existsSync(claudeDir) || claudeDir !== derived) && fs.existsSync(derived)) {
+        console.warn(
+          `[Delta Index] Repairing claude_dir for ${projectPath}: ` +
+          `${claudeDir || '(unset)'} -> ${derived}`
+        )
+        try {
+          await recordProject(agentDb, {
+            project_path: projectPath,
+            project_name: projectPath.split('/').pop() || 'unknown',
+            claude_dir: derived,
+          })
+          claudeDir = derived
+        } catch (err) {
+          console.error(`[Delta Index] Failed to repair claude_dir for ${projectPath}:`, err)
+        }
+      }
+
+      // A Copilot agent's project has no Claude directory (claude_dir is unset); it is not skipped
+      const hasClaudeDir = !!claudeDir && fs.existsSync(claudeDir)
+      if (!hasClaudeDir && !copilotAgent) continue
+
+      const existingConvosResult = await getConversations(agentDb, projectPath)
+      const existingFiles = new Set(existingConvosResult.rows.map((row: unknown[]) => row[0] as string))
+
+      // Recursively find all .jsonl files (Claude Code stores subagent
+      // conversations in <session-id>/subagents/ subdirectories)
+      const findJsonlRecursive = (dir: string): string[] => {
+        const results: string[] = []
+        try {
+          for (const entry of fs.readdirSync(dir)) {
+            const entryPath = path.join(dir, entry)
+            try {
+              const stat = fs.statSync(entryPath)
+              if (stat.isDirectory()) {
+                results.push(...findJsonlRecursive(entryPath))
+              } else if (entry.endsWith('.jsonl')) {
+                results.push(entryPath)
+              }
+            } catch { /* skip inaccessible */ }
+          }
+        } catch { /* skip */ }
+        return results
+      }
+
+      try {
+        const jsonlPaths = hasClaudeDir ? findJsonlRecursive(claudeDir) : []
+
+        for (const fullPath of jsonlPaths) {
+          if (existingFiles.has(fullPath)) continue
+
+          console.log(`[Delta Index] Discovered new conversation: ${path.relative(claudeDir, fullPath)}`)
+
+          try {
+            const metadata = await extractConversationMetadata(fullPath, projectPath)
+            await recordConversation(agentDb, {
+              jsonl_file: fullPath,
+              project_path: projectPath,
+              session_id: metadata.sessionId || 'unknown',
+              message_count: metadata.messageCount,
+              first_message_at: metadata.firstMessageAt || undefined,
+              last_message_at: metadata.lastMessageAt || undefined,
+              first_user_message: metadata.firstUserMessage || undefined,
+              model_names: metadata.modelNames || undefined,
+              git_branch: metadata.gitBranch || undefined,
+              claude_version: metadata.claudeVersion || undefined,
+              last_indexed_at: 0,
+              last_indexed_message_count: 0
+            })
+
+            // Seed the file size cache for this new file
+            updateFileSizeCache(fullPath)
+
+            newConversationsDiscovered++
+          } catch (err) {
+            console.error(`[Delta Index] Failed to process ${path.relative(claudeDir, fullPath)}:`, err)
+          }
+        }
+      } catch (err) {
+        console.error(`[Delta Index] Error scanning ${claudeDir}:`, err)
+      }
+
+      // Copilot sessions started in this project (or below it)
+      if (copilotAgent) {
+        for (const session of copilotSessionsFor(agentId, [projectPath])) {
+          if (existingFiles.has(session.path) || copilotKnownFiles.has(session.path)) continue
+          console.log(`[Delta Index] Discovered new Copilot conversation: ${session.sessionId}`)
+          try {
+            const metadata = await extractConversationMetadata(session.path, projectPath)
+            await recordConversation(agentDb, {
+              jsonl_file: session.path,
+              project_path: projectPath,
+              session_id: metadata.sessionId || session.sessionId,
+              message_count: metadata.messageCount,
+              first_message_at: metadata.firstMessageAt || undefined,
+              last_message_at: metadata.lastMessageAt || undefined,
+              first_user_message: metadata.firstUserMessage || undefined,
+              model_names: metadata.modelNames || undefined,
+              git_branch: metadata.gitBranch || undefined,
+              claude_version: metadata.claudeVersion || undefined,
+              last_indexed_at: 0,
+              last_indexed_message_count: 0
+            })
+            updateFileSizeCache(session.path)
+            copilotKnownFiles.add(session.path)
+            newConversationsDiscovered++
+          } catch (err) {
+            console.error(`[Delta Index] Failed to process Copilot session ${session.sessionId}:`, err)
+          }
+        }
+      }
+    }
+
+    if (newConversationsDiscovered > 0) {
+      console.log(`[Delta Index] Discovered ${newConversationsDiscovered} new conversation(s)`)
+    }
+
+    // Phase 2: Get ALL conversations
+    const conversations: Array<{
+      jsonl_file: string
+      message_count: number
+      last_indexed_message_count: number
+      project_path: string
+    }> = []
+
+    for (const projectRow of projectsResult.rows) {
+      const projectPath = projectRow[0] as string
+      const convosResult = await getConversations(agentDb, projectPath)
+
+      for (const convoRow of convosResult.rows) {
+        conversations.push({
+          jsonl_file: convoRow[0] as string,
+          message_count: convoRow[4] as number,
+          last_indexed_message_count: (convoRow[10] as number) || 0,
+          project_path: projectPath,
+        })
+      }
+    }
+
+    console.log(`[Delta Index] ${conversations.length} total conversations (${newConversationsDiscovered} new)`)
+
+    // Phase 3: Filter — use file size cache to skip unchanged files (no file reads!)
+    const conversationsNeedingIndex: Array<typeof conversations[0] & { currentLineCount: number }> = []
+
+    // Conversations whose file is gone: count them so a fully-dead binding is
+    // visible in the result instead of looking like a clean "0 to index" run.
+    let deadConversations = 0
+
+    for (const conv of conversations) {
+      if (!fs.existsSync(conv.jsonl_file)) {
+        deadConversations++
+        continue
+      }
+
+      // Fast check: has the file size changed since last time?
+      if (!hasFileChanged(conv.jsonl_file) && conv.last_indexed_message_count > 0) {
+        continue // File unchanged — skip without reading
+      }
+
+      // File changed or never indexed — read once and count lines
+      const currentLineCount = countFileLines(conv.jsonl_file)
+      const delta = currentLineCount - conv.last_indexed_message_count
+
+      if (delta > 0) {
+        conversationsNeedingIndex.push({ ...conv, currentLineCount })
+      }
+    }
+
+    if (deadConversations > 0 && shouldLogChange('delta.dead', deadConversations)) {
+      console.warn(
+        `[Delta Index] ${deadConversations}/${conversations.length} recorded conversations no longer exist on disk` +
+        (deadConversations === conversations.length ? ' — the binding is entirely stale' : '')
+      )
+    }
+    console.log(`[Delta Index] ${conversationsNeedingIndex.length} conversations need indexing`)
+
+    if (dryRun) {
+      const report = conversationsNeedingIndex.map((conv) => ({
+        file: conv.jsonl_file,
+        last_indexed: conv.last_indexed_message_count,
+        current_messages: conv.currentLineCount,
+        delta_to_index: conv.currentLineCount - conv.last_indexed_message_count,
+      }))
+
+      return {
+        success: true,
+        dry_run: true,
+        agent_id: agentId,
+        new_conversations_discovered: newConversationsDiscovered,
+        conversations_needing_index: conversationsNeedingIndex.length,
+        total_messages_processed: 0,
+        report,
+      }
+    }
+
+    // Phase 4: Index deltas (file read happens inside indexConversationDelta)
+    const results: Array<{
+      file: string
+      delta: number
+      processed: number
+      duration_ms: number
+    }> = []
+
+    let totalProcessed = 0
+    let totalDuration = 0
+
+    for (const conv of conversationsNeedingIndex) {
+      console.log(`\n[Delta Index] Processing: ${conv.jsonl_file}`)
+
+      const delta = conv.currentLineCount - conv.last_indexed_message_count
+
+      const indexedSize = fs.statSync(conv.jsonl_file).size
+      const stats = await indexConversationDelta(
+        agentDb,
+        conv.jsonl_file,
+        conv.last_indexed_message_count,
+        { batchSize }
+      )
+
+      await recordConversation(agentDb, {
+        jsonl_file: conv.jsonl_file,
+        project_path: conv.project_path,
+        message_count: stats.totalMessages,
+        last_indexed_at: Date.now(),
+        last_indexed_message_count: stats.totalMessages,
+      })
+
+      // Update file size cache after successful indexing
+      updateFileSizeCache(conv.jsonl_file, indexedSize)
+
+      results.push({
+        file: conv.jsonl_file,
+        delta,
+        processed: stats.processedMessages,
+        duration_ms: stats.durationMs,
+      })
+
+      totalProcessed += stats.processedMessages
+      totalDuration += stats.durationMs
+    }
+
+    console.log(`\n[Delta Index] Complete: ${totalProcessed} messages in ${totalDuration}ms`)
+
+    return {
+      success: true,
+      agent_id: agentId,
+      new_conversations_discovered: newConversationsDiscovered,
+      conversations_indexed: conversationsNeedingIndex.length,
+      total_messages_processed: totalProcessed,
+      total_duration_ms: totalDuration,
+      results,
+    }
+  } catch (error) {
+    console.error('[Delta Index] Error:', error)
+    return {
+      success: false,
+      agent_id: agentId,
+      new_conversations_discovered: 0,
+      total_messages_processed: 0,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    }
+  }
+}

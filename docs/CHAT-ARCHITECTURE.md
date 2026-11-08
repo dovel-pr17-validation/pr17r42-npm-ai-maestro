@@ -1,0 +1,347 @@
+# Chat Architecture
+
+How a message gets from the dashboard to an agent, how an agent's question gets
+back, and every place those two things can go wrong.
+
+Written on 15 September 2026 after seven releases in one day chasing a single
+user-visible symptom through code paths nobody had written down. Most of that day
+was not spent fixing bugs — it was spent fixing the *wrong copy* of the right
+code. Read this before touching the chat.
+
+---
+
+## There are TWO chat paths
+
+They are completely separate implementations. Knowing which one you are looking
+at is the first question to ask about any chat bug.
+
+| | **tmux path** (default) | **SDK path** (`Streaming` tab) |
+|---|---|---|
+| Component | `ChatView.tsx` / `MobileChatView.tsx` | `StreamingChatView.tsx` |
+| Transport | WebSocket → `server.mjs` | WebSocket → `lib/streaming-runtime.mjs` |
+| Send function | **`sendChatMessage` in `server.mjs`** | `Session.push()` |
+| How text reaches the agent | `tmux load-buffer` + `paste-buffer` + `C-m` | Claude Agent SDK stream |
+| How state is known | **reading the terminal as text** | structured SDK events |
+| Questions | scraped from the pane, or from the transcript | `canUseTool` callback |
+| Reliability ceiling | inherently below 100% | deterministic |
+
+### The trap that cost a full day
+
+There are **two functions named `sendChatMessage`**:
+
+| file | called by |
+|---|---|
+| `server.mjs:~735` | **the chat UI** (WebSocket `chat:send`) |
+| `services/agents-chat-service.ts` | the REST endpoint `/api/agents/:id/chat` |
+
+Verification was added to the TypeScript one, tested through the REST endpoint,
+observed returning `verified: true`, and reported as fixed. The chat UI never
+calls it. **Check which one you are editing.**
+
+### Why the SDK path is the one that can be right
+
+The tmux path infers agent state by reading a terminal as text and typing
+keystrokes back. Everything that broke on 15 Sep follows from that, and none of
+it is a coding mistake:
+
+- text pasted into the input box but never submitted, reported as sent
+- `C-u` silently not clearing Claude Code's input, so every "clear and retype"
+  recovery appended instead of replacing
+- Claude Code's **dim placeholder** (your previous prompt, greyed, inside an
+  *empty* box) read as staged text — indistinguishable without `capture-pane -e`
+- the input box truncating a long line to its tail, so a readback sees only part
+- a menu that scrolled into history parsed as a live prompt
+
+Screen-scraping a TUI can be made *better*. It cannot be made *certain*. The SDK
+path exchanges structured JSON in both directions.
+
+---
+
+## Sending a message (tmux path)
+
+`server.mjs → sendChatMessage(sessionName, message)`
+
+1. `exitCopyMode` — scrolling leaves the pane in copy-mode, where Enter is eaten
+2. **permission check** — see *Permission state* below
+3. capture a baseline of the pane
+4. write to a temp file → `tmux load-buffer` → `paste-buffer`
+5. paste probe — **advisory only**, never gate submission on it
+6. `tmux send-keys C-m`
+7. **verify submission** — the text must appear *above* the input box
+   (`paneSubmitted`). If it is still *in* the box (`paneStaged`), clear with
+   **backspaces** and retype once. Twice failing means something is holding the
+   keyboard; return an error that says so.
+
+Step 7 did not exist until v0.38.16. Before that the chat reported success for
+every message it typed, whether or not it was submitted.
+
+### Pane readback rules — `lib/pane-readback.mjs`
+
+One module, imported by **both** `server.mjs` and the TypeScript services. It
+used to live in `lib/notification-service.ts`, which `server.mjs` cannot import —
+so the file that needed it most was the only file without it.
+
+- **Proof of submission is position, not presence.** The text must be ABOVE the
+  input box. "Anywhere on the pane" also matches text sitting unsent in the box.
+- **Capture with `-e` and strip SGR dim** before matching, or the placeholder
+  lies to you.
+- **Whitespace-insensitive matching** — a TUI wraps long text mid-token.
+- **Clearing the input is `BSpace` × N, never `C-u`.** Verified by hand on a live
+  agent: a staged line survived two `C-u` and an `Escape`; only backspace removed
+  characters.
+
+---
+
+## Where a question panel comes from — THREE places
+
+This is the part that took five releases. A panel of numbered options can be
+rendered from three independent sources, and only two of them mention
+`AskUserQuestion` anywhere in the code.
+
+### 1. The transcript card — `ChatView.tsx`
+
+An `AskUserQuestion` tool_use block in the conversation JSONL. Answered-ness
+comes from a `tool_result_marker`, emitted by `parseJsonlLines` for each
+completed tool call, so it **survives a page reload**. (`answeredQuestions` is a
+`useState` Set and dies with the page; it is a fallback, not the record.)
+
+A card is interactive only when it is the **last** question AND nothing has been
+said since. Once the agent has spoken, the question is settled — clicking an old
+option sends a keystroke to a menu that is no longer on screen.
+
+### 2. The same card again — `MobileChatView.tsx`
+
+**A second, independent copy.** Not phone-only: `app/page.tsx` reads a
+`layoutOverride` from localStorage and `TabletDashboard` renders `MobileChatView`,
+so a desktop browser lands here too. Fixing one renderer and not the other means
+the bug persists for half your users and you cannot reproduce it.
+
+### 3. `hookState.options` — synthesised from the PANE
+
+The one with no mention of `AskUserQuestion` at all.
+
+`detectPermissionFromPane` captures **200 lines of scrollback** and
+`parsePermissionMenu` looks for a numbered menu in it. If it finds one, the
+server manufactures a `hookState` carrying `options`, and *both* renderers draw
+buttons from it. **This path never reads the transcript.**
+
+That is why a question answered hours earlier, 46 messages back in the
+conversation, kept reappearing on every reload: the transcript said "answered"
+and this code does not consult the transcript.
+
+**Rule: a live menu is the LAST thing on the pane.** If Claude Code has spoken
+since — `●` assistant turn, `⎿` tool result, `✻` status, or a submitted
+`❯ <text>` — the menu is over. An empty `❯` is the waiting input box and still
+counts as live.
+
+**Identity reconciliation (v0.38.33).** This card had no `tool_use` id, so it was
+the last place in the chat that resolved a target by *screen position* rather than
+*identity* — the same class as the `amp-inbox | head -1` reply misroute. The fix
+recovers the identity from what the menu SAYS:
+`paneCardBelongsToTranscriptQuestion(messages, hookState)` content-matches the
+pane card's option labels against the transcript's LAST `AskUserQuestion`. When
+they match, this card *belongs to that question*, which renderer #1/#2 already
+govern by `tool_use` id — so both renderers now **suppress this card** and defer
+to the identity-governed one. An answered question is therefore hidden on all
+three paths at once. A genuine `Allow Edit?` tool-permission prompt matches no
+transcript question and still renders (it has no id anywhere, and this card is its
+only representation). MobileChatView suppresses via a derived `showPermission` so
+the composer returns when the card is gone — a suppressed card must never strand
+the input.
+
+---
+
+## Programs other than Claude Code
+
+The chat reads a different transcript per program (`lib/chat-transcript.mjs` dispatches by `agent.program`): Claude Code under `~/.claude/projects`, Codex under `~/.codex/sessions` (`lib/transcript-codex.mjs`), Grok Build under `~/.grok/sessions` (`lib/transcript-grok.mjs`). All emit the same message shapes, so the components do not change. Per-line detection lets the incremental watcher parse a delta.
+
+Neither Codex nor Grok writes an approval request to its transcript, so their cards come from the pane only (`lib/pane-approval.mjs`: `parseGrokApproval`, `parseCodexApproval`). The menu footer must be the last thing on the pane, or there is no card and the cached one is dropped. Options carry the key to send (a digit); the answer goes through the same `chat:permissionResponse` path as Claude's. What each program supports: `docs/AGENT-PROGRAMS.md`.
+
+---
+
+## Cards that are not messages (secret requests, SQL write requests)
+
+Two cards are not chat messages and not questions. Each comes from its own endpoint, polled every 3 seconds, and is rendered in both `ChatView.tsx` and `MobileChatView.tsx`: `SecretRequestCard` (F033, `docs/SECRETS.md`) and `SqlWriteRequestCard` (F037).
+
+**SQL write requests (F037).** The agentic-sql write wrapper (`safe-psql-write propose`) writes one JSON file per pending change to `$SAFE_PSQL_HOME/requests` (default `~/.safe-psql/requests`), named `w-<12 hex>.json`. `GET /api/agents/[id]/sql-write-requests` lists the agent's pending, unexpired ones (matched on the `agent` field, which is `AIM_AGENT_NAME`, else `AIM_AGENT_ID`); the card shows what the wrapper's own approval screen shows (statement, table, rows, before and after per row, environment, countdown), with the same sanitising and limits. `POST /api/agents/[id]/sql-write-requests/[rid]` with `{ action: 'approve', environment }` or `{ action: 'reject' }` makes the same state change as the wrapper's `approve` and `reject` (`lib/sql-write-requests.ts`). The server never runs the wrapper and never touches the database; the agent then runs `safe-psql-write apply <id>`, which repeats every check. Parameter values are shown like the wrapper shows them and are never logged.
+
+The answer endpoint accepts only a real browser page of this server (`Sec-Fetch-Site: same-origin`, or an `Origin` whose host equals `Host`) and, to approve, the environment name typed in the card; anything else is a 403 or 400 and changes nothing. This stops an agent from approving by accident or with a plain curl. It is not a defence against an agent that deliberately forges headers or edits the request file: AI Maestro has no app-level authentication by design, and the agent and the person share one OS user. The database login's own limits (listed tables and columns only) are the real backstop. The request shape and the fingerprint rule are pinned by `tests/fixtures/sql-write-request*.json`, generated by running the real wrapper; a wrapper change that breaks the card fails `tests/sql-write-requests.test.ts`. Skill-side text for the other half: `docs/F037-agentic-sql-card-handoff.md`.
+
+---
+
+## Permission state
+
+Three sources, in descending trustworthiness:
+
+1. **The pane, right now** — ground truth.
+2. `~/.aimaestro/chat-state/<cwdHash>.json` — written by the hook with
+   `fs.writeFileSync` *before* any network call, so it survives a hook process
+   that exits mid-fetch.
+3. `sessionState._lastPermission` — in-memory cache, set from either of the above
+   including a pane false-positive.
+
+Since 0.93.7 the hook also reports a pending permission the moment Claude Code asks, from the
+`PermissionRequest` event (about 0.05 s after the tool call, instead of the 6 s `permission_prompt`
+notification, which any keystroke in the pane defers). That state is **observe-only**: it says that
+something is pending and what (a short summary), with `options: []` and `observed: true`. Claude Code's
+real dialog options cannot be derived from the payload, so `needsPaneApprovalCard`
+(`lib/pane-approval.mjs`) sends an option-less state to the pane, which supplies the card's options and
+keys; trust-folder and MCP-consent dialogs fire no hook and are read from the pane only. Claude Code fires nothing when the user answers or presses Esc, so `sweepObservedPermissions` (`services/sessions-service.ts`, every second from `server.mjs`) expires an observed request once the pane shows no decision (`lib/observed-permission.mjs`, the same menu parser as the card): the feed reports Ready or Working and the chat drops the stale card. Presence
+still comes only from the server feed, as everywhere. See `docs/HOOKS-SETUP.md`.
+
+`_lastPermission` is a **cache, never an authority**. It is cleared only when a
+new assistant message arrives, which produced a deadlock:
+
+> refuse the send → nothing reaches the agent → no assistant message → the cache
+> never clears → refuse the next send
+
+Measured live: a false `permission_request` blocked every chat message for an
+entire afternoon while the pane sat at an ordinary empty prompt. Always
+re-validate against the pane before refusing, and drop the cache when the pane
+disagrees.
+
+---
+
+## Answering a question on the SDK path
+
+`AskUserQuestion` arrives through the **same** `canUseTool` callback as a
+permission request, and needs a **different** answer shape:
+
+```js
+// permission
+{ behavior: 'allow', updatedInput: input }
+{ behavior: 'deny',  message }
+
+// question — an allow with unchanged input gives Claude NO ANSWER
+{ behavior: 'allow',
+  updatedInput: {
+    questions,                                   // always echo these back
+    answers: { "<question text>": "<label>" },   // or the user's own words
+    response: "…"                                // optional freeform reply
+  } }
+```
+
+**Free text is a first-class answer**, not a fallback — per Anthropic's
+[user-input docs](https://code.claude.com/docs/en/agent-sdk/user-input), the
+custom string goes in `answers[question]`. `response` is for a reply that answers
+no specific question; Claude reads it as *"The user responded: …"*.
+
+---
+
+## History is paged
+
+`chat:history` (connect, refresh, a new conversation file) carries the newest page: about 40 conversation messages, counted by `isConversationMessage` in `lib/chat-transcript.mjs`, so tool calls, results and thinking come along without using up the page (at most 1500 entries). It also carries `historyStart`, the index where that page begins, and `hasMore`.
+
+Scrolling to the top sends `chat:requestHistory` with `before: historyStart` and the `conversationFile`; the server answers `chat:historyPage` with the page that ends there (`getChatHistoryPage`). Both views keep the list through `lib/chat-history-paging.ts`:
+
+- `prependPage` adds an older page and moves the cursor; a page for another file or an old cursor is ignored.
+- `mergeHistory` keeps the loaded older pages when the history is pushed again for the same conversation, and starts over on a new one.
+- Incremental `chat:messages` are appended with no cap, because the cursor counts from the front of the list.
+- `useKeepScrollOnPrepend` keeps the reading position (Safari has no CSS scroll anchoring).
+
+A host on an older version ignores `before` and answers with the full history without `historyStart`, which ends paging; no answer at all shows "try again" after 15 seconds. The chat socket to a remote host is forwarded as is, so paging works for agents on other hosts once they run this version.
+
+## Search and days
+
+`chat:search` runs on the agent's host over the whole conversation file (`searchMessages`), so it covers pages not loaded and works through the forwarded socket for agents on other hosts; the answer is `chat:searchResults`. Picking a result sends `chat:requestHistory` with `through: index`, and `pageOfMessages` returns one contiguous page down to it, so `prependPage` needs no change. `withDividers` adds the day lines and the "Found" mark to the list both views draw, and `hooks/useChatFind.ts` scrolls to that mark. Dividers sit in `groupedItems`, so a message after one is not grouped with the message before it.
+
+## Device messages (F098)
+
+Words someone said or typed at one of the agent's devices reach it as an AMP message notice in the pane (`lib/device-events.ts`). `parseJsonlLines` turns that notice into a `device_message` entry (`device`, `source`, `text`), not a `system_notice`, so it is always shown and never drawn as the person: a device cannot know who spoke. The notice holds 400 characters; when it cut the words, `lib/device-message-text.mjs` reads them from the agent's inbox by the notice ref. The agent's own reply needs nothing: it is its written answer and the `adp-device.sh say` step.
+
+## Reactions
+
+A person or an agent reacts to a message with one of six emoji: 👍 👎 ❓ ✅ 👀 ❤️ (`lib/chat-reactions.ts`). They are stored with the agent, in `~/.aimaestro/agents/<id>/chat-reactions.json`, keyed by transcript `uuid`, one per reactor per emoji per message. `services/chat-reactions-service.ts` serves `GET|POST|DELETE /api/agents/:id/chat/reactions` on the agent's own host: the views send REST to `getAgentBaseUrl(agent)`, and the `chat:reaction` event (`{ agentId, messageId, reactions }`, the full list for that message) goes out on `/term` chat clients, so it passes through a forwarded socket, and on `/stream-chat`.
+
+Who reacted: `deviceId` is a person's paired app, and its key must be active on that host; `agentId` is an agent (`scripts/aimaestro-react.sh`); neither is the dashboard, recorded as `operator`, the way task comments are.
+
+A new 👍 👎 ❓ from a person on the agent's own message reaches the agent as one `[REACTION] ...` line: into the streaming session, or through `sendChatMessage` in `server.mjs` by way of `globalThis.__deliverChatLine`. So it refuses while a permission prompt is on the pane, and a reaction never answers one. The service also refuses a bare shell, because the line quotes the agent's text. One note per agent every 5 seconds; a reaction over that limit is saved and the answer says it was not sent. Nothing is sent on removal, and an agent's reaction is never sent. The line lands in the transcript as a user line, and `systemNoticeKind` makes it a system note by its exact shape, so `buildReactionLine` keeps name and quote on one line, without `"`.
+
+## Optimistic state — the rules
+
+The chat shows your message before the agent has it. Everything below exists
+because that optimism has to be reconciled against truth, and every way of
+getting it wrong has now been shipped at least once.
+
+**A pending bubble clears when ITS OWN text appears in the transcript, and nothing
+else clears it.** Not "any new message" (that marks an undelivered message as
+delivered — `MobileChatView` did this), and not "only on first load" (that leaves
+the bubble beside the real message forever — `ChatView` did this, and persisting
+bubbles in v0.38.16 made it permanent rather than transient). One matcher,
+`lib/pending-reconcile.mjs`, called from **both** the history and incremental
+paths in **both** renderers.
+
+**Match whitespace-insensitively.** The text comes back through a terminal, which
+wraps and re-flows it. Exact equality fails on long messages.
+
+**Never report a send that has not happened.** A deferred send must report when it
+runs, not when it is scheduled.
+
+**Dedup needs a fallback key.** `!m.uuid || !seen.has(m.uuid)` waves every
+uuid-less message through, and an overlapping batch appends it again. Use
+`uuid || type|timestamp|text.slice(0,120)`.
+
+**Stickiness is against MISSING information, not contradicting information.** A
+permission card should survive a `null` state (a failed read) but must yield to a
+concrete `waiting_for_input`. Ignoring every later state is how one false positive
+pins a card that only an assistant message can clear — which an idle agent
+receiving nothing will never produce. That was the client-side twin of the server
+deadlock in v0.38.15.
+
+---
+
+## Debugging checklist
+
+Run these before forming a theory. Each one took minutes and would have replaced
+hours of reasoning on 15 Sep.
+
+```bash
+# Which panel is being rendered? Run the REAL parser on the LIVE pane.
+tmux capture-pane -p -t <session> -S -200 > /tmp/pane.txt
+node -e "import('./lib/pane-permission.mjs').then(async m => {
+  const fs = await import('fs')
+  console.log(m.parsePermissionMenu(fs.readFileSync('/tmp/pane.txt','utf-8')))
+})"
+
+# What is the chat actually being sent?
+curl -s "localhost:23000/api/agents/<id>/chat?limit=200" | python3 -m json.tool | head -40
+
+# Is the fix in the bundle the browser downloads? (app chunks live in chunks/app/)
+grep -rl "<your marker>" .next/static/chunks/app/
+
+# Is the process running the version on disk? /api/config reads the FILE.
+pm2 list    # the version column and a short uptime are the real evidence
+```
+
+**An empty grep is evidence about your search terms, not about the codebase.**
+Three wrong diagnoses on 15 Sep came from greps that were correct and pointed at
+the wrong file.
+
+---
+
+## Known duplication — fix this and the class of bug goes away
+
+| was duplicated | status |
+|---|---|
+| pane readback | **resolved** — `lib/pane-readback.mjs` |
+| question answered/live rules | **resolved** — `lib/question-state.mjs` |
+| verify / clear / retype loop | **resolved** — `lib/chat-verify.mjs` |
+| question panel *sources* × 3 | inherent, documented above |
+
+### What was deliberately NOT collapsed
+
+**The two chat components.** `ChatView` and `MobileChatView` are different
+layouts, not an accident. Merging them yields one component full of branching
+markup — worse than two. Their shared *logic* moved to `lib/question-state.mjs`;
+their markup stays apart.
+
+**The two `sendChatMessage` wrappers.** They have genuinely different jobs: the
+service resolves an agent from the registry and guards against a bare shell;
+`server.mjs` handles tmux copy-mode and the permission cache. They also deliver
+text differently — the chat path pastes through a tmux buffer (newlines and
+quoting for free), the service types via the runtime abstraction its tests mock.
+Both are legitimate. Only the **proof** was duplicated, and that is now
+`lib/chat-verify.mjs`, which takes delivery as an injected function.
+
+The rule this leaves behind: **share the logic, not the shape.** Every bug on
+15 September was a fork of logic; none of them was a fork of markup.

@@ -1,0 +1,1501 @@
+/**
+ * Sessions Service
+ *
+ * Pure business logic extracted from app/api/sessions/** routes.
+ * No HTTP concepts (Request, Response, NextResponse, headers) leak into this module.
+ * API routes become thin wrappers that call these functions.
+ *
+ * Covers:
+ *   GET    /api/sessions              -> listSessions / listLocalSessions
+ *   POST   /api/sessions/create       -> createSession
+ *   DELETE  /api/sessions/[id]        -> deleteSession
+ *   PATCH  /api/sessions/[id]/rename  -> renameSession
+ *   POST   /api/sessions/[id]/command -> sendCommand
+ *   GET    /api/sessions/[id]/command -> checkIdleStatus
+ *   GET    /api/sessions/restore      -> listRestorableSessions
+ *   POST   /api/sessions/restore      -> restoreSessions
+ *   DELETE /api/sessions/restore      -> deletePersistedSession
+ *   GET    /api/sessions/activity     -> getActivity
+ *   POST   /api/sessions/activity/update -> broadcastActivityUpdate
+ */
+
+import { hookNeedsYou, normalizeActivityStatus, claimsActivity } from '@/lib/agent-presence'
+import { resolveWorkingDirectory } from '@/lib/working-directory'
+import { execFile } from 'child_process'
+import { exactTarget } from '@/lib/tmux-safe.mjs'
+import { promisify } from 'util'
+import http from 'http'
+import https from 'https'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
+import type { Session } from '@/types/session'
+import { getAgent, getAgentBySession, getAgentByName, createAgent, deleteAgentBySession, renameAgentSession, updateAgent } from '@/lib/agent-registry'
+import { loadAgents, folderOwner, folderTakenMessage } from '@/lib/agent-registry'
+// F004 Phase 2b: a codex agent has no AI Maestro hook, so its status is not in
+// the hook-fed sessionActivity map — derive it from its own transcript instead.
+import { resolveJsonlPath, isPiAgent } from '@/lib/chat-transcript.mjs'
+import { codexLiveStatusFromFile } from '@/lib/transcript-codex.mjs'
+import { copilotLiveStatusFromFile, isCopilotAgent } from '@/lib/transcript-copilot.mjs'
+import { piSessionStatus } from '@/lib/transcript-pi.mjs'
+const isCodexProgram = (a: any) => (a?.program || '').toLowerCase().includes('codex')
+
+/**
+ * Status for a codex session, from its transcript's turn-lifecycle events:
+ * 'active' while mid-turn, 'idle' when the turn completed. Returns null when it
+ * cannot be determined (no transcript / not codex), so the caller keeps whatever
+ * the activity map said.
+ */
+function codexSessionStatus(agent: any): 'active' | 'idle' | null {
+  // F038: Copilot is the same case (no hook, events.jsonl carries the turn lifecycle).
+  const copilot = isCopilotAgent(agent)
+  // F036: Pi has no hook either; its session file carries the turn (with an age limit, see piSessionStatus).
+  const pi = isPiAgent(agent)
+  if (!isCodexProgram(agent) && !copilot && !pi) return null
+  try {
+    const file = resolveJsonlPath(agent)
+    if (!file) return null
+    const s = pi ? piSessionStatus(file.path)
+      : copilot ? copilotLiveStatusFromFile(file.path) : codexLiveStatusFromFile(file.path)
+    return s === 'working' ? 'active' : s === 'idle' ? 'idle' : null
+  } catch {
+    return null
+  }
+}
+import { getHosts, getSelfHost, isSelf, getHostById } from '@/lib/hosts-config'
+import { persistSession, loadPersistedSessions, unpersistSession } from '@/lib/session-persistence'
+import { parseNameForDisplay, isCallSession, cannotBeStarted } from '@/types/agent'
+import { initAgentAMPHome, getAgentAMPDir } from '@/lib/amp-inbox-writer'
+import { sessionActivity, agentActivity, terminalSessions, hookStatus as hookStatusMap, observedExpired, broadcastStatusUpdate, broadcastChatEvent } from '@/services/shared-state'
+import { observedPermissionVerdict, OBSERVED_GRACE_MS } from '@/lib/observed-permission.mjs'
+import { capturePaneSync } from '@/lib/tmux-runtime.mjs'
+import { HOOK_STATUS_TTL_MS } from '@/lib/session-idle'
+import { isSessionIdle, IDLE_THRESHOLD_MS } from '@/lib/session-idle'
+import { getRuntime } from '@/lib/agent-runtime'
+import { resolveProgramCommand, isNoProgram } from '@/lib/program-command'
+import { buildLaunchCommand } from '@/lib/launch-command'
+import { sanitizeLaunchOptions } from '@/lib/launch-options'
+import { permissionModesFor } from '@/lib/program-choices'
+import type { AgentPermissionMode } from '@/types/agent'
+import { paneSubmitted, paneStaged, clearInputPlan } from '@/lib/notification-service'
+import { verifyProgramStarted, type LaunchVerdict } from '@/lib/program-launch'
+import crypto from 'crypto'
+import { type ServiceResult, missingField, notFound, alreadyExists, invalidField, operationFailed, serviceError, runtimeConflict } from '@/services/service-errors'
+import { runtimeOf } from '@/lib/agent-runtime-kind.mjs'
+import { shouldLogChange } from '@/lib/log-on-change'
+
+const execFileAsync = promisify(execFile)
+
+export type SessionActivityStatus = 'active' | 'idle' | 'waiting'
+
+export interface SessionActivityInfo {
+  lastActivity: string
+  status: SessionActivityStatus
+  hookStatus?: string
+  notificationType?: string
+}
+
+export interface CreateSessionParams {
+  name: string
+  workingDirectory?: string
+  agentId?: string
+  hostId?: string
+  label?: string
+  avatar?: string
+  programArgs?: string
+  program?: string
+  /** How freely the tool may act (see lib/program-choices for what each tool honours). Saved on the agent. */
+  permissionMode?: string
+  /** The tool's declared launch choices (lib/launch-options). Validated here; saved on the agent. */
+  launchOptions?: Record<string, string | boolean>
+}
+
+export interface RestoreResult {
+  sessionId: string
+  status: 'restored' | 'already_exists' | 'failed'
+}
+
+// ---------------------------------------------------------------------------
+// Caching (for listSessions)
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL_MS = 3000
+
+let cachedSessions: Session[] | null = null
+let cacheTimestamp = 0
+let pendingRequest: Promise<Session[]> | null = null
+
+// Read version from package.json (once at module load)
+const packageJson = JSON.parse(
+  fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf-8')
+)
+const AI_MAESTRO_VERSION: string = packageJson.version
+
+// Idle threshold in milliseconds (30 seconds) — for command endpoint
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/** HTTP GET using native Node.js http module (fetch/undici is broken for local networks) */
+export async function httpGet(url: string): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url)
+    const client = urlObj.protocol === 'https:' ? https : http
+
+    const req = client.get(url, { timeout: 2000 }, (res) => {
+      let data = ''
+      res.on('data', (chunk: string) => data += chunk)
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data))
+        } catch {
+          reject(new Error(`Invalid JSON from ${url}`))
+        }
+      })
+    })
+
+    req.on('error', (error: Error) => reject(error))
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')) })
+  })
+}
+
+/** HTTP POST using native fetch */
+async function httpPost(url: string, body: any, timeout = 10000): Promise<any> {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeout)
+  })
+
+  const data = await response.text()
+
+  if (response.ok) {
+    try { return JSON.parse(data) } catch { throw new Error(`Invalid JSON: ${data.substring(0, 100)}`) }
+  } else {
+    try {
+      const errorData = JSON.parse(data)
+      throw new Error(errorData.error || `HTTP ${response.status}`)
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('HTTP')) throw e
+      throw new Error(`HTTP ${response.status}: ${data.substring(0, 100)}`)
+    }
+  }
+}
+
+/** Hash working directory to find hook state file */
+function hashCwd(cwd: string): string {
+  return crypto.createHash('md5').update(cwd || '').digest('hex').substring(0, 16)
+}
+
+/**
+ * How long a "waiting" report stays believable in the ACTIVITY INDICATOR.
+ *
+ * Waiting states deliberately never expire in the wake path (lib/session-idle):
+ * an agent blocked on a prompt is still blocked tomorrow, and the wake logic must
+ * know that. The indicator has the opposite problem. When v0.38.10 first surfaced
+ * hook state in the sidebar, 56 of 67 agents on one host reported "waiting" from
+ * reports older than a week — the oldest from 12 January. Every one rendered as a
+ * pulsing amber "needs you" badge.
+ *
+ * Fifty-six permanent amber dots teach a person to ignore the colour, which
+ * defeats the entire point of having one. A day is long enough that an agent
+ * genuinely blocked overnight is still flagged in the morning, and short enough
+ * that January stops shouting.
+ *
+ * This bound applies ONLY to the indicator. The wake path is untouched.
+ */
+export const WAITING_STATE_TTL_MS = 24 * 60 * 60 * 1000
+
+const isWaitingStatus = (status: string): boolean =>
+  status === 'waiting_for_input' || status === 'permission_request'
+
+/**
+ * Read hook state for a working directory.
+ *
+ * This reads the FILE the hook writes with fs.writeFileSync before it attempts
+ * any network call — so unlike the broadcast, it cannot be lost to the hook
+ * process exiting mid-fetch. It is the more trustworthy of the two hook records.
+ *
+ * `maxAgeMs` applies to non-waiting states only; waiting states never expire here
+ * because an agent blocked on a prompt stays blocked until someone answers.
+ * Default 60s preserves the original behaviour for the terminal-upgrade path.
+ */
+function getHookState(
+  workingDir: string,
+  maxAgeMs: number = 60000,
+  maxWaitingAgeMs: number = WAITING_STATE_TTL_MS
+): { status: string; notificationType?: string; at: number; transcriptPath?: string; observed?: boolean } | null {
+  if (!workingDir) return null
+
+  const stateDir = path.join(os.homedir(), '.aimaestro', 'chat-state')
+  const cwdHash = hashCwd(workingDir)
+  const stateFile = path.join(stateDir, `${cwdHash}.json`)
+
+  try {
+    if (fs.existsSync(stateFile)) {
+      const content = fs.readFileSync(stateFile, 'utf-8')
+      const state = JSON.parse(content)
+
+      // 'ended' / 'started' claim nothing: the terminal / transcript decide.
+      if (!claimsActivity(state.status)) return null
+
+      const at = new Date(state.updatedAt).getTime()
+      const age = Date.now() - at
+      if (age > (isWaitingStatus(state.status) ? maxWaitingAgeMs : maxAgeMs)) return null
+
+      return { status: state.status, notificationType: state.notificationType, at, transcriptPath: state.transcriptPath, ...(state.observed && { observed: true }) }
+    }
+  } catch {
+    // Ignore errors reading state files
+  }
+
+  return null
+}
+
+/**
+ * An observed permission request (Claude Code's PermissionRequest hook) that the terminal showed to be
+ * over is no longer "Needs you". The hook fires nothing when the user answers, presses Esc or chooses
+ * "No", so sweepObservedPermissions records the expiry and the feed reads it here: the request is
+ * reported as what the agent is doing now ('active' or 'idle'). A newer hook report has a different
+ * `at` and is not covered.
+ */
+function withObservedExpiry<T extends { status: string; at: number; observed?: boolean }>(sessionName: string, hookState: T | null): T | null {
+  if (!hookState || hookState.status !== 'permission_request' || !hookState.observed) return hookState
+  const expired = observedExpired.get(sessionName)
+  if (!expired || expired.at !== hookState.at) return hookState
+  return { ...hookState, status: expired.status, notificationType: undefined }
+}
+
+const OBSERVED_RECHECK_MS = 1500
+const OBSERVED_MAX_CAPTURES_PER_SWEEP = 3
+const observedCheckedAt = new Map<string, number>()
+
+/**
+ * Look at the terminal of every agent whose Claude Code hook reported a pending decision and expire the
+ * ones that are over. Cheap by construction: it only visits sessions the hook reported as
+ * permission_request, no younger than OBSERVED_GRACE_MS, at most one pane capture per session per
+ * OBSERVED_RECHECK_MS and OBSERVED_MAX_CAPTURES_PER_SWEEP per call, and a request is expired once. Called every second by server.mjs. Returns the
+ * number of requests expired.
+ */
+export function sweepObservedPermissions(now: number = Date.now()): number {
+  let expired = 0
+  const due: Array<{ sessionName: string; agentId: string; at: number }> = []
+  hookStatusMap.forEach((reported, sessionName) => {
+    if (reported.status !== 'permission_request' || now - reported.at < OBSERVED_GRACE_MS) return
+    if (now - (observedCheckedAt.get(sessionName) || 0) < OBSERVED_RECHECK_MS) return
+    const agent = getAgentByName(sessionName) || getAgentBySession(sessionName)
+    const workingDir = agent && (agent.workingDirectory || agent.sessions?.[0]?.workingDirectory || agent.preferences?.defaultWorkingDirectory)
+    if (!agent || !workingDir) return
+    const hookState = getHookState(workingDir, HOOK_STATUS_TTL_MS, WAITING_STATE_TTL_MS)
+    if (!hookState || hookState.status !== 'permission_request' || !hookState.observed) return
+    if (observedExpired.get(sessionName)?.at === hookState.at) return
+    due.push({ sessionName, agentId: agent.id, at: hookState.at })
+  })
+
+  // The capture is synchronous (up to 2 s on a slow tmux), so one tick captures at most a few panes,
+  // least recently checked first so every pending session still gets its turn.
+  due.sort((a, b) => (observedCheckedAt.get(a.sessionName) || 0) - (observedCheckedAt.get(b.sessionName) || 0))
+  for (const { sessionName, agentId, at } of due.slice(0, OBSERVED_MAX_CAPTURES_PER_SWEEP)) {
+    observedCheckedAt.set(sessionName, now)
+    let pane = ''
+    try {
+      pane = capturePaneSync(sessionName, 200, { timeout: 2000 })
+    } catch {
+      continue // no pane to look at (another host's agent, session gone): nothing proves it is over
+    }
+    const verdict = observedPermissionVerdict({ ageMs: now - at, paneText: pane })
+    if (verdict === 'keep') continue
+
+    observedExpired.set(sessionName, { at, status: verdict })
+    // The same path the hook uses: updates the hook status map (wake logic) and pushes to /status clients
+    broadcastActivityUpdate(sessionName, verdict, verdict, undefined, agentId)
+    console.log(`[Hook] ${sessionName}: pending permission over (pane shows no decision), now ${verdict}`)
+    expired++
+  }
+  // Forget sessions that no longer report a pending request
+  observedCheckedAt.forEach((_, name) => { if (hookStatusMap.get(name)?.status !== 'permission_request') observedCheckedAt.delete(name) })
+  return expired
+}
+
+/** Fetch sessions from a remote host */
+async function fetchRemoteSessions(hostUrl: string, hostId: string): Promise<Session[]> {
+  try {
+    const data = await httpGet(`${hostUrl}/api/sessions?local=true`)
+    const remoteSessions = data.sessions || []
+    console.log(`[Sessions] Successfully fetched ${remoteSessions.length} session(s) from ${hostUrl}`)
+    return remoteSessions.map((session: Session) => ({ ...session, hostId }))
+  } catch (error) {
+    console.error(`[Sessions] Error fetching from ${hostUrl}:`, error)
+    return []
+  }
+}
+
+/** Fetch local tmux sessions + cloud agents + Docker containers */
+async function fetchLocalSessions(hostId: string): Promise<Session[]> {
+  try {
+    const runtime = getRuntime()
+    const discovered = await runtime.listSessions()
+
+    const sessions: Session[] = []
+
+    for (const disc of discovered) {
+      // Skip companion call forks — they are temporary and should not appear in the dashboard
+      if (isCallSession(disc.name)) continue
+
+      const activityTimestamp = sessionActivity.get(disc.name)
+      let lastActivity: string
+      let status: 'active' | 'idle' | 'disconnected'
+
+      if (activityTimestamp) {
+        lastActivity = new Date(activityTimestamp).toISOString()
+        status = ((Date.now() - activityTimestamp) / 1000) > 3 ? 'idle' : 'active'
+      } else {
+        lastActivity = disc.createdAt
+        status = 'disconnected'
+      }
+
+      let agent = getAgentBySession(disc.name)
+
+      // Fallback: session name might be UUID@host (from legacy bug where agentId was used as session name)
+      if (!agent) {
+        const uuidMatch = disc.name.match(/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:@|$)/)
+        if (uuidMatch) {
+          agent = getAgent(uuidMatch[1])
+        }
+      }
+
+      // Codex has no hook feeding sessionActivity, so it would otherwise read as
+      // 'disconnected' even while actively working. Its transcript is the
+      // authority for a codex agent.
+      const codexStatus = codexSessionStatus(agent)
+      if (codexStatus) status = codexStatus
+
+      sessions.push({
+        id: disc.name,
+        name: disc.name,
+        workingDirectory: disc.workingDirectory,
+        status,
+        createdAt: disc.createdAt,
+        lastActivity,
+        windows: disc.windows,
+        hostId,
+        version: AI_MAESTRO_VERSION,
+        ...(agent && { agentId: agent.id })
+      })
+    }
+
+    // Discover cloud agents from registry
+    try {
+      const agentsDir = path.join(os.homedir(), '.aimaestro', 'agents')
+      if (fs.existsSync(agentsDir)) {
+        const agentFiles = fs.readdirSync(agentsDir).filter(f => f.endsWith('.json'))
+        for (const file of agentFiles) {
+          const agentData = JSON.parse(fs.readFileSync(path.join(agentsDir, file), 'utf8'))
+          const hasSession = agentData.sessions && agentData.sessions.length > 0
+          if (agentData.deployment?.type === 'cloud' && hasSession) {
+            const agentName = agentData.name || agentData.alias
+            if (agentName && !sessions.find(s => s.name === agentName)) {
+              const activityTimestamp = sessionActivity.get(agentName)
+              let status: 'active' | 'idle' | 'disconnected' = 'disconnected'
+              let lastActivity = agentData.lastActive || agentData.createdAt
+              if (activityTimestamp) {
+                lastActivity = new Date(activityTimestamp).toISOString()
+                status = ((Date.now() - activityTimestamp) / 1000) > 3 ? 'idle' : 'active'
+              }
+              sessions.push({
+                id: agentName,
+                name: agentName,
+                workingDirectory: agentData.workingDirectory || agentData.sessions?.[0]?.workingDirectory || '/workspace',
+                status,
+                createdAt: agentData.createdAt,
+                lastActivity,
+                windows: 1,
+                hostId,
+                version: AI_MAESTRO_VERSION,
+                agentId: agentData.id
+              })
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error discovering cloud agents:', error)
+    }
+
+    // Discover standalone agents (registered with heartbeat, no tmux session, no session history)
+    // Agents with session history (e.g. hibernated agents) are NOT standalone.
+    // This block runs BEFORE Docker so heartbeat-enriched entries (with agentId,
+    // standalone flag, real workingDirectory) win the name-uniqueness race.
+    try {
+      const allAgents = loadAgents()
+      for (const agent of allAgents) {
+        const agentName = agent.name || agent.alias
+        if (!agentName || sessions.find(s => s.name === agentName)) continue
+        if (agent.deployment?.type === 'cloud') continue
+        // Skip agents with tmux session history — they are managed (hibernated), not standalone
+        if ((agent.sessions || []).length > 0) continue
+
+        const heartbeatTs = agentActivity.get(agent.id)
+        if (!heartbeatTs) continue
+
+        const age = (Date.now() - heartbeatTs) / 1000
+        if (age > 120) continue  // stale heartbeat (2 min)
+
+        sessions.push({
+          id: agentName,
+          name: agentName,
+          workingDirectory: agent.workingDirectory || agent.sessions?.[0]?.workingDirectory || '',
+          status: age > 3 ? 'idle' : 'active',
+          createdAt: agent.createdAt,
+          lastActivity: new Date(heartbeatTs).toISOString(),
+          windows: 0,
+          hostId,
+          version: AI_MAESTRO_VERSION,
+          agentId: agent.id,
+          standalone: true,
+        })
+      }
+    } catch (error) {
+      console.error('Error discovering standalone agents:', error)
+    }
+
+    // Discover Docker container agents (fallback for containers without a fresh heartbeat)
+    try {
+      const dockerOutput = await listAimContainers()
+      if (dockerOutput.trim()) {
+        for (const line of dockerOutput.trim().split('\n')) {
+          if (!line.trim()) continue
+          const [containerName, containerStatus, ports] = line.split('\t')
+          if (!containerName) continue
+          const agentName = containerName.replace(/^aim-/, '')
+          if (sessions.find(s => s.name === agentName)) continue
+          let containerPort: number | undefined
+          const portMatch = ports?.match(/(\d+)->23000/)
+          if (portMatch) containerPort = parseInt(portMatch[1], 10)
+          const isUp = containerStatus?.toLowerCase().includes('up')
+          sessions.push({
+            id: agentName,
+            name: agentName,
+            workingDirectory: '/workspace',
+            status: isUp ? 'idle' : 'disconnected',
+            createdAt: new Date().toISOString(),
+            lastActivity: new Date().toISOString(),
+            windows: 1,
+            hostId,
+            version: AI_MAESTRO_VERSION,
+            containerAgent: true,
+            containerPort,
+          })
+        }
+      }
+    } catch {
+      // Docker not available
+    }
+
+    // Discover OpenClaw sessions (custom tmux sockets)
+    try {
+      const openclawSocketDir = process.env.OPENCLAW_TMUX_SOCKET_DIR
+        || path.join(os.tmpdir(), 'clawdbot-tmux-sockets')
+
+      if (fs.existsSync(openclawSocketDir)) {
+        const socketFiles = fs.readdirSync(openclawSocketDir)
+          .filter(f => !f.startsWith('.'))
+
+        for (const socketFile of socketFiles) {
+          const socketPath = path.join(openclawSocketDir, socketFile)
+          try {
+            const { stdout } = await execFileAsync(
+              'tmux', ['-S', socketPath, 'list-sessions'],
+              { timeout: 3000 }
+            )
+            if (!stdout.trim()) continue
+
+            for (const line of stdout.trim().split('\n')) {
+              const match = line.match(/^([^:]+):\s+(\d+)\s+windows?/)
+              if (!match) continue
+              const [, sessionName, windows] = match
+              if (sessions.find(s => s.id === sessionName)) continue
+
+              // Validate session name (same rules as session creation)
+              if (!/^[a-zA-Z0-9_-]+$/.test(sessionName)) continue
+
+              // Auto-register agent if not already registered
+              let agentId: string | undefined
+              let resolvedWorkingDirectory = ''
+              const existingAgent = getAgentByName(sessionName)
+              if (existingAgent) {
+                agentId = existingAgent.id
+                resolvedWorkingDirectory = existingAgent.workingDirectory || ''
+              } else {
+                try {
+                  // Query working directory only for new agents
+                  try {
+                    const { stdout: cwdOut } = await execFileAsync(
+                      'tmux', ['-S', socketPath, 'display-message', '-t', exactTarget(sessionName), '-p', '#{pane_current_path}'],
+                      { timeout: 3000 }
+                    )
+                    resolvedWorkingDirectory = cwdOut.trim()
+                  } catch { /* fallback to empty */ }
+
+                  const { tags } = parseNameForDisplay(sessionName)
+                  const agent = createAgent({
+                    name: sessionName,
+                    program: 'openclaw',
+                    taskDescription: `OpenClaw agent ${sessionName}`,
+                    tags,
+                    owner: os.userInfo().username,
+                    createSession: true,
+                    // A folder another agent owns is left out: the registration would fail on every poll (B023)
+                    workingDirectory: resolvedWorkingDirectory && !folderOwner(resolvedWorkingDirectory) ? resolvedWorkingDirectory : undefined,
+                  })
+                  agentId = agent.id
+                  console.log(`[Sessions] Auto-registered OpenClaw agent: ${sessionName} (${agent.id})`)
+
+                  // Initialize AMP only on first registration (non-fatal)
+                  try {
+                    await initAgentAMPHome(sessionName, agent.id)
+                    const ampDir = getAgentAMPDir(sessionName, agent.id)
+                    await execFileAsync('tmux', ['-S', socketPath, 'set-environment', '-t', exactTarget(sessionName), 'AMP_DIR', ampDir], { timeout: 3000 })
+                    await execFileAsync('tmux', ['-S', socketPath, 'set-environment', '-t', exactTarget(sessionName), 'AIM_AGENT_NAME', sessionName], { timeout: 3000 })
+                    await execFileAsync('tmux', ['-S', socketPath, 'set-environment', '-t', exactTarget(sessionName), 'AIM_AGENT_ID', agent.id], { timeout: 3000 })
+                  } catch (ampError) {
+                    console.warn(`[Sessions] Could not set up AMP for OpenClaw agent ${sessionName}:`, ampError)
+                  }
+                } catch (regError) {
+                  console.warn(`[Sessions] Could not register OpenClaw agent ${sessionName}:`, regError)
+                }
+              }
+
+              sessions.push({
+                id: sessionName,
+                name: sessionName,
+                workingDirectory: resolvedWorkingDirectory,
+                status: 'idle',
+                createdAt: new Date().toISOString(),
+                lastActivity: new Date().toISOString(),
+                windows: parseInt(windows, 10),
+                hostId,
+                version: AI_MAESTRO_VERSION,
+                socketPath,
+                ...(agentId && { agentId }),
+              })
+            }
+          } catch { /* socket file may be stale */ }
+        }
+      }
+    } catch {
+      // OpenClaw not installed or socket dir doesn't exist
+    }
+
+    return sessions
+  } catch (error) {
+    console.error('[Sessions] Error fetching local sessions:', error)
+    return []
+  }
+}
+
+/** Fetch sessions from all hosts (local + remote) */
+async function fetchAllSessions(): Promise<Session[]> {
+  const hosts = getHosts()
+  const selfHost = getSelfHost()
+
+  console.log(`[Sessions] Fetching from ${hosts.length} host(s)...`)
+
+  const localSessions = selfHost ? await fetchLocalSessions(selfHost.id) : []
+  if (shouldLogChange('sessions.local', localSessions.length)) console.log(`[Agents] Found ${localSessions.length} local tmux session(s)`)
+
+  const remoteHosts = hosts.filter(h => !isSelf(h.id))
+  if (remoteHosts.length === 0) return localSessions
+
+  const remoteResults = await Promise.all(
+    remoteHosts.map(host => fetchRemoteSessions(host.url, host.id))
+  )
+
+  const allSessions = [...localSessions, ...remoteResults.flat()]
+  console.log(`[Sessions] Found ${allSessions.length} total session(s) across all hosts`)
+  return allSessions
+}
+
+// ===========================================================================
+// PUBLIC API — called by API routes
+// ===========================================================================
+
+/**
+ * List all sessions (local + remote). Cached for 3s with request deduplication.
+ */
+export async function listSessions(): Promise<{ sessions: Session[]; fromCache: boolean }> {
+  const now = Date.now()
+
+  if (cachedSessions && (now - cacheTimestamp) < CACHE_TTL_MS) {
+    return { sessions: cachedSessions, fromCache: true }
+  }
+
+  if (pendingRequest) {
+    const sessions = await pendingRequest
+    return { sessions, fromCache: false }
+  }
+
+  pendingRequest = fetchAllSessions()
+  try {
+    const sessions = await pendingRequest
+    cachedSessions = sessions
+    cacheTimestamp = Date.now()
+    return { sessions, fromCache: false }
+  } finally {
+    pendingRequest = null
+  }
+}
+
+const DOCKER_TIMEOUT_MS = 5_000
+const DOCKER_CACHE_MS = 1_000
+const dockerList = globalThis as unknown as { _aimDockerPs?: { at: number; run: Promise<string> } }
+
+/**
+ * `docker ps` for agent containers, as argv with a timeout, shared by everyone who asks within a
+ * second. A hung Docker daemon used to leave one shell and one docker process per request.
+ * No Docker, or an error: '' (no containers), as before.
+ */
+export function listAimContainers(now = Date.now()): Promise<string> {
+  const cached = dockerList._aimDockerPs
+  if (cached && now - cached.at < DOCKER_CACHE_MS) return cached.run
+  const run = execFileAsync('docker', ['ps', '--filter', 'name=aim-', '--format', '{{.Names}}\t{{.Status}}\t{{.Ports}}'], { timeout: DOCKER_TIMEOUT_MS })
+    .then(r => r.stdout, () => '')
+  dockerList._aimDockerPs = { at: now, run }
+  return run
+}
+
+/**
+ * List only local sessions (no remote fan-out).
+ */
+export async function listLocalSessions(): Promise<{ sessions: Session[] }> {
+  const selfHost = getSelfHost()
+  const sessions = selfHost ? await fetchLocalSessions(selfHost.id) : []
+  if (shouldLogChange('sessions.merged', sessions.length)) console.log(`[Agents] Found ${sessions.length} local tmux session(s)`)
+  return { sessions }
+}
+
+/**
+ * Get session activity with hook state enrichment.
+ */
+export async function getActivity(): Promise<Record<string, SessionActivityInfo>> {
+  const activityMap = sessionActivity
+  const activity: Record<string, SessionActivityInfo> = {}
+
+  const agents = loadAgents()
+  const sessionToWorkingDir = new Map<string, string>()
+
+  for (const agent of agents) {
+    const sessionName = agent.name || agent.alias
+    const workingDir = agent.workingDirectory ||
+                       agent.sessions?.[0]?.workingDirectory ||
+                       agent.preferences?.defaultWorkingDirectory
+    if (sessionName && workingDir) {
+      sessionToWorkingDir.set(sessionName, workingDir)
+    }
+  }
+
+  const now = Date.now()
+  activityMap.forEach((timestamp, sessionName) => {
+    const terminalIdle = ((now - timestamp) / 1000) > 3
+    const workingDir = sessionToWorkingDir.get(sessionName)
+    // Bounded the same way: a live terminal must not be labelled "waiting" on the
+    // strength of a report from months ago.
+    const hookState = workingDir ? withObservedExpiry(sessionName, getHookState(workingDir, HOOK_STATUS_TTL_MS, WAITING_STATE_TTL_MS)) : null
+
+    // The hook is the authority when it has a fresh report: it fires the moment
+    // a turn starts (UserPromptSubmit) and ends (Stop), and when the agent
+    // blocks on you. Terminal output is not: Claude Code redraws its screen and
+    // status line while idle, so an open terminal made idle agents look busy
+    // (green) for minutes. Terminal activity only decides for agents with no
+    // hook report (Codex, a plain shell).
+    let status: SessionActivityStatus = hookState
+      ? normalizeActivityStatus(hookState.status, hookState.notificationType)
+      : (terminalIdle ? 'idle' : 'active')
+    // After you approve, the agent resumes but the hook says nothing until the
+    // turn ends: fresh terminal output well after the permission report is the
+    // proof it is working again. (An unanswered dialog does not redraw.)
+    if (status === 'waiting' && hookState && !terminalIdle && timestamp > hookState.at + 5000) {
+      status = 'active'
+    }
+    if (status === 'waiting' && hookState && transcriptResumedSince(hookState.transcriptPath, hookState.at)) {
+      status = 'active'
+    }
+
+    activity[sessionName] = {
+      lastActivity: new Date(timestamp).toISOString(),
+      status,
+      hookStatus: hookState?.status,
+      notificationType: hookState?.notificationType
+    }
+  })
+
+  // Everything above this line comes from `sessionActivity`, which is written by
+  // the PTY layer — and the PTY only runs while somebody has that agent's
+  // terminal open in the dashboard. For an autonomous fleet that is the UNUSUAL
+  // case: nobody is watching, so no agent ever appeared to be working, however
+  // busy it was. A twelve-minute turn showed as 'idle' start to finish.
+  //
+  // The hook already reports what the agent is doing and
+  // `broadcastActivityUpdate` already persists it — its own comment says this is
+  // "the only busy/idle signal that exists for an agent nobody is watching". That
+  // signal fed the wake path (lib/session-idle) and was never read here.
+  //
+  // Terminal activity still wins where it exists, because it is measured rather
+  // than reported. This only fills in the agents it cannot see.
+  // One rule for both stores: a working/idle report goes stale in minutes, a
+  // blocked one stays relevant for a day. See WAITING_STATE_TTL_MS.
+  const isFresh = (status: string, at: number): boolean =>
+    claimsActivity(status) &&
+    Date.now() - at <= (isWaitingStatus(status) ? WAITING_STATE_TTL_MS : HOOK_STATUS_TTL_MS)
+
+  const toActivityStatus = (hookStatus: string, notificationType?: string): SessionActivityStatus =>
+    hookStatus === 'active' ? 'active'
+    : hookNeedsYou(hookStatus, notificationType) ? 'waiting'
+    : 'idle'
+
+  // Prefer the state FILE over the broadcast map. Both come from the same hook,
+  // but the file is written synchronously before any network call, so it survives
+  // a hook process that exits before its fetch completes. The map is the only
+  // source for an agent on ANOTHER host, whose file is on that host's disk.
+  for (const [sessionName, workingDir] of sessionToWorkingDir) {
+    if (activity[sessionName]) continue
+
+    const fromFile = withObservedExpiry(sessionName, getHookState(workingDir, HOOK_STATUS_TTL_MS, WAITING_STATE_TTL_MS))
+    const fromMap = hookStatusMap.get(sessionName)
+    const mapFresh = fromMap && isFresh(fromMap.status, fromMap.at) ? fromMap : null
+    const reported =
+      fromFile && (!mapFresh || fromFile.at >= mapFresh.at) ? fromFile
+      : mapFresh
+    if (!reported) continue
+
+    const resumed = fromFile && reported === fromFile && transcriptResumedSince(fromFile.transcriptPath, fromFile.at)
+    activity[sessionName] = {
+      lastActivity: new Date(reported.at).toISOString(),
+      status: resumed ? 'active' : toActivityStatus(reported.status, reported.notificationType),
+      hookStatus: reported.status,
+      notificationType: reported.notificationType,
+    }
+  }
+
+  // Remote agents report over the wire and have no local state file.
+  hookStatusMap.forEach((reported, sessionName) => {
+    if (activity[sessionName] || !isFresh(reported.status, reported.at)) return
+    activity[sessionName] = {
+      lastActivity: new Date(reported.at).toISOString(),
+      status: toActivityStatus(reported.status),
+      hookStatus: reported.status,
+      notificationType: reported.notificationType,
+    }
+  })
+
+  return activity
+}
+
+/**
+ * hookStatusMap gets an entry for every sessionName that ever reports, including
+ * arbitrary names POSTed to /api/sessions/activity/update, and nothing removed them.
+ * Drop entries past the longest TTL anything honours (the 24 h waiting TTL), and when
+ * the map is still over the cap, the oldest first.
+ */
+export const HOOK_STATUS_MAP_MAX = 1000
+export function pruneHookStatusMap(now: number = Date.now()): void {
+  hookStatusMap.forEach((v, k) => {
+    if (now - v.at > WAITING_STATE_TTL_MS) hookStatusMap.delete(k)
+  })
+  if (hookStatusMap.size > HOOK_STATUS_MAP_MAX) {
+    const oldestFirst = Array.from(hookStatusMap.entries()).sort((a, b) => a[1].at - b[1].at)
+    for (const [k] of oldestFirst.slice(0, hookStatusMap.size - HOOK_STATUS_MAP_MAX)) hookStatusMap.delete(k)
+  }
+}
+
+/**
+ * Broadcast a status update via WebSocket.
+ */
+export function broadcastActivityUpdate(
+  sessionName: string,
+  status: string,
+  hookStatus?: string,
+  notificationType?: string,
+  agentId?: string,
+  hookState?: any
+): ServiceResult<{ success: boolean }> {
+  if (!sessionName && !agentId) {
+    return missingField('sessionName')
+  }
+
+  // Persist the hook's view of the agent's state, not just broadcast it. This
+  // is the only busy/idle signal that exists for an agent nobody is watching:
+  // sessionActivity is written by the PTY layer, which only runs while a
+  // terminal is attached. The wake path reads this via lib/session-idle.
+  const reported = hookStatus || status
+  const wasIdle = sessionName ? hookStatusMap.get(sessionName)?.status === 'idle' : false
+  const before = sessionName ? hookStatusMap.get(sessionName) : undefined
+  const wasWaiting = !!before && normalizeActivityStatus(before.status, before.notificationType) === 'waiting'
+  if (sessionName && reported) {
+    if (!claimsActivity(reported)) {
+      // SessionEnd: the session is gone, so its last report must not linger.
+      hookStatusMap.delete(sessionName)
+    } else {
+      hookStatusMap.set(sessionName, {
+        status: reported,
+        notificationType,
+        at: Date.now(),
+      })
+      pruneHookStatusMap()
+    }
+  }
+
+  // The agent just went idle — the moment to run whatever maintenance it owns.
+  //
+  // This is what makes scheduling agent-level rather than host-level: the
+  // agent's own lifecycle drives its maintenance, on whichever machine it
+  // happens to be running, with no per-host timer or cron entry. The schedule
+  // itself lives in the agent's directory and travels with it.
+  //
+  // Only on the TRANSITION into idle, so a burst of hook events does not
+  // re-trigger. Fire-and-forget: a scheduled task must never delay or fail the
+  // hook that reported the status.
+  if (agentId && reported === 'idle' && !wasIdle) {
+    import('@/lib/agent-schedule-runner')
+      .then(({ runDueTasks }) => runDueTasks(agentId))
+      .then((r) => {
+        if (r.ran.length > 0) {
+          console.log(`[Schedule] ${agentId.substring(0, 8)} ran ${r.ran.length} task(s) on idle`)
+        }
+      })
+      .catch((err) => console.warn('[Schedule] idle-triggered run failed:', err))
+  }
+
+  // The agent just started waiting on a person: the one place that sees the transition. Fire-and-forget,
+  // like the schedule above; a push must never delay or fail the hook that reported the status.
+  if (reported && normalizeActivityStatus(reported, notificationType) === 'waiting' && !wasWaiting) {
+    import('@/lib/push-expo')
+      .then(({ pushNeedsYou }) => pushNeedsYou(agentId, sessionName))
+      .catch((err) => console.warn('[Push] needs-you push failed:', err))
+  }
+
+  // The sidebar vocabulary, never the raw hook word (lib/agent-presence.ts)
+  broadcastStatusUpdate(sessionName, normalizeActivityStatus(hookStatus || status, notificationType), hookStatus, notificationType, agentId)
+
+  // Push hookState to chat-subscribed WebSocket clients in real-time
+  if (hookState) {
+    let delivered = false
+    // Try the provided sessionName first
+    if (sessionName) {
+      const session = terminalSessions.get(sessionName)
+      const chatClients = (session as any)?.chatClients as Set<import('ws').WebSocket> | undefined
+      if (chatClients && chatClients.size > 0) {
+        broadcastChatEvent(sessionName, 'chat:hookState', { data: hookState })
+        delivered = true
+      }
+    }
+    // Fallback: if agentId is provided and sessionName didn't deliver,
+    // resolve the agent's name and try that as the session key
+    if (!delivered && agentId) {
+      const agent = getAgent(agentId)
+      const resolvedName = agent?.name
+      if (resolvedName && resolvedName !== sessionName) {
+        broadcastChatEvent(resolvedName, 'chat:hookState', { data: hookState })
+      }
+    }
+  }
+
+  return { data: { success: true }, status: 200 }
+}
+
+/**
+ * Record a heartbeat for a standalone agent (no tmux session).
+ * Makes the agent appear in the dashboard session list.
+ */
+export function heartbeat(agentId: string, status?: string, claudeSessionId?: string): ServiceResult<{ success: boolean }> {
+  if (!agentId) return missingField('agentId')
+  // Resolve: agentId could be a UUID or a name. Store heartbeat under the UUID.
+  const agent = getAgent(agentId) || getAgentByName(agentId)
+  const resolvedId = agent?.id || agentId
+  agentActivity.set(resolvedId, Date.now())
+  // Capture Claude Code's native session id (sent by the hook on SessionStart)
+  // when it changes — enables transcript lookup, native resume, telemetry.
+  if (agent && claudeSessionId && agent.claudeSessionId !== claudeSessionId) {
+    updateAgent(agent.id, { claudeSessionId } as any)
+  }
+  broadcastStatusUpdate('', normalizeActivityStatus(status || 'active'), status, undefined, resolvedId)
+  return { data: { success: true }, status: 200 }
+}
+
+/**
+ * Create a new session (local or forwarded to remote host).
+ */
+export async function createSession(params: CreateSessionParams): Promise<ServiceResult<{
+  success: boolean
+  name: string
+  agentId?: string
+  type?: string
+  /** False when the configured program did not start in the pane. */
+  programStarted?: boolean
+  /** Why it did not start, phrased for the person who just created the agent. */
+  programError?: string
+  /** The shell's own complaint, verbatim. */
+  shellSaid?: string
+  /** The folder the agent works in, after resolving (~/agents/<name> when none was given) */
+  workingDirectory?: string
+  /** Things to tell the person (a Windows path translated, a Windows folder chosen) */
+  warnings?: string[]
+  /** On WSL: where Windows Explorer can open the agent's folder */
+  windowsPath?: string
+}>> {
+  const { name, workingDirectory, agentId, hostId, label, avatar, programArgs, program } = params
+
+  // The tool the agent runs decides which permission modes and options mean anything. Anything the tool cannot
+  // honour is dropped, not stored: it would look chosen and do nothing.
+  const chosenProgram = program || 'claude-code'
+  const chosenKind = isNoProgram(chosenProgram) ? null : resolveProgramCommand(chosenProgram).kind
+  const allowedModes = permissionModesFor(chosenKind)
+  const chosenMode = allowedModes.includes(params.permissionMode as AgentPermissionMode) ? (params.permissionMode as AgentPermissionMode) : undefined
+  const chosenOptions = sanitizeLaunchOptions(chosenKind, params.launchOptions)
+
+  if (!name || typeof name !== 'string') {
+    return missingField('name')
+  }
+
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+    return invalidField('name', 'Session name can only contain letters, numbers, dashes, and underscores')
+  }
+
+  // Determine target host
+  const selfHost = getSelfHost()
+  const targetHost = hostId ? getHostById(hostId) : selfHost
+  const isRemoteTarget = targetHost && !isSelf(targetHost.id)
+
+  // Forward to remote host if needed
+  if (isRemoteTarget && targetHost) {
+    try {
+      const remoteUrl = `${targetHost.url}/api/sessions/create`
+      console.log(`[Sessions] Creating session "${name}" on remote host ${targetHost.name} at ${remoteUrl}`)
+      const data = await httpPost(remoteUrl, { name, workingDirectory, agentId, label, avatar, programArgs, program, permissionMode: params.permissionMode, launchOptions: params.launchOptions })
+      console.log(`[Sessions] Successfully created session "${name}" on ${targetHost.name}`)
+      return { data, status: 200 }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
+      const errorCause = (error as any)?.cause
+      const causeCode = errorCause?.code || ''
+      const causeMessage = errorCause?.message || ''
+      const fullErrorText = `${errorMessage} ${causeCode} ${causeMessage}`
+
+      console.error(`[Sessions] Failed to connect to ${targetHost.name} (${targetHost.url}):`, { message: errorMessage, causeCode, causeMessage })
+
+      if (errorMessage.includes('aborted') || causeCode === 'ABORT_ERR') {
+        return serviceError('timeout', `Timeout connecting to ${targetHost.name}. Is the remote AI Maestro running?`, 504)
+      } else if (fullErrorText.includes('ECONNREFUSED') || causeCode === 'ECONNREFUSED') {
+        return serviceError('operation_failed', `Connection refused by ${targetHost.name}. Verify the remote AI Maestro is running on ${targetHost.url}`, 503)
+      } else if (fullErrorText.includes('EHOSTUNREACH') || causeCode === 'EHOSTUNREACH') {
+        return serviceError('operation_failed', `Cannot reach ${targetHost.name} at ${targetHost.url}. Try again or check network.`, 503)
+      } else if (fullErrorText.includes('ENETUNREACH') || causeCode === 'ENETUNREACH') {
+        return serviceError('operation_failed', `Network unreachable to ${targetHost.name}. Are you on the same network/VPN?`, 503)
+      } else {
+        return operationFailed(`connect to ${targetHost.name}`, `${errorMessage} (${causeCode})`)
+      }
+    }
+  }
+
+  // Local session creation
+  const runtime = getRuntime()
+  const normalizedName = name.toLowerCase()
+  // Always use the friendly agent name for the tmux session (never UUID)
+  // agentId is only used for linking to an existing agent, not naming
+  const actualSessionName = normalizedName
+
+  const sessionExists = await runtime.sessionExists(actualSessionName)
+  if (sessionExists) {
+    return alreadyExists('Session', actualSessionName)
+  }
+  // Never a terminal beside the agent's streaming session (two processes on one conversation)
+  const known = getAgentByName(normalizedName)
+  if (known && cannotBeStarted(known)) {
+    return runtimeConflict(`"${normalizedName}" connects over AMP and has no terminal.`)
+  }
+  if (known && runtimeOf(known) === 'streaming') {
+    return runtimeConflict(`"${normalizedName}" is running as a streaming session. Switch it to terminal mode instead.`)
+  }
+
+  // An empty folder is ~/agents/<name> (created), a Windows path is translated
+  // (WSL), a missing folder is refused. It used to be process.cwd() — the AI
+  // Maestro install directory — while the UI said "home directory".
+  const where = resolveWorkingDirectory(workingDirectory, normalizedName)
+  if (!where.ok || !where.cwd) {
+    return invalidField('workingDirectory', where.error || 'Unusable working directory')
+  }
+  const cwd = where.cwd
+  // Refuse before the session starts: a session without its agent would be registered as an orphan
+  const owner = known ? null : folderOwner(cwd)
+  if (owner) return runtimeConflict(folderTakenMessage(cwd, owner))
+  await runtime.createSession(actualSessionName, cwd)
+
+  // Register agent
+  const agentName = normalizedName
+  let registeredAgent = getAgentByName(agentName)
+
+  if (!registeredAgent) {
+    try {
+      const { tags } = parseNameForDisplay(agentName)
+      registeredAgent = createAgent({
+        name: agentName,
+        label,
+        avatar,
+        program: program || 'claude-code',
+        taskDescription: `Agent for ${agentName}`,
+        tags,
+        owner: os.userInfo().username,
+        createSession: true,
+        workingDirectory: cwd,
+        programArgs: programArgs || '',
+        ...(chosenMode ? { permissionMode: chosenMode } : {}),
+        ...(Object.keys(chosenOptions).length > 0 ? { launchOptions: chosenOptions } : {}),
+      })
+      console.log(`[Sessions] Registered new agent: ${agentName} (${registeredAgent.id})`)
+    } catch (createError) {
+      console.warn(`[Sessions] Could not register agent ${agentName}:`, createError)
+    }
+  }
+
+  // Persist session metadata (legacy)
+  persistSession({
+    id: normalizedName,
+    name: normalizedName,
+    workingDirectory: cwd,
+    createdAt: new Date().toISOString(),
+    ...(agentId && { agentId }),
+    ...(registeredAgent && { agentId: registeredAgent.id })
+  })
+
+  // Initialize AMP
+  const registeredAgentId = registeredAgent?.id
+  try {
+    await initAgentAMPHome(agentName, registeredAgentId)
+    const ampDir = getAgentAMPDir(agentName, registeredAgentId)
+    await runtime.setEnvironment(actualSessionName, 'AMP_DIR', ampDir)
+    await runtime.setEnvironment(actualSessionName, 'AIM_AGENT_NAME', agentName)
+    if (registeredAgentId) {
+      await runtime.setEnvironment(actualSessionName, 'AIM_AGENT_ID', registeredAgentId)
+    }
+    await runtime.unsetEnvironment(actualSessionName, 'CLAUDECODE')
+    const exportCmd = registeredAgentId
+      ? `export AMP_DIR='${ampDir}' AIM_AGENT_NAME='${agentName}' AIM_AGENT_ID='${registeredAgentId}'; unset CLAUDECODE`
+      : `export AMP_DIR='${ampDir}' AIM_AGENT_NAME='${agentName}'; unset CLAUDECODE`
+    await runtime.sendKeys(actualSessionName, `"${exportCmd}"`, { enter: true })
+    console.log(`[Sessions] Set AMP_DIR=${ampDir} for agent ${agentName}`)
+  } catch (ampError) {
+    console.warn(`[Sessions] Could not set up AMP for ${agentName}:`, ampError)
+  }
+
+  // Launch program.
+  //
+  // Shares lib/program-command with the wake path — this used to be a second,
+  // slightly different copy of the same ladder, with the same `else 'claude'`
+  // default that turns an unrecognised or broken wrapper into a bare,
+  // unsandboxed Claude Code.
+  let launchVerdict: LaunchVerdict = { started: true }
+  const selectedProgram = program || 'claude-code'
+  if (!isNoProgram(selectedProgram)) {
+    const resolved = resolveProgramCommand(selectedProgram)
+    if (!resolved.command) {
+      console.error(`[Sessions] Not launching a program in ${actualSessionName}: ${resolved.error}`)
+    } else {
+      // The bare command, for the launch check and its messages (the wake does the same).
+      const startCommand = resolved.command
+      // The command that is typed: one builder for creating and waking, so a new agent starts exactly as a wake
+      // would start it (permission mode, options, and for Claude Code the fixed AI Maestro additions).
+      const fullCommand = buildLaunchCommand({
+        command: startCommand,
+        kind: resolved.kind,
+        agentName,
+        programArgs: typeof programArgs === 'string' ? programArgs : undefined,
+        permissionMode: chosenMode ?? registeredAgent?.permissionMode,
+        launchOptions: Object.keys(chosenOptions).length > 0 ? chosenOptions : registeredAgent?.launchOptions,
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 300))
+
+      try {
+        await runtime.sendKeys(actualSessionName, `"${fullCommand}"`, { enter: true })
+      } catch (progError) {
+        console.warn(`[Sessions] Could not launch program in ${actualSessionName}:`, progError)
+      }
+
+      // send-keys succeeding proves tmux took the keystrokes, not that the
+      // program exists. This is where #426 was born: a fresh install whose
+      // `claude` was not on PATH inside the tmux session created an agent that
+      // reported healthy and sat at a bash prompt, so the operator's next
+      // message was executed as shell commands. Creation is the right moment to
+      // notice — it is when someone is looking.
+      launchVerdict = await verifyProgramStarted(runtime, actualSessionName, startCommand)
+      if (launchVerdict.started) {
+        console.log(`[Sessions] Launched program "${startCommand}" in session ${actualSessionName}`)
+      } else {
+        console.warn(`[Sessions] ${actualSessionName}: ${launchVerdict.error}${launchVerdict.shellSaid ? ` — shell said: ${launchVerdict.shellSaid}` : ''}`)
+      }
+    }
+  }
+
+  return {
+    data: {
+      success: true,
+      name: actualSessionName,
+      agentId: registeredAgent?.id,
+      programStarted: launchVerdict.started,
+      workingDirectory: cwd,
+      ...(where.warnings.length ? { warnings: where.warnings } : {}),
+      // On Windows: where Explorer / VS Code can open the agent's files
+      ...(where.windowsPath ? { windowsPath: where.windowsPath } : {}),
+      // Surfaced so the UI can say what is wrong at the moment the agent is
+      // created, rather than leaving someone to discover it by talking to a shell.
+      ...(launchVerdict.error ? { programError: launchVerdict.error, shellSaid: launchVerdict.shellSaid } : {}),
+    },
+    status: 200,
+  }
+}
+
+/**
+ * Delete a session (kill tmux + remove agent).
+ */
+export async function deleteSession(sessionName: string): Promise<ServiceResult<{ success: boolean; name: string; type?: string }>> {
+  const agent = getAgentBySession(sessionName)
+  const isCloudAgent = agent?.deployment?.type === 'cloud'
+
+  if (isCloudAgent) {
+    deleteAgentBySession(sessionName, true)
+    return { data: { success: true, name: sessionName, type: 'cloud' }, status: 200 }
+  }
+
+  const runtime = getRuntime()
+  const exists = await runtime.sessionExists(sessionName)
+  if (!exists) {
+    return notFound('Session', sessionName)
+  }
+
+  await runtime.killSession(sessionName)
+  unpersistSession(sessionName)
+  deleteAgentBySession(sessionName, true)
+
+  return { data: { success: true, name: sessionName }, status: 200 }
+}
+
+/**
+ * Rename a session (tmux + registry + cloud agent files).
+ */
+export async function renameSession(oldName: string, newName: string): Promise<ServiceResult<{ success: boolean; oldName: string; newName: string; type?: string }>> {
+  if (!newName || typeof newName !== 'string') {
+    return missingField('newName')
+  }
+  if (!/^[a-zA-Z0-9_-]+$/.test(newName)) {
+    return invalidField('newName', 'Session name can only contain letters, numbers, dashes, and underscores')
+  }
+
+  // Check if cloud agent
+  const agentsDir = path.join(os.homedir(), '.aimaestro', 'agents')
+  const oldAgentFilePath = path.join(agentsDir, `${oldName}.json`)
+  const newAgentFilePath = path.join(agentsDir, `${newName}.json`)
+  const isCloudAgent = fs.existsSync(oldAgentFilePath)
+
+  if (isCloudAgent) {
+    if (fs.existsSync(newAgentFilePath)) {
+      return alreadyExists('Agent', newName)
+    }
+    const agentConfig = JSON.parse(fs.readFileSync(oldAgentFilePath, 'utf8'))
+    agentConfig.id = newName
+    agentConfig.name = newName
+    agentConfig.alias = newName
+    fs.writeFileSync(newAgentFilePath, JSON.stringify(agentConfig, null, 2), 'utf8')
+    fs.unlinkSync(oldAgentFilePath)
+    renameAgentSession(oldName, newName)
+    return { data: { success: true, oldName, newName, type: 'cloud' }, status: 200 }
+  }
+
+  // Local tmux session
+  const runtime = getRuntime()
+  const oldExists = await runtime.sessionExists(oldName)
+  if (!oldExists) {
+    return notFound('Session', oldName)
+  }
+
+  const newExists = await runtime.sessionExists(newName)
+  if (newExists) {
+    return alreadyExists('Session', newName)
+  }
+
+  await runtime.renameSession(oldName, newName)
+  renameAgentSession(oldName, newName)
+
+  return { data: { success: true, oldName, newName }, status: 200 }
+}
+
+/**
+ * Readback window for `sendCommand({ verify: true })`.
+ *
+ * Sized from the lesson 3Metas paid for: they judged four agents "deaf" using a
+ * 2m19s observation window when their own measured response time was 3m48s, and
+ * a window shorter than the thing it measures can only say ABSENT, never SLOW —
+ * so slow came back as absent. A TUI echo is sub-second, but 1s left no margin
+ * on a loaded host, and the cost of reading slow as absent here is a duplicate
+ * nudge on every busy agent.
+ */
+const COMMAND_VERIFY_POLLS = 12
+const COMMAND_VERIFY_DELAY_MS = 250
+/** Initial send plus one clear-and-retype. */
+const COMMAND_MAX_SENDS = 2
+/** Ctrl-U kills the line, emptying the input box before retyping. */
+// Clearing uses backspaces, not C-u — C-u is a no-op in Claude Code's input.
+// See clearInputKeys() in lib/notification-service.
+const COMMAND_CLEAR_SETTLE_MS = 80
+
+/**
+ * Send a command to a tmux session.
+ */
+export async function sendCommand(
+  sessionName: string,
+  command: string,
+  options: { requireIdle?: boolean; addNewline?: boolean; verify?: boolean } = {}
+): Promise<ServiceResult<{ success: boolean; sessionName: string; commandSent?: string; method?: string; wasIdle?: boolean; idle?: boolean; timeSinceActivity?: number; idleThreshold?: number; submitted?: boolean; staged?: boolean }>> {
+  const requireIdle = options.requireIdle !== false
+  const addNewline = options.addNewline !== false
+
+  if (!command || typeof command !== 'string') {
+    return missingField('command')
+  }
+
+  const runtime = getRuntime()
+  const exists = await runtime.sessionExists(sessionName)
+  if (!exists) {
+    return notFound('Session', sessionName)
+  }
+
+  if (requireIdle && !isSessionIdle(sessionName)) {
+    const lastActivity = sessionActivity.get(sessionName)
+    const timeSinceActivity = lastActivity ? Date.now() - lastActivity : 0
+    return serviceError('invalid_state', 'Session is not idle', 409, {
+      details: { success: false, sessionName, idle: false, timeSinceActivity, idleThreshold: IDLE_THRESHOLD_MS }
+    })
+  }
+
+  await runtime.cancelCopyMode(sessionName)
+  await runtime.sendKeys(sessionName, command, { literal: true, enter: addNewline })
+
+  sessionActivity.set(sessionName, Date.now())
+
+  // Opt-in readback. `sendKeys` returning proves bytes reached tmux and nothing
+  // more — the same unearned claim that made the message-wake path report eight
+  // deaf agents as delivered. This route is the 5-minute inbox poll's wake, and
+  // it was never verified at all, so it has been quietly reporting success for
+  // every nudge that staged in an input box and never submitted.
+  //
+  // Off by default: most callers (canvas, chat inject, meetings) send commands
+  // whose text is not expected to echo back the way a prompt does, and paying
+  // ~1s of polling for them would be waste.
+  if (options.verify && addNewline) {
+    let submitted = false
+    let staged = false
+    let stagedPane = ''
+
+    for (let attempt = 1; attempt <= COMMAND_MAX_SENDS; attempt++) {
+      // A resend after staged text must CLEAR the input box first. This is the
+      // recovery the message-wake path got in 0.37.7 and this path did not,
+      // and it turned out to matter far more here: 3Metas showed that the
+      // "…check your inbox" text found staged on seven of eight panes is THIS
+      // poll's wording, not the push's. So the five-minute poll was not a
+      // reliable channel quietly rescuing failed pushes — it was the same
+      // dropped keystroke, retried every five minutes, failing identically
+      // each time. One agent stayed deaf for eleven hours with over a hundred
+      // attempts, each one typing on top of the last.
+      //
+      // Measured by them: Enter once fails, Enter twice fails,
+      // clear-and-retype then Enter succeeds 7 of 7.
+      if (attempt > 1) {
+        // Only our own text: a person may have typed in the box before it (B015).
+        const { key: clearKey, repeat: clearRepeat } = clearInputPlan(stagedPane, command)
+        if (clearRepeat === 0) break
+        await runtime.repeatKey(sessionName, clearKey, clearRepeat)
+        await new Promise(resolve => setTimeout(resolve, COMMAND_CLEAR_SETTLE_MS))
+        await runtime.sendKeys(sessionName, command, { literal: true, enter: true })
+      }
+
+      staged = false
+      for (let poll = 0; poll < COMMAND_VERIFY_POLLS; poll++) {
+        await new Promise(resolve => setTimeout(resolve, COMMAND_VERIFY_DELAY_MS))
+        const pane = await runtime.capturePane(sessionName, 120).catch(() => '')
+        if (!pane) continue
+        if (paneSubmitted(pane, command)) { submitted = true; break }
+        // In the box = the Enter did not take. Stop polling; more waiting will
+        // not submit it, and the next attempt needs to clear first.
+        if (paneStaged(pane, command)) { staged = true; stagedPane = pane; break }
+      }
+      if (submitted || !staged) break
+    }
+
+    return {
+      data: { success: true, sessionName, commandSent: command, method: 'tmux-send-keys', wasIdle: true, submitted, staged },
+      status: 200,
+    }
+  }
+
+  return { data: { success: true, sessionName, commandSent: command, method: 'tmux-send-keys', wasIdle: true }, status: 200 }
+}
+
+/**
+ * Check if a session is idle and ready for commands.
+ */
+export async function checkIdleStatus(sessionName: string): Promise<{
+  sessionName: string
+  exists: boolean
+  idle: boolean
+  lastActivity: number | null
+  timeSinceActivity: number | null
+  idleThreshold: number
+}> {
+  const runtime = getRuntime()
+  const exists = await runtime.sessionExists(sessionName)
+  if (!exists) {
+    return { sessionName, exists: false, idle: false, lastActivity: null, timeSinceActivity: null, idleThreshold: IDLE_THRESHOLD_MS }
+  }
+
+  const lastActivity = sessionActivity.get(sessionName) || null
+  const timeSinceActivity = lastActivity ? Date.now() - lastActivity : null
+  const idle = isSessionIdle(sessionName)
+
+  return { sessionName, exists: true, idle, lastActivity, timeSinceActivity, idleThreshold: IDLE_THRESHOLD_MS }
+}
+
+/**
+ * List persisted sessions that can be restored.
+ */
+export async function listRestorableSessions(): Promise<{ sessions: any[]; count: number }> {
+  const persistedSessions = loadPersistedSessions()
+  const runtime = getRuntime()
+  const discovered = await runtime.listSessions()
+  const activeSessions = discovered.map(s => s.name)
+  const restorableSessions = persistedSessions.filter(
+    session => !activeSessions.includes(session.id)
+  )
+  return { sessions: restorableSessions, count: restorableSessions.length }
+}
+
+/**
+ * Restore one or all persisted sessions.
+ */
+export async function restoreSessions(params: { sessionId?: string; all?: boolean }): Promise<ServiceResult<{ results: RestoreResult[]; summary: { restored: number; failed: number; alreadyExisted: number; total: number } }>> {
+  const persistedSessions = loadPersistedSessions()
+  const sessionsToRestore = params.all
+    ? persistedSessions
+    : persistedSessions.filter(s => s.id === params.sessionId)
+
+  if (sessionsToRestore.length === 0) {
+    return notFound('Session')
+  }
+
+  const runtime = getRuntime()
+  const results: RestoreResult[] = []
+  const { wakeAgent } = await import('@/services/agents-core-service')
+
+  for (const session of sessionsToRestore) {
+    try {
+      if (await runtime.sessionExists(session.id)) {
+        results.push({ sessionId: session.id, status: 'already_exists' })
+        continue
+      }
+
+      // Reconcile before restoring. A record whose agent no longer exists is
+      // stale — restoring it would create an orphan session for a deleted
+      // agent, which is how a 73-entry file accumulated against 8 real
+      // sessions. Drop it instead.
+      const agent = session.agentId ? getAgent(session.agentId) : null
+      if (!agent) {
+        console.warn(`[Restore] Dropping stale record '${session.id}' — agent not in registry`)
+        unpersistSession(session.id)
+        results.push({ sessionId: session.id, status: 'failed' })
+        continue
+      }
+
+      // Re-WAKE rather than createSession(). A bare tmux session would look
+      // alive in the API with nothing running inside it — worse than staying
+      // offline. wakeAgent relaunches the program with the agent's own
+      // settings, falling back to what was recorded at wake time.
+      const wake = await wakeAgent(agent.id, {
+        automatic: true,
+        startProgram: true,
+        sessionIndex: session.sessionIndex ?? 0,
+        program: session.program,
+        projectDirectory: session.workingDirectory,
+        permissionMode: session.permissionMode as any,
+      })
+
+      // Running elsewhere (outside tmux, or streaming): the tmux record is stale, so drop it rather
+      // than try again at every start
+      const wakeData = wake.data as { woken?: boolean; alreadyRunning?: boolean } | undefined
+      if (wake.status === 200 && wakeData?.alreadyRunning && !wakeData.woken) {
+        unpersistSession(session.id)
+        results.push({ sessionId: session.id, status: 'already_exists' })
+        continue
+      }
+      results.push({
+        sessionId: session.id,
+        status: wake.status === 200 ? 'restored' : 'failed',
+      })
+    } catch (err) {
+      console.warn(`[Restore] ${session.id} failed:`, err)
+      results.push({ sessionId: session.id, status: 'failed' })
+    }
+  }
+
+  return {
+    data: {
+      results,
+      summary: {
+        restored: results.filter(r => r.status === 'restored').length,
+        failed: results.filter(r => r.status === 'failed').length,
+        alreadyExisted: results.filter(r => r.status === 'already_exists').length,
+        total: results.length
+      }
+    },
+    status: 200
+  }
+}
+
+/**
+ * Delete a persisted session from storage.
+ */
+export function deletePersistedSession(sessionId: string): ServiceResult<{ success: boolean }> {
+  if (!sessionId) {
+    return missingField('sessionId')
+  }
+  const success = unpersistSession(sessionId)
+  if (!success) {
+    return operationFailed('delete session')
+  }
+  return { data: { success: true }, status: 200 }
+}
+
+
+// ---------------------------------------------------------------------------
+// Resumed after you answered
+// ---------------------------------------------------------------------------
+
+/** Transcript growth this long after a block was reported means the agent resumed */
+const RESUME_MARGIN_MS = 3000
+
+/**
+ * Has the agent written to its transcript since it reported being blocked?
+ *
+ * Claude Code fires no event when you answer a permission or a question. The
+ * hook reports the resume itself on PostToolBatch (async, after the approved
+ * tool ran); this is the fallback for hosts whose hooks predate that, checked
+ * only when the status is read (one stat, no watcher). The transcript is
+ * written the moment the agent resumes; an unanswered dialog does not write.
+ */
+export function transcriptResumedSince(transcriptPath: string | undefined, reportedAt: number): boolean {
+  if (!transcriptPath) return false
+  try {
+    return fs.statSync(transcriptPath).mtimeMs > reportedAt + RESUME_MARGIN_MS
+  } catch {
+    return false
+  }
+}

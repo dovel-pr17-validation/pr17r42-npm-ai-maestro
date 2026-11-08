@@ -1,0 +1,364 @@
+/**
+ * Tests for the Jev memory classifier (lib/memory/jev-provider.ts, settings.ts).
+ *
+ * Memory consolidation had never run on any agent: it needed an LLM that was
+ * not configured and reported the failure in a field the UI never read. The
+ * classifier path replaces extraction with classification of verbatim
+ * exchanges. The properties that matter:
+ *   - chunking never skips or duplicates messages across incremental runs
+ *   - an unanswered trailing turn is left for the next run
+ *   - a bad key aborts the run (fatal) instead of silently marking progress
+ *   - the API key never leaves the host unmasked
+ */
+
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { chunkConversation, JevClassifier, ClassifierError, classifyRelations, classifyEntityRelations, defang } from '@/lib/memory/jev-provider'
+import { maskClassifierSettings, DEFAULT_CLASSIFIER_SETTINGS } from '@/lib/memory/settings'
+import type { ConversationMessage } from '@/lib/memory/types'
+
+const u = (content: string): ConversationMessage => ({ role: 'user', content })
+const a = (content: string): ConversationMessage => ({ role: 'assistant', content })
+const LONG = 'x'.repeat(100)
+
+const texts = (c: { passages: { text: string }[] }) => c.passages.map(p => p.text)
+const PARA = 'p'.repeat(130)
+
+describe('chunkConversation', () => {
+  it('pairs each user turn with the assistant replies that follow it', () => {
+    const msgs = [u(`use CozoDB ${LONG}`), a(`reading ${PARA}`), a(`decided: CozoDB ${PARA}`), u(`next ${LONG}`), a(`done ${PARA}`)]
+    const chunks = chunkConversation(msgs, 0)
+    expect(chunks).toHaveLength(2)
+    expect(texts(chunks[0])).toEqual([`USER: use CozoDB ${LONG}`, `reading ${PARA}`, `decided: CozoDB ${PARA}`])
+    expect(chunks[0].endIndex).toBe(3)
+    expect(chunks[1].endIndex).toBe(5)
+    expect(chunks[1].startIndex).toBe(3)
+    expect(chunks[0].exchange).toBe(`USER: use CozoDB ${LONG}\n\nASSISTANT: reading ${PARA}\n\ndecided: CozoDB ${PARA}`)
+  })
+
+  it('stores each passage verbatim but judges it in the context of the request', () => {
+    const [chunk] = chunkConversation([u(`should we store verbatim? ${LONG}`), a(`Decision: store verbatim. ${PARA}`)], 0)
+    const reply = chunk.passages[1]
+    expect(reply.text).toBe(`Decision: store verbatim. ${PARA}`)
+    expect(reply.state).toContain('CONTEXT (the user\'s request this passage belongs to): should we store verbatim?')
+    expect(reply.state).toContain('PASSAGE TO JUDGE (said by the assistant): Decision: store verbatim.')
+  })
+
+  it('splits replies into paragraphs and drops short lines and code blocks', () => {
+    const reply = [`first point ${PARA}`, 'ok.', '```ts\nconst x = 1 ' + PARA + '\n```', `second point ${PARA}`].join('\n\n')
+    const [chunk] = chunkConversation([u(`q ${LONG}`), a(reply)], 0)
+    expect(texts(chunk)).toEqual([`USER: q ${LONG}`, `first point ${PARA}`, `second point ${PARA}`])
+  })
+
+  it('leaves an unanswered final user turn for the next run', () => {
+    const msgs = [u(`first ${LONG}`), a(`reply ${PARA}`), u('still waiting for a reply')]
+    const chunks = chunkConversation(msgs, 0)
+    expect(chunks).toHaveLength(1)
+    expect(chunks[0].endIndex).toBe(2) // offset stops before the unanswered turn
+  })
+
+  it('resumes from an offset without re-reading consumed messages', () => {
+    const msgs = [u(`one ${LONG}`), a('r1'), u(`two ${LONG}`), a('r2')]
+    const first = chunkConversation(msgs, 0)
+    const resumed = chunkConversation(msgs, first[0].endIndex)
+    expect(resumed).toHaveLength(1)
+    expect(texts(resumed[0])).toEqual([`USER: two ${LONG}`])
+  })
+
+  it('merges consecutive user messages into one turn', () => {
+    const chunks = chunkConversation([u(`part one ${LONG}`), u('part two'), a('reply')], 0)
+    expect(chunks).toHaveLength(1)
+    expect(texts(chunks[0])[0]).toContain('part one')
+    expect(texts(chunks[0])[0]).toContain('part two')
+  })
+
+  it('consumes tiny exchanges without anything to classify', () => {
+    const chunks = chunkConversation([u('go'), a('ok')], 0)
+    expect(chunks).toMatchObject([{ startIndex: 0, endIndex: 2, passages: [] }])
+    expect(chunks[0].exchange).toBe('USER: go\n\nASSISTANT: ok')
+  })
+
+  it('strips harness noise from user turns', () => {
+    const [chunk] = chunkConversation([u(`<system-reminder>ignore me</system-reminder>real question ${LONG}`), a('answer')], 0)
+    expect(texts(chunk)[0]).not.toContain('ignore me')
+    expect(texts(chunk)[0]).toContain('real question')
+  })
+
+  it('does not treat background-task notifications as user turns', () => {
+    const msgs = [u(`real ask ${LONG}`), a('working'), u('<task-notification><task-id>x</task-id>done</task-notification>'), a(`agent finished ${PARA}`)]
+    const chunks = chunkConversation(msgs, 0)
+    expect(chunks).toHaveLength(1)
+    expect(texts(chunks[0])).toEqual([`USER: real ask ${LONG}`, `agent finished ${PARA}`])
+  })
+
+  it('ignores the compaction summary Claude Code injects as a user turn', () => {
+    const chunks = chunkConversation([u(`This session is being continued from a previous conversation. Summary: ${LONG}`), a(`resuming ${PARA}`)], 0)
+    // nothing to classify, but the offset still moves past it so the conversation is not retried forever
+    expect(chunks).toEqual([{ startIndex: 0, endIndex: 2, exchange: '', passages: [] }])
+  })
+
+  it('keeps head and tail of very long passages', () => {
+    const para = 'START' + 'y'.repeat(10000) + 'CONCLUSION'
+    const [chunk] = chunkConversation([u(`q ${LONG}`), a(para)], 0)
+    const stored = texts(chunk)[1]
+    expect(stored).toContain('START')
+    expect(stored).toContain('CONCLUSION')
+    expect(stored.length).toBeLessThan(2100)
+  })
+})
+
+describe('corrections: a user turn judged against what the agent said before it', () => {
+  it('shows the previous reply to the classifier and marks the turn as one that can correct', () => {
+    const msgs = [u(`deploy it ${LONG}`), a(`I will hardcode the ALB internal address. ${PARA}`), u(`no, that makes no sense, use the service discovery name ${LONG}`), a(`ok ${PARA}`)]
+    const [first, second] = chunkConversation(msgs, 0)
+    const firstUser = first.passages[0]
+    const correction = second.passages[0]
+    expect(firstUser.canCorrect).toBe(false) // nothing said before it
+    expect(correction.canCorrect).toBe(true)
+    expect(correction.state).toContain('WHAT THE ASSISTANT SAID JUST BEFORE: I will hardcode the ALB internal address.')
+    expect(correction.state).toContain('PASSAGE TO JUDGE (said by the user): no, that makes no sense')
+  })
+
+  it('a run that starts mid-conversation still sees the reply before its first turn', () => {
+    const msgs = [u(`q ${LONG}`), a(`the bucket is staging ${PARA}`), u(`wrong, it is production ${LONG}`), a(`noted ${PARA}`)]
+    const [chunk] = chunkConversation(msgs, 2)
+    expect(chunk.passages[0].canCorrect).toBe(true)
+    expect(chunk.passages[0].state).toContain('the bucket is staging')
+  })
+
+  it('drops notifications typed into the session by AI Maestro and the harness', () => {
+    const msgs = [a(`earlier ${PARA}`), u('You have a new message from pas-lola (mini-lola) about "X". Please check your inbox using the agent-messaging skill.'), a(`checking ${PARA}`)]
+    const chunks = chunkConversation(msgs, 0)
+    expect(chunks.flatMap(c => c.passages).some(p => p.text.startsWith('USER:'))).toBe(false)
+  })
+
+  it('drops the current pane notification format too', () => {
+    const msgs = [a(`earlier ${PARA}`), u('[#zl8spaj1] [MESSAGE] Deploy finished — from pas-lola@mini-lola — the staging deploy is green, nothing for you to do'), a(`checking ${PARA}`)]
+    const chunks = chunkConversation(msgs, 0)
+    expect(chunks.flatMap(c => c.passages).some(p => p.text.startsWith('USER:'))).toBe(false)
+  })
+})
+
+describe('JevClassifier', () => {
+  const settings = { ...DEFAULT_CLASSIFIER_SETTINGS, apiKey: 'k' }
+  afterEach(() => vi.unstubAllGlobals())
+
+  const answer = (durable: number, category: string, importance: number) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      model: 'jev-1.13.0',
+      answers: {
+        durable: { noul: durable },
+        category: { choice: category, confidence: 0.9 },
+        importance: { score: importance },
+      },
+      usage: { input_tokens: 600 },
+    }),
+  })
+
+  it('parses answers and applies thresholds', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => answer(0.88, 'decision', 3.2)))
+    const c = new JevClassifier(settings)
+    const r = await c.classify('state')
+    expect(r).toMatchObject({ durable: 0.88, category: 'decision', importance: 3.2, model: 'jev-1.13.0' })
+    expect(c.accepts(r)).toBe(true)
+    expect(c.accepts({ ...r, durable: 0.1 })).toBe(false)
+    expect(c.accepts({ ...r, category: 'none' })).toBe(false)
+    expect(c.accepts({ ...r, importance: 1 })).toBe(false)
+  })
+
+  it('asks the correction question only when the turn can correct, and lets a correction in on a lower bar', async () => {
+    const fetchMock = vi.fn(async (_u: string, init: any) => {
+      const body = JSON.parse(init.body)
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          model: 'jev', answers: {
+            durable: { noul: 0.55 }, category: { choice: 'none', confidence: 0.5 }, importance: { score: 1.5 },
+            ...(body.questions.correction ? { correction: { noul: 0.93 } } : {}),
+          },
+        }),
+      }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const c = new JevClassifier(settings)
+    const plain = await c.classify('state')
+    expect(plain.correction).toBeUndefined()
+    expect(c.accepts(plain)).toBe(false) // category none, low importance
+    const corrected = await c.classify('state', { canCorrect: true })
+    expect(corrected.correction).toBe(0.93)
+    expect(c.isCorrection(corrected)).toBe(true)
+    expect(c.accepts(corrected)).toBe(true) // a correction is kept although it scored low otherwise
+    expect(c.accepts({ ...corrected, durable: 0.3 })).toBe(false) // but not one about nothing lasting
+    expect(c.isCorrection({ ...corrected, correction: 0.7 })).toBe(false)
+  })
+
+  it('retries firewall-blocked content once, defanged', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 403, text: async () => '' })
+      .mockResolvedValueOnce(answer(0.9, 'decision', 3))
+    vi.stubGlobal('fetch', fetchMock)
+    const r = await new JevClassifier(settings).classify("' OR 1=1; DROP TABLE users; --")
+    expect(r.category).toBe('decision')
+    const retried = JSON.parse(fetchMock.mock.calls[1][1].body).state
+    expect(retried).not.toContain("'")
+    expect(retried).not.toContain('--')
+  })
+
+  it('marks content the firewall keeps refusing as blocked, not fatal', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 403, text: async () => '' })))
+    const err = await new JevClassifier(settings).classify('../../etc/passwd').catch(e => e)
+    expect(err).toBeInstanceOf(ClassifierError)
+    expect(err.blocked).toBe(true)
+    expect(err.fatal).toBe(false)
+  })
+
+  it('treats a rejected key as fatal', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 401, text: async () => '' })))
+    const err = await new JevClassifier(settings).classify('state').catch(e => e)
+    expect(err).toBeInstanceOf(ClassifierError)
+    expect(err.fatal).toBe(true)
+  })
+
+  it('retries rate limits before succeeding', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 429 })
+      .mockResolvedValueOnce(answer(0.9, 'fact', 3))
+    vi.stubGlobal('fetch', fetchMock)
+    const p = new JevClassifier(settings).classify('state')
+    await vi.runAllTimersAsync()
+    await expect(p).resolves.toMatchObject({ category: 'fact' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    vi.useRealTimers()
+  })
+})
+
+describe('maskClassifierSettings', () => {
+  it('never exposes the API key', () => {
+    const masked = maskClassifierSettings({ ...DEFAULT_CLASSIFIER_SETTINGS, apiKey: 'apikey_secret_abcd' })
+    expect(JSON.stringify(masked)).not.toContain('secret')
+    expect(masked.apiKeyHint).toBe('…abcd')
+    expect(masked.configured).toBe(true)
+  })
+
+  it('reports unconfigured when no key is stored', () => {
+    const masked = maskClassifierSettings(DEFAULT_CLASSIFIER_SETTINGS)
+    expect(masked.configured).toBe(false)
+    expect(masked.apiKeyHint).toBeNull()
+  })
+})
+
+// Regression: memory vectors were written as `<0.1, 0.2>`, which CozoDB cannot
+// parse as a value. Every memory store and every memory search threw, so no
+// long-term memory was ever stored on any agent.
+describe('toCozoVector', () => {
+  it('builds a vec([...]) literal, never the <...> type syntax', async () => {
+    const { toCozoVector } = await import('@/lib/cozo-schema-memory')
+    expect(toCozoVector([0.5, -0.25])).toBe('vec([0.5, -0.25])')
+    expect(toCozoVector([0.5, -0.25])).not.toContain('<')
+  })
+
+  it('replaces non-finite values so the query still parses', async () => {
+    const { toCozoVector } = await import('@/lib/cozo-schema-memory')
+    expect(toCozoVector([NaN, Infinity, 1])).toBe('vec([0, 0, 1])')
+  })
+})
+
+// The memory graph: edges come from one classifier call per new memory.
+describe('classifyRelations', () => {
+  const settings = { ...DEFAULT_CLASSIFIER_SETTINGS, apiKey: 'k' }
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('asks one question per candidate and keeps confident, non-none answers', async () => {
+    const fetchMock = vi.fn(async (_url: string, init: any) => {
+      const body = JSON.parse(init.body)
+      expect(Object.keys(body.questions)).toEqual(['relation_1', 'relation_2', 'relation_3'])
+      expect(body.state).toContain('NEW MEMORY: store verbatim')
+      expect(body.state).toContain('EXISTING MEMORY 2: use haiku')
+      return {
+        ok: true, status: 200,
+        json: async () => ({ model: 'jev', answers: {
+          relation_1: { choice: 'supports', confidence: 0.9 },
+          relation_2: { choice: 'supersedes', confidence: 0.8 },
+          relation_3: { choice: 'contradicts', confidence: 0.4 }, // below cutoff
+        } }),
+      }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const rels = await classifyRelations(new JevClassifier(settings), 'store verbatim', ['a', 'use haiku', 'c'])
+    expect(rels).toEqual([
+      { index: 0, relation: 'supports', confidence: 0.9 },
+      { index: 1, relation: 'supersedes', confidence: 0.8 },
+    ])
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('makes no call without candidates', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    expect(await classifyRelations(new JevClassifier(settings), 'x', [])).toEqual([])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('defang', () => {
+  it('neutralises the patterns the API firewall blocks, keeping the text readable', () => {
+    expect(defang("' OR 1=1; --")).toBe('\u2019 OR 1=1\u037e \u2014')
+    expect(defang('../../etc/passwd')).toBe('..\u2044..\u2044etc/passwd')
+    expect(defang('We decided to deploy.')).toBe('We decided to deploy.')
+  })
+})
+
+describe('classifyEntityRelations', () => {
+  const settings = { ...DEFAULT_CLASSIFIER_SETTINGS, apiKey: 'k' }
+  afterEach(() => vi.unstubAllGlobals())
+  const reply = (answers: Record<string, unknown>) => ({ ok: true, status: 200, json: async () => ({ model: 'jev', answers }) })
+
+  it('reads verbs per pair, including reversed direction, and skips none/low confidence', async () => {
+    const fetchMock = vi.fn(async () => reply({
+      pair_1: { choice: 'runs_on', confidence: 0.95 },      // gateway runs_on host
+      pair_2: { choice: 'calls__rev', confidence: 0.9 },    // reversed: C calls A
+      pair_3: { choice: 'none', confidence: 0.8 },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const rels = await classifyEntityRelations(new JevClassifier(settings), 'statement', ['gateway', 'host', 'C'])
+    expect(rels).toEqual([
+      { subject: 'gateway', predicate: 'runs_on', object: 'host', confidence: 0.95 },
+      { subject: 'C', predicate: 'calls', object: 'gateway', confidence: 0.9 },
+    ])
+  })
+
+  it('only asks about pairs that have no relation yet, and passes the evidence', async () => {
+    const fetchMock = vi.fn(async (_u: string, init: any) => {
+      const body = JSON.parse(init.body)
+      expect(Object.keys(body.questions)).toHaveLength(2) // 3 pairs minus 1 already related
+      expect(body.state).toContain('EVIDENCE (where it was said):')
+      return reply({})
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    await classifyEntityRelations(new JevClassifier(settings), 's', ['a', 'b', 'c'], 0.7, new Set(['a|b']), 'the passage')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('makes no call when every pair is already related', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    expect(await classifyEntityRelations(new JevClassifier(settings), 's', ['a', 'b'], 0.7, new Set(['a|b']))).toEqual([])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('classifyRelations — related is not an edge', () => {
+  const settings = { ...DEFAULT_CLASSIFIER_SETTINGS, apiKey: 'k' }
+  afterEach(() => vi.unstubAllGlobals())
+  it('drops "related" and requires high confidence for "supports"', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ model: 'jev', answers: {
+      relation_1: { choice: 'related', confidence: 0.99 },
+      relation_2: { choice: 'supports', confidence: 0.7 },
+      relation_3: { choice: 'supports', confidence: 0.85 },
+    } }) })))
+    const rels = await classifyRelations(new JevClassifier(settings), 'new', ['a', 'b', 'c'])
+    expect(rels).toEqual([{ index: 2, relation: 'supports', confidence: 0.85 }])
+  })
+})

@@ -1,0 +1,48 @@
+/**
+ * Agent Playback API
+ *
+ * GET  /api/agents/[id]/playback — Get playback state
+ * POST /api/agents/[id]/playback — Control playback
+ *
+ * Thin wrapper — business logic in services/agents-playback-service.ts
+ */
+
+import { NextResponse } from 'next/server'
+import { getPlaybackState, controlPlayback } from '@/services/agents-playback-service'
+import { toResponse } from '@/app/api/_helpers'
+
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { searchParams } = new URL(request.url)
+    const sessionId = searchParams.get('sessionId')
+
+    const result = getPlaybackState((await params).id, sessionId)
+    return toResponse(result)
+  } catch (error) {
+    console.error('[Playback API] Failed to get playback state:', error)
+    return NextResponse.json(
+      { success: false, error: error instanceof Error ? error.message : 'Failed to get playback state' },
+      { status: 500 }
+    )
+  }
+}
+
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const body = await request.json()
+    const result = controlPlayback((await params).id, body)
+    return toResponse(result)
+  } catch (error) {
+    console.error('[Playback API] Failed to control playback:', error)
+    return NextResponse.json(
+      { success: false, error: error instanceof Error ? error.message : 'Failed to control playback' },
+      { status: 500 }
+    )
+  }
+}

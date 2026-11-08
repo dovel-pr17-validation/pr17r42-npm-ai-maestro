@@ -1,0 +1,1132 @@
+'use client'
+
+import SecretRequestCard from '@/components/chat/SecretRequestCard'
+import { useSecretRequests } from '@/hooks/useSecretRequests'
+import SqlWriteRequestCard from '@/components/chat/SqlWriteRequestCard'
+import ReactionBar from '@/components/chat/ReactionBar'
+import DeviceMessage, { SpeakingMessage } from '@/components/chat/DeviceMessage'
+import { useChatReactions } from '@/hooks/useChatReactions'
+import { useSqlWriteRequests } from '@/hooks/useSqlWriteRequests'
+import { PRESENCE_STYLE } from '@/lib/agent-presence'
+import { useSessionActivity } from '@/hooks/useSessionActivity'
+import AgentStatusRow from './AgentStatusRow'
+import AgentIdentityLine from './AgentIdentityLine'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { SendHorizontal, ChevronDown, ChevronRight, Loader2, Wrench, Copy, Check } from 'lucide-react'
+import { reconcilePending } from '@/lib/pending-reconcile.mjs'
+import {
+  isQuestionAnswered as sharedIsAnswered,
+  isQuestionCurrent as sharedIsCurrent,
+  paneCardBelongsToTranscriptQuestion,
+} from '@/lib/question-state.mjs'
+import MobileToolBurstGroup from '@/components/chat/MobileToolBurstGroup'
+import LoadEarlierMessages from '@/components/chat/LoadEarlierMessages'
+import { mergeHistory, prependPage, type HistoryCursor } from '@/lib/chat-history-paging'
+import { useKeepScrollOnPrepend } from '@/hooks/useKeepScrollOnPrepend'
+import { groupMessages, getToolPreviewText, messageTime, withDividers, type ToolBurst } from '@/lib/chat-utils'
+import { useChatFind } from '@/hooks/useChatFind'
+import { ChatFind, ChatDividerLine } from '@/components/chat/ChatFind'
+
+interface MobileChatViewProps {
+  agentId: string
+  agentName: string
+  sessionName?: string  // tmux session name for WebSocket (falls back to agentName)
+  hostId?: string       // Host ID for remote agent routing (e.g., 'mac-mini')
+  baseUrl?: string      // getAgentBaseUrl(agent): REST goes to the agent's host, '' for this one
+  workingDirectory?: string | null  // shown under the status, like the desktop header
+  address?: string | null           // the agent's AMP address
+}
+
+interface ChatMessage {
+  type: string
+  uuid?: string
+  timestamp?: string
+  thinking?: string
+  message?: {
+    role?: string
+    content?: string | Array<{
+      type: string
+      text?: string
+      name?: string
+      id?: string
+      input?: { command?: string; file_path?: string; pattern?: string; query?: string; questions?: any[]; [key: string]: any }
+      thinking?: string
+      tool_use_id?: string
+    }>
+  }
+  // For queue-operation type
+  operation?: 'enqueue' | 'dequeue'
+  content?: string
+}
+
+// Copy button with checkmark feedback
+function CopyButton({ text, className = '' }: { text: string; className?: string }) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      // Fallback for older browsers
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      textarea.style.position = 'fixed'
+      textarea.style.opacity = '0'
+      document.body.appendChild(textarea)
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    }
+  }
+
+  return (
+    <button
+      onClick={handleCopy}
+      className={`p-1.5 rounded-md transition-colors ${
+        copied
+          ? 'bg-green-600/20 text-green-400'
+          : 'bg-gray-700/50 text-gray-400 hover:text-gray-200 active:bg-gray-600/50'
+      } ${className}`}
+      aria-label={copied ? 'Copied' : 'Copy'}
+    >
+      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+    </button>
+  )
+}
+
+// Code block with copy button
+function CodeBlock({ code }: { code: string }) {
+  return (
+    <div className="relative group my-1 overflow-hidden">
+      <div className="absolute top-1 right-1 z-10">
+        <CopyButton text={code} />
+      </div>
+      <pre className="bg-gray-900 rounded-md px-3 py-2 pr-9 overflow-x-auto max-w-full text-xs font-mono text-gray-200 select-text">
+        {code}
+      </pre>
+    </div>
+  )
+}
+
+// Lightweight markdown renderer
+function renderMarkdown(text: string): React.JSX.Element {
+  const lines = text.split('\n')
+  const elements: React.JSX.Element[] = []
+  let inCodeBlock = false
+  let codeLines: string[] = []
+  let codeKey = 0
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+
+    if (line.startsWith('```')) {
+      if (inCodeBlock) {
+        const code = codeLines.join('\n')
+        elements.push(<CodeBlock key={`code-${codeKey++}`} code={code} />)
+        codeLines = []
+        inCodeBlock = false
+      } else {
+        inCodeBlock = true
+      }
+      continue
+    }
+
+    if (inCodeBlock) {
+      codeLines.push(line)
+      continue
+    }
+
+    // List items
+    if (line.match(/^[-*]\s/)) {
+      elements.push(
+        <div key={i} className="flex gap-1.5 ml-2">
+          <span className="text-gray-500 flex-shrink-0">&#x2022;</span>
+          <span>{renderInline(line.replace(/^[-*]\s/, ''))}</span>
+        </div>
+      )
+      continue
+    }
+
+    // Regular line
+    if (line.trim()) {
+      elements.push(
+        <p key={i} className="whitespace-pre-wrap break-words" style={{ overflowWrap: 'anywhere' }}>
+          {renderInline(line)}
+        </p>
+      )
+    } else {
+      elements.push(<div key={i} className="h-2" />)
+    }
+  }
+
+  // Close unclosed code block
+  if (inCodeBlock && codeLines.length > 0) {
+    const code = codeLines.join('\n')
+    elements.push(<CodeBlock key={`code-${codeKey}`} code={code} />)
+  }
+
+  return <>{elements}</>
+}
+
+function renderInline(text: string): (string | React.JSX.Element)[] {
+  const parts: (string | React.JSX.Element)[] = []
+  // Match bold, inline code, or plain text
+  const regex = /(\*\*(.+?)\*\*)|(`([^`]+?)`)/g
+  let lastIndex = 0
+  let match
+  let key = 0
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(text.slice(lastIndex, match.index))
+    }
+    if (match[2]) {
+      parts.push(<strong key={key++}>{match[2]}</strong>)
+    } else if (match[4]) {
+      parts.push(
+        <code key={key++} className="bg-gray-700 px-1 py-0.5 rounded text-xs font-mono text-blue-300">
+          {match[4]}
+        </code>
+      )
+    }
+    lastIndex = match.index + match[0].length
+  }
+  if (lastIndex < text.length) {
+    parts.push(text.slice(lastIndex))
+  }
+  return parts
+}
+
+// Extract display text from a message
+function extractText(msg: ChatMessage): string {
+  const content = msg.message?.content
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .filter(b => b.type === 'text' && b.text)
+      .map(b => b.text!)
+      .join('\n')
+  }
+  // Handle queue-operation (enqueued user messages)
+  if (msg.type === 'queue-operation' && msg.content) {
+    return msg.content
+  }
+  return ''
+}
+
+/** One key per message: its uuid, else type, time and text (uuid-less batches overlap otherwise) */
+function chatMessageKey(m: ChatMessage): string {
+  return m.uuid || `${m.type}|${m.timestamp || ''}|${extractText(m).slice(0, 120)}`
+}
+
+// Extract tool use info from a message
+function extractToolUses(msg: ChatMessage): { name: string; preview: string }[] {
+  const content = msg.message?.content
+  if (!Array.isArray(content)) return []
+  return content
+    .filter(b => b.type === 'tool_use' && b.name)
+    .map(b => ({
+      name: b.name!,
+      preview: getToolPreviewText(b.name!, b.input)
+    }))
+}
+
+// Extract AskUserQuestion tool_use from a message
+function extractAskUserQuestion(msg: ChatMessage): { id?: string; questions: Array<{ question: string; header?: string; options: Array<{ label: string; description?: string }>; multiSelect?: boolean }> } | null {
+  const content = msg.message?.content
+  if (!Array.isArray(content)) return null
+  const block = content.find(b => b.type === 'tool_use' && b.name === 'AskUserQuestion')
+  if (!block?.input?.questions) return null
+  return { id: block.id, questions: block.input.questions }
+}
+
+function ThinkingBlock({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false)
+  const preview = text.slice(0, 80) + (text.length > 80 ? '...' : '')
+
+  return (
+    <div
+      className="mx-3 my-1 px-3 py-2 rounded-lg bg-gray-800/50 border border-gray-700/50 cursor-pointer"
+      onClick={() => setExpanded(!expanded)}
+    >
+      <div className="flex items-center gap-1.5 text-xs text-gray-500">
+        {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        <span className="italic">Thinking</span>
+      </div>
+      {expanded ? (
+        <p className="text-xs text-gray-400 mt-1 whitespace-pre-wrap select-text max-h-48 overflow-y-auto">{text}</p>
+      ) : (
+        <p className="text-xs text-gray-500 mt-0.5 truncate">{preview}</p>
+      )}
+    </div>
+  )
+}
+
+export default function MobileChatView({ agentId, agentName, sessionName: sessionNameProp, hostId, baseUrl = '', workingDirectory, address }: MobileChatViewProps) {
+  const { requests: secretRequests, refresh: refreshSecretRequests } = useSecretRequests(agentId)
+  const { requests: sqlWriteRequests, refresh: refreshSqlWriteRequests } = useSqlWriteRequests(agentId)
+  // One status for every view (the sidebar and terminal read the same feed)
+  const { presenceOf, snapshotOf } = useSessionActivity()
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [hookState, setHookState] = useState<{
+    status?: string;
+    description?: string;
+    message?: string;
+    toolName?: string;
+    toolInput?: {
+      command?: string;
+      file_path?: string;
+      path?: string;
+      [key: string]: any;
+    };
+    options?: Array<{
+      key: string;
+      label: string;
+      action: string;
+    }>;
+    notificationType?: string
+    updatedAt?: string;
+  } | null>(null)
+  const [input, setInput] = useState('')
+  const [sending, setSending] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const chatReactions = useChatReactions(agentId, baseUrl, messages, setError)
+  const [pendingMessages, setPendingMessages] = useState<Array<{ text: string; timestamp: string }>>([])
+  const [answeredQuestions, setAnsweredQuestions] = useState<Set<string>>(new Set())
+  const [liveActivity, setLiveActivity] = useState<{ label: string; detail?: string } | null>(null)
+
+  const [chatWsConnected, setChatWsConnected] = useState(false)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const prevLastMsgIdRef = useRef<string | null>(null)
+  const lastPongRef = useRef<number>(Date.now())
+  const wsRef = useRef<WebSocket | null>(null)
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | undefined>(undefined)
+  const reconnectAttemptsRef = useRef(0)
+  // Older history, loaded page by page when the person scrolls up (lib/chat-history-paging)
+  const messagesRef = useRef<ChatMessage[]>([])
+  messagesRef.current = messages
+  const historyCursorRef = useRef<HistoryCursor | null>(null)
+  const [historyHasMore, setHistoryHasMore] = useState(false)
+  const [olderLoading, setOlderLoading] = useState(false)
+  const [olderFailed, setOlderFailed] = useState(false)
+  const olderTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const keepScrollOnPrepend = useKeepScrollOnPrepend(scrollContainerRef, messages)
+
+  // The session name to use for the WebSocket URL
+  const wsSessionName = sessionNameProp || agentName
+
+  // ── WebSocket connection for chat ─────────────────────────────────
+  const getChatWsUrl = useCallback(() => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const host = window.location.host
+    let url = `${protocol}//${host}/term?name=${encodeURIComponent(wsSessionName)}&chatOnly=1`
+    if (hostId && hostId !== 'local') {
+      url += `&host=${encodeURIComponent(hostId)}`
+    }
+    return url
+  }, [wsSessionName, hostId])
+
+  const sendChatWs = useCallback((type: string, payload?: Record<string, any>) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type, ...payload }))
+      return true
+    }
+    return false
+  }, [])
+
+  // Ask for the page before the oldest loaded message. A host on an older version answers with the
+  // full history instead (no historyStart), which ends paging; no answer at all becomes "try again".
+  const loadOlder = useCallback(() => {
+    const cursor = historyCursorRef.current
+    if (!cursor || cursor.start <= 0 || olderLoading) return
+    if (!sendChatWs('chat:requestHistory', { agentId, before: cursor.start, conversationFile: cursor.file })) return
+    setOlderLoading(true)
+    setOlderFailed(false)
+    clearTimeout(olderTimeoutRef.current)
+    olderTimeoutRef.current = setTimeout(() => { setOlderLoading(false); setOlderFailed(true) }, 15000)
+  }, [sendChatWs, agentId, olderLoading])
+
+  const find = useChatFind({ agentId, send: sendChatWs, cursorRef: historyCursorRef, rootRef: scrollContainerRef, messages })
+  const receiveFind = useRef(find.receive)
+  receiveFind.current = find.receive
+
+  // Another agent in the same view: its history starts fresh
+  useEffect(() => {
+    historyCursorRef.current = null
+    setHistoryHasMore(false)
+    setOlderLoading(false)
+    setOlderFailed(false)
+    return () => clearTimeout(olderTimeoutRef.current)
+  }, [agentId])
+
+  // Connect WebSocket on mount
+  useEffect(() => {
+    if (!agentId) return
+
+    const connect = () => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) return
+      // Close zombie sockets stuck in CONNECTING
+      if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
+        wsRef.current.close()
+        wsRef.current = null
+      }
+
+      const ws = new WebSocket(getChatWsUrl())
+
+      ws.onopen = () => {
+        console.log(`[MobileChatView] Connected to chat WS for ${wsSessionName}`)
+        setChatWsConnected(true)
+        reconnectAttemptsRef.current = 0
+        ws.send(JSON.stringify({ type: 'chat:requestHistory', agentId }))
+        setError(null)
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+
+          switch (data.type) {
+            case 'chat:history': {
+              chatReactions.reload()
+              const history = data.data || {}
+              const merged = mergeHistory(messagesRef.current, historyCursorRef.current, history, chatMessageKey)
+              historyCursorRef.current = merged.cursor
+              setHistoryHasMore(merged.hasMore)
+              setOlderLoading(false)
+              setMessages(merged.messages)
+              setHookState(history.hookState || null)
+              break
+            }
+
+            case 'chat:reaction':
+              chatReactions.apply(data)
+              break
+            case 'chat:searchResults':
+              receiveFind.current(data.data || {})
+              break
+
+            case 'chat:historyPage': {
+              clearTimeout(olderTimeoutRef.current)
+              const res = prependPage(messagesRef.current, historyCursorRef.current, data.data || {}, chatMessageKey)
+              historyCursorRef.current = res.cursor
+              setHistoryHasMore(res.hasMore)
+              setOlderFailed(res.failed)
+              setOlderLoading(false)
+              if (res.messages !== messagesRef.current) {
+                keepScrollOnPrepend()
+                setMessages(res.messages)
+              }
+              break
+            }
+
+            case 'chat:messages': {
+              const newMsgs = data.data || []
+              if (newMsgs.length > 0) {
+                setMessages(prev => {
+                  const existingKeys = new Set(prev.map(chatMessageKey))
+                  const uniqueNew = newMsgs.filter((m: ChatMessage) => !existingKeys.has(chatMessageKey(m)))
+                  if (uniqueNew.length === 0) return prev
+                  // No cap: older pages the person loaded stay (the cursor counts from the front)
+                  return [...prev, ...uniqueNew]
+                })
+                // Clear a bubble only when ITS OWN text is in the transcript.
+                // This used to clear ALL pending on any incoming batch, so
+                // unrelated agent output marked your message delivered when it
+                // may never have landed. See lib/pending-reconcile.mjs.
+                setPendingMessages(prev => reconcilePending(prev, newMsgs, extractText) as typeof prev)
+                if (newMsgs.some((m: ChatMessage) => m.type === 'assistant')) {
+                  setLiveActivity(null)
+                }
+              }
+              break
+            }
+
+            case 'chat:hookState': {
+              setHookState(data.data || null)
+              // Don't clear pending here — let chat:messages confirm with content match
+              break
+            }
+
+            case 'chat:sent': {
+              break
+            }
+
+            case 'chat:activity': {
+              setLiveActivity(data.data || null)
+              break
+            }
+
+            case 'pong': {
+              lastPongRef.current = Date.now()
+              break
+            }
+
+            case 'chat:sendFailed': {
+              // Server refused/failed the send — remove the matching pending
+              // bubble so it doesn't sit on "sending" forever; the chat:error
+              // banner (sent alongside) explains what happened
+              const failedText = (data.message || '').trim()
+              setPendingMessages(prev => {
+                const idx = prev.findIndex(p => p.text.trim() === failedText)
+                if (idx === -1) return prev
+                return prev.filter((_, i) => i !== idx)
+              })
+              break
+            }
+
+            case 'chat:error': {
+              setError(data.error || 'Unknown error')
+              break
+            }
+          }
+        } catch {
+          // Not JSON — ignore
+        }
+      }
+
+      ws.onclose = () => {
+        setChatWsConnected(false)
+        // Guard against stale closures
+        if (wsRef.current !== ws) return
+        wsRef.current = null
+
+        // Auto-reconnect with backoff
+        if (reconnectAttemptsRef.current < 5) {
+          reconnectAttemptsRef.current++
+          reconnectTimeoutRef.current = setTimeout(connect, 3000)
+        }
+      }
+
+      ws.onerror = () => {
+        // onclose will fire after — reconnect handled there
+      }
+
+      wsRef.current = ws
+    }
+
+    connect()
+
+    // Reconnect on visibility change (mobile tab switching / background recovery)
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+          reconnectAttemptsRef.current = 0
+          if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
+            wsRef.current.close()
+          }
+        }
+      } else {
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current)
+        }
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility)
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+      }
+      if (wsRef.current) {
+        wsRef.current.close()
+        wsRef.current = null
+      }
+      setChatWsConnected(false)
+    }
+  }, [agentId, wsSessionName, getChatWsUrl])
+
+  // Heartbeat: send ping every 15s, force reconnect if no pong for 45s
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        if (Date.now() - lastPongRef.current > 45000) {
+          console.log('[MobileChatView] No pong in 45s — forcing reconnect')
+          wsRef.current.close()
+          return
+        }
+        wsRef.current.send(JSON.stringify({ type: 'ping' }))
+      }
+    }, 15000)
+    return () => clearInterval(interval)
+  }, [])
+
+  // Auto-scroll when new messages or pending messages arrive
+  useEffect(() => {
+    const lastMsg = messages[messages.length - 1]
+    const lastId = lastMsg?.uuid || lastMsg?.timestamp || null
+    const hasNewMessages = lastId !== prevLastMsgIdRef.current
+    prevLastMsgIdRef.current = lastId
+
+    if (hasNewMessages || pendingMessages.length > 0) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [messages, pendingMessages])
+
+  // Send message via WebSocket
+  const sendMessage = () => {
+    const text = input.trim()
+    if (!text || sending) return
+
+    // Check connection BEFORE clearing input
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      setError('Not connected — reconnecting...')
+      reconnectAttemptsRef.current = 0
+      if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
+        wsRef.current.close()
+      }
+      return
+    }
+
+    setSending(true)
+    setInput('')
+
+    // Reset textarea height
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto'
+    }
+
+    const pendingMsg = { text, timestamp: new Date().toISOString() }
+    setPendingMessages(prev => [...prev, pendingMsg])
+
+    const sent = sendChatWs('chat:send', { message: text })
+    if (!sent) {
+      setError('Failed to send — try again')
+      setPendingMessages(prev => prev.filter(p => p.timestamp !== pendingMsg.timestamp))
+      setInput(text)
+    }
+
+    setSending(false)
+  }
+
+  // Send quick response (for permission prompts)
+  // Answer a permission / choice menu via the dedicated raw-keystroke path
+  // (bypasses the send guard that swallowed clicks; selects the menu option).
+  const sendQuickResponse = (text: string) => {
+    setHookState(null)  // clear the card optimistically
+    const sent = sendChatWs('chat:permissionResponse', { key: text })
+    if (!sent) setError('Not connected — reopen the agent and try again')
+  }
+
+  // Check if an AskUserQuestion has been answered
+  // Shared with ChatView — see lib/question-state.mjs. These rules used to be
+  // duplicated here, which is why fixing ChatView alone left the bug live for
+  // anyone whose layoutOverride put them on this renderer (including desktop).
+  const isQuestionAnswered = (toolUseId?: string): boolean =>
+    sharedIsAnswered(messages, toolUseId, answeredQuestions)
+
+  const isQuestionCurrent = (toolUseId?: string): boolean =>
+    sharedIsCurrent(messages, toolUseId, hookState)
+
+
+  // Auto-grow textarea
+  const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(e.target.value)
+    const el = e.target
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 96) + 'px' // max ~4 lines
+  }
+
+  // Enter to send, Shift+Enter for newline
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      sendMessage()
+    }
+  }
+
+  // Group consecutive tool-only messages into collapsible bursts
+  const groupedItems = useMemo(() => withDividers(groupMessages(messages as any[], 'power', false), find.found), [messages, find.found])
+
+  // Determine status
+  const isPermission = hookState?.status === 'permission_request'
+  // The id-less pane/hook permission card is suppressed when it belongs to a
+  // transcript AskUserQuestion (matched by option text) — that question is
+  // rendered and governed by identity inside the message list, so drawing this
+  // one too is how an answered question redraws from screen position. Suppressing
+  // it here ALSO restores the composer (which isPermission hides), so a settled
+  // question does not leave the chat with neither a card nor an input. Genuine
+  // "Allow Edit?" prompts match no transcript question and still show.
+  // See paneCardBelongsToTranscriptQuestion. Mirrors ChatView exactly.
+  const showPermission = isPermission && !paneCardBelongsToTranscriptQuestion(messages, hookState)
+  const isWaiting = hookState?.status === 'waiting_for_input'
+  const isSendingMsg = sending
+  // F004 Phase 2: codex reports 'working' from its transcript (no hook).
+  const isCodexWorking = hookState?.status === 'working'
+  const isWorking = isCodexWorking || (!sending && (pendingMessages.length > 0 || (messages.length > 0 && !isWaiting && !showPermission &&
+    (messages[messages.length - 1]?.type === 'user' || messages[messages.length - 1]?.type === 'human'))))
+
+  return (
+    <div className="flex flex-col h-full bg-gray-900">
+      <div className="relative h-0 flex-shrink-0"><ChatFind find={find} /></div>
+
+      {/* Messages */}
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-1 py-2" style={{ minHeight: 0 }}>
+        {messages.length === 0 && !error && secretRequests.length === 0 && sqlWriteRequests.length === 0 && (
+          <div className="flex flex-col items-center justify-center h-full text-gray-500">
+            <p className="text-sm">No messages yet</p>
+            <p className="text-xs mt-1">Conversation will appear here</p>
+          </div>
+        )}
+
+        {error && (
+          <div className="mx-3 my-2 px-3 py-2 rounded-lg bg-red-900/20 border border-red-800/50">
+            <p className="text-xs text-red-400">{error}</p>
+          </div>
+        )}
+
+        {messages.length > 0 && (
+          <LoadEarlierMessages
+            hasMore={historyHasMore}
+            loading={olderLoading}
+            failed={olderFailed}
+            atStart={historyCursorRef.current?.start === 0}
+            onLoad={loadOlder}
+            rootRef={scrollContainerRef}
+          />
+        )}
+
+        {groupedItems.map((item, i) => {
+          if ('_isDivider' in item) return <ChatDividerLine key={item.key} divider={item} />
+
+          // Tool burst — render collapsible group
+          if ('_isBurst' in item) {
+            const burst = item as ToolBurst
+            return (
+              <MobileToolBurstGroup
+                key={`burst-${burst.startTimestamp || i}`}
+                burst={burst}
+              />
+            )
+          }
+
+          const msg = item as ChatMessage
+          const key = msg.uuid ? `${msg.uuid}-${i}` : `msg-${i}`
+
+          // Thinking block
+          if (msg.type === 'thinking' && msg.thinking) {
+            return <ThinkingBlock key={key} text={msg.thinking} />
+          }
+
+          // Summary divider
+          if (msg.type === 'summary') {
+            return (
+              <div key={key} className="flex items-center gap-3 my-2 mx-3">
+                <div className="flex-1 border-t border-gray-700/50" />
+                <span className="text-xs text-gray-500 italic whitespace-nowrap">
+                  {(msg as any).summary || 'Conversation compacted'}
+                </span>
+                <div className="flex-1 border-t border-gray-700/50" />
+              </div>
+            )
+          }
+
+          if (msg.type === 'speaking_message') {
+            const m = msg as any
+            return <SpeakingMessage key={key} kind={m.kind} device={m.device} source={m.source} text={m.text || ''} timestamp={msg.timestamp} />
+          }
+
+          // Words someone said or typed at one of the agent's devices (F098)
+          if (msg.type === 'device_message') {
+            const m = msg as any
+            return <DeviceMessage key={key} device={m.device} source={m.source} text={m.text || ''} timestamp={msg.timestamp} />
+          }
+
+          // Human/user message
+          if (msg.type === 'human' || msg.type === 'user') {
+            const text = extractText(msg)
+            if (!text) return null
+            return (
+              <div key={key} className="flex justify-end mx-3 my-1.5">
+                <div className="max-w-[85%]">
+                  <div className="px-3 py-2 rounded-2xl rounded-br-sm bg-blue-600 text-white text-sm select-text">
+                    <p className="whitespace-pre-wrap">{text}</p>
+                  </div>
+                  <div className="flex justify-end items-center gap-1 mt-0.5 mr-1">
+                    <span className="text-[10px] text-gray-500">{messageTime(msg.timestamp)}</span>
+                    <CopyButton text={text} className="text-gray-500" />
+                    {msg.uuid && <ReactionBar reactions={chatReactions.reactions[msg.uuid]} onToggle={emoji => chatReactions.toggle(msg.uuid!, emoji)} />}
+                  </div>
+                </div>
+              </div>
+            )
+          }
+
+          // Queue-operation (enqueued user messages)
+          if (msg.type === 'queue-operation' && msg.operation === 'enqueue') {
+            const text = extractText(msg)
+            if (!text) return null
+            return (
+              <div key={key} className="flex justify-end mx-3 my-1.5">
+                <div className="max-w-[85%]">
+                  <div className="px-3 py-2 rounded-2xl rounded-br-sm bg-yellow-600/80 text-white text-sm border border-yellow-500 select-text">
+                    <div className="flex items-center gap-1.5 mb-1">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      <span className="text-xs opacity-70">Queued</span>
+                    </div>
+                    <p className="whitespace-pre-wrap">{text}</p>
+                  </div>
+                </div>
+              </div>
+            )
+          }
+
+          // Assistant message
+          if (msg.type === 'assistant') {
+            const text = extractText(msg)
+            const tools = extractToolUses(msg)
+            const askQ = extractAskUserQuestion(msg)
+            const answered = askQ
+              ? isQuestionAnswered(askQ.id) || !isQuestionCurrent(askQ.id)
+              : false
+
+            // AskUserQuestion-only message (no text, just the question)
+            if (!text && askQ) {
+              return (
+                <div key={key} className="mx-3 my-1.5">
+                  <div className="max-w-[90%] min-w-0 overflow-hidden">
+                    {answered && (
+                      <div className="space-y-1">
+                        {askQ.questions.map((q, qIdx) => (
+                          <div key={qIdx} className="flex items-center gap-2 text-xs text-gray-500 px-2 py-1 rounded bg-gray-800/20">
+                            <Check className="w-3 h-3 flex-shrink-0 text-gray-600" />
+                            <span className="truncate">{q.header || q.question}</span>
+                            <span className="text-gray-600 flex-shrink-0">· answered</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {!answered && askQ.questions.map((q, qIdx) => (
+                      <div key={qIdx} className="bg-cyan-900/30 rounded-xl border border-cyan-700/40 p-3 mb-2">
+                        {q.header && (
+                          <div className="text-xs font-medium text-cyan-400 mb-1">{q.header}</div>
+                        )}
+                        <div className="text-sm text-cyan-100 mb-2">{q.question}</div>
+                        <div className="space-y-1.5">
+                          {q.options.map((opt, optIdx) => (
+                            <button
+                              key={optIdx}
+                              onClick={() => { if (!answered && askQ?.id) { setAnsweredQuestions(prev => new Set(prev).add(askQ.id!)); sendQuickResponse(String(optIdx + 1)) } }}
+                              disabled={answered || sending}
+                              className={`flex items-start gap-2 w-full text-left px-3 py-2 rounded-lg transition-all ${
+                                answered
+                                  ? 'opacity-50 cursor-default bg-gray-800/30'
+                                  : 'bg-cyan-800/20 hover:bg-cyan-700/30 border border-cyan-600/30 active:bg-cyan-600/40'
+                              }`}
+                            >
+                              <span className="text-cyan-400 font-bold w-5 text-center flex-shrink-0 mt-0.5">{optIdx + 1}</span>
+                              <div className="min-w-0 flex-1">
+                                <span className="text-sm text-cyan-200">{opt.label}</span>
+                                {opt.description && (
+                                  <p className="text-xs text-cyan-400/60 mt-0.5">{opt.description}</p>
+                                )}
+                              </div>
+                            </button>
+                          ))}
+                          {!answered && (
+                            <button
+                              onClick={() => textareaRef.current?.focus()}
+                              disabled={sending}
+                              className="flex items-center gap-2 w-full text-left px-3 py-2 rounded-lg bg-gray-800/30 active:bg-gray-700/40 border border-gray-600/30 transition-all"
+                            >
+                              <span className="text-gray-400 font-bold w-5 text-center flex-shrink-0">{q.options.length + 1}</span>
+                              <span className="text-sm text-gray-300">Other</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )
+            }
+
+            // Tool-only message (no text content) — not in a burst (1-2 consecutive)
+            if (!text && tools.length > 0) {
+              return (
+                <div key={key} className="mx-3 my-1">
+                  {tools.filter(t => t.name !== 'AskUserQuestion').map((tool, j) => (
+                    <div key={j} className="flex items-center gap-1.5 text-xs text-gray-500 italic py-0.5">
+                      <Wrench className="w-3 h-3 flex-shrink-0" />
+                      <span className="truncate">
+                        <span className="text-gray-400">{tool.name}</span>
+                        {tool.preview && <span className="text-gray-600 font-mono"> {tool.preview}</span>}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )
+            }
+
+            // Text message (may also include tools and/or AskUserQuestion)
+            if (text || askQ) {
+              return (
+                <div key={key} className="mx-3 my-1.5">
+                  {tools.length > 0 && (
+                    <div className="mb-1">
+                      {tools.filter(t => t.name !== 'AskUserQuestion').map((tool, j) => (
+                        <div key={j} className="flex items-center gap-1.5 text-xs text-gray-500 italic py-0.5">
+                          <Wrench className="w-3 h-3 flex-shrink-0" />
+                          <span className="truncate">
+                            Used <span className="text-gray-400">{tool.name}</span>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {text && (
+                    <div className="max-w-[90%] min-w-0 overflow-hidden relative">
+                      <div className="px-3 py-2 rounded-2xl rounded-bl-sm bg-gray-800 text-gray-200 text-sm select-text overflow-hidden">
+                        {renderMarkdown(text)}
+                      </div>
+                      <div className="flex justify-end items-center gap-1 mt-0.5 mr-1">
+                        <span className="text-[10px] text-gray-500">{messageTime(msg.timestamp)}</span>
+                        <CopyButton text={text} />
+                        {msg.uuid && <ReactionBar reactions={chatReactions.reactions[msg.uuid]} onToggle={emoji => chatReactions.toggle(msg.uuid!, emoji)} />}
+                      </div>
+                    </div>
+                  )}
+                  {askQ && (
+                    <div className="max-w-[90%] mt-2">
+                      {answered && (
+                        <div className="space-y-1">
+                          {askQ.questions.map((q, qIdx) => (
+                            <div key={qIdx} className="flex items-center gap-2 text-xs text-gray-500 px-2 py-1 rounded bg-gray-800/20">
+                              <Check className="w-3 h-3 flex-shrink-0 text-gray-600" />
+                              <span className="truncate">{q.header || q.question}</span>
+                              <span className="text-gray-600 flex-shrink-0">· answered</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {!answered && askQ.questions.map((q, qIdx) => (
+                        <div key={qIdx} className="bg-cyan-900/30 rounded-xl border border-cyan-700/40 p-3 mb-2">
+                          {q.header && (
+                            <div className="text-xs font-medium text-cyan-400 mb-1">{q.header}</div>
+                          )}
+                          <div className="text-sm text-cyan-100 mb-2">{q.question}</div>
+                          <div className="space-y-1.5">
+                            {q.options.map((opt, optIdx) => (
+                              <button
+                                key={optIdx}
+                                onClick={() => { if (!answered && askQ?.id) { setAnsweredQuestions(prev => new Set(prev).add(askQ.id!)); sendQuickResponse(String(optIdx + 1)) } }}
+                                disabled={answered || sending}
+                                className={`flex items-start gap-2 w-full text-left px-3 py-2 rounded-lg transition-all ${
+                                  answered
+                                    ? 'opacity-50 cursor-default bg-gray-800/30'
+                                    : 'bg-cyan-800/20 hover:bg-cyan-700/30 border border-cyan-600/30 active:bg-cyan-600/40'
+                                }`}
+                              >
+                                <span className="text-cyan-400 font-bold w-5 text-center flex-shrink-0 mt-0.5">{optIdx + 1}</span>
+                                <div className="min-w-0 flex-1">
+                                  <span className="text-sm text-cyan-200">{opt.label}</span>
+                                  {opt.description && (
+                                    <p className="text-xs text-cyan-400/60 mt-0.5">{opt.description}</p>
+                                  )}
+                                </div>
+                              </button>
+                            ))}
+                            {!answered && (
+                              <button
+                                onClick={() => textareaRef.current?.focus()}
+                                disabled={sending}
+                                className="flex items-center gap-2 w-full text-left px-3 py-2 rounded-lg bg-gray-800/30 active:bg-gray-700/40 border border-gray-600/30 transition-all"
+                              >
+                                <span className="text-gray-400 font-bold w-5 text-center flex-shrink-0">{q.options.length + 1}</span>
+                                <span className="text-sm text-gray-300">Other</span>
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            }
+
+            return null
+          }
+
+          // Result messages (tool results) - skip rendering
+          return null
+        })}
+
+        {/* Pending messages */}
+        {pendingMessages.map((pending, idx) => (
+          <div key={`pending-${idx}`} className="flex justify-end mx-3 my-1.5">
+            <div className="max-w-[85%]">
+              <div className="px-3 py-2 rounded-2xl rounded-br-sm bg-blue-600/70 text-white text-sm border border-blue-500/50 select-text">
+                <div className="flex items-center gap-1.5 mb-1">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  <span className="text-xs opacity-70">Sending...</span>
+                </div>
+                <p className="whitespace-pre-wrap">{pending.text}</p>
+              </div>
+            </div>
+          </div>
+        ))}
+
+        {/* Live activity indicator */}
+        {liveActivity && !showPermission && (
+          <div className="mx-3 my-1">
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-gray-800/60 border border-gray-700/50">
+              <div className="flex gap-0.5">
+                <div className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+                <div className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+                <div className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+              </div>
+              <span className="text-xs text-gray-300">
+                {liveActivity.label}
+                {liveActivity.detail && (
+                  <span className="text-gray-500 font-mono ml-1">{liveActivity.detail}</span>
+                )}
+              </span>
+            </div>
+          </div>
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Status bar */}
+      <div className="flex-shrink-0 border-t border-gray-800">
+        {secretRequests.map((r) => (
+          <div key={r.id} className="px-3 py-2 border-b border-gray-800">
+            <SecretRequestCard agentId={agentId} request={r} onDone={refreshSecretRequests} />
+          </div>
+        ))}
+        {sqlWriteRequests.map((r) => (
+          <div key={r.id} className="px-3 py-2 border-b border-gray-800 max-h-[60vh] overflow-y-auto">
+            <SqlWriteRequestCard agentId={agentId} request={r} onDone={refreshSqlWriteRequests} />
+          </div>
+        ))}
+        {showPermission && (
+          <div className="px-3 py-2 bg-yellow-900/20 border-b border-yellow-800/50">
+            <p className="text-xs text-yellow-300 mb-2">
+              {hookState?.description || hookState?.message || `Allow ${hookState?.toolName || 'action'}?`}
+            </p>
+            {hookState?.toolName === 'Bash' && hookState?.toolInput?.command && (
+              <pre className="text-xs bg-gray-950/50 p-2 rounded font-mono overflow-x-auto max-h-20 overflow-y-auto mb-2 text-gray-300">
+                {hookState.toolInput.command}
+              </pre>
+            )}
+            {hookState?.toolName !== 'Bash' && (hookState?.toolInput?.file_path || hookState?.toolInput?.path) && (
+              <div className="text-xs opacity-80 font-mono bg-gray-950/30 px-2 py-1 rounded mb-2 text-gray-300 truncate">
+                {hookState.toolInput.file_path || hookState.toolInput.path}
+              </div>
+            )}
+            {hookState?.options && hookState.options.length > 0 ? (
+              <div className="space-y-1.5">
+                {hookState.options.map((option, idx) => (
+                  <button
+                    key={idx}
+                    onClick={() => sendQuickResponse(option.key)}
+                    disabled={sending}
+                    className="flex items-center gap-2 w-full text-left px-3 py-2 rounded-lg
+                      bg-amber-800/30 hover:bg-amber-700/40 border border-amber-600/30
+                      hover:border-amber-500/50 transition-all disabled:opacity-50"
+                  >
+                    <span className="text-amber-400 font-bold w-5 text-center">{option.key}</span>
+                    <span className="text-amber-200 text-sm flex-1">{option.label}</span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="flex gap-2">
+                <button
+                  onClick={() => sendQuickResponse('y')}
+                  disabled={sending}
+                  className="px-4 py-1.5 text-xs font-medium rounded-md bg-green-700 hover:bg-green-600 text-white transition-colors disabled:opacity-50"
+                >
+                  Yes
+                </button>
+                <button
+                  onClick={() => sendQuickResponse('n')}
+                  disabled={sending}
+                  className="px-4 py-1.5 text-xs font-medium rounded-md bg-red-700 hover:bg-red-600 text-white transition-colors disabled:opacity-50"
+                >
+                  No
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {!showPermission && (
+          <div className="px-3 py-1.5 flex items-center gap-2">
+            {/* One rule for every view (lib/agent-presence.ts): a permission
+                prompt is "needs you"; idle_prompt / a finished turn is "ready" */}
+            {(() => {
+              // The shared store's status: the same value every other view shows
+              const presence = presenceOf({ name: sessionNameProp || agentName, id: agentId }, { online: true })
+              const style = PRESENCE_STYLE[presence]
+              return (
+                <>
+                  <div className={`w-2 h-2 rounded-full flex-shrink-0 ${style.dot}`} title={style.title} />
+                  <span className={`text-xs ${style.text}`}>
+                    {presence === 'working' && liveActivity
+                      ? `Working · ${liveActivity.label}${liveActivity.detail ? ` · ${liveActivity.detail}` : ''}`
+                      : style.label}
+                  </span>
+                  {presence === 'working' && <Loader2 className={`w-3 h-3 animate-spin ${style.text}`} />}
+                </>
+              )
+            })()}
+          </div>
+        )}
+
+        {/* Where the agent works and its AMP address, as the desktop header shows them */}
+        {(workingDirectory || address) && (
+          <div className="px-3 pb-1"><AgentIdentityLine workingDirectory={workingDirectory} address={address} /></div>
+        )}
+
+        {/* The terminal status bar's facts (F025): context + /compact hint, the rest behind the chevron */}
+        {(() => {
+          const snap = snapshotOf({ name: sessionNameProp || agentName, id: agentId })
+          return snap ? <div className="px-3 pb-1.5"><AgentStatusRow snapshot={snap} /></div> : null
+        })()}
+      </div>
+
+      {/* Input area */}
+      <div className="flex-shrink-0 border-t border-gray-800 bg-gray-950 px-3 py-2">
+        {!chatWsConnected && (
+          <div className="mb-2 px-2 py-1.5 bg-yellow-900/20 border border-yellow-800/50 rounded-lg text-xs text-yellow-400 flex items-center gap-1.5">
+            <Loader2 className="w-3 h-3 animate-spin" />
+            Reconnecting...
+          </div>
+        )}
+        <div className="flex items-end gap-2">
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={handleTextareaChange}
+            onKeyDown={handleKeyDown}
+            placeholder={`Message ${agentName}...`}
+            rows={1}
+            className="flex-1 bg-gray-800 text-gray-200 text-sm rounded-xl px-3 py-2 resize-none focus:outline-none focus:ring-1 focus:ring-blue-500 placeholder-gray-500"
+            style={{ maxHeight: '96px' }}
+          />
+          <button
+            onClick={sendMessage}
+            disabled={!input.trim() || sending}
+            className="flex-shrink-0 p-2 rounded-xl bg-blue-600 text-white disabled:opacity-30 disabled:bg-gray-700 transition-colors"
+          >
+            {sending ? (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            ) : (
+              <SendHorizontal className="w-5 h-5" />
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}

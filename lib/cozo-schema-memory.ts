@@ -1,0 +1,925 @@
+/**
+ * CozoDB Schema for Long-Term Memory
+ *
+ * Implements a biological memory model:
+ * - Short-term: Current RAG system (messages, msg_vec, msg_terms)
+ * - Warm: Recently consolidated, frequently accessed
+ * - Long-term: Permanent, distilled knowledge
+ *
+ * Inspired by:
+ * - Claude-Cognitive: HOT/WARM/COLD tiers
+ * - Cipher: System 1/2 separation (knowledge vs reasoning)
+ * - Cognee: Graph relationships between memories
+ */
+
+import { AgentDatabase } from './cozo-db'
+import { escapeForCozo } from './cozo-utils'
+import { schemaDebug } from './schema-log'
+
+/**
+ * Memory categories following System 1/2 model
+ */
+export type MemoryCategory =
+  | 'fact'        // System 1: Specific information (URLs, paths, names)
+  | 'decision'    // System 1: Choices made with rationale
+  | 'preference'  // System 1: User/project preferences
+  | 'pattern'     // System 2: Recurring workflows
+  | 'insight'     // System 2: Learned understanding
+  | 'reasoning'   // System 2: How problems were solved
+
+/** All three are long-term memory (the agent's context window is its short-term memory). warm: seen in one session; recurring: came up in 2+ sessions; faded: one-off, unused, or a legacy raw passage (kept, not recalled) */
+export type MemoryTier = 'warm' | 'recurring' | 'faded'
+export type MemorySystem = 1 | 2  // 1 = knowledge, 2 = reasoning
+
+export type RelationshipType =
+  | 'leads_to'    // This memory led to another
+  | 'contradicts' // This memory contradicts another
+  | 'supports'    // This memory supports another
+  | 'supersedes'  // This memory replaces another
+
+/**
+ * Initialize long-term memory schema
+ */
+export async function initializeMemorySchema(agentDb: AgentDatabase): Promise<void> {
+  console.log('[MEMORY-SCHEMA] Initializing long-term memory schema...')
+
+  // A table that fails to create must not stop the ones after it, and a
+  // "database is locked" from another connection is transient: retry it.
+  // Before this, one lock (a second connection opening the same DB) aborted
+  // the whole migration, the caller swallowed the error, and every table after
+  // the failed one stayed missing until the next restart.
+  const failures: string[] = []
+
+  const createTableIfNotExists = async (tableName: string, schema: string) => {
+    try {
+      await withLockRetry(() => agentDb.run(schema))
+      console.log(`[MEMORY-SCHEMA] ✓ Created table: ${tableName}`)
+    } catch (error: any) {
+      if (error.code === 'eval::stored_relation_conflict') {
+        schemaDebug(`[MEMORY-SCHEMA] ℹ Table ${tableName} already exists`)
+      } else {
+        console.error(`[MEMORY-SCHEMA] ✗ Failed to create ${tableName}:`, error)
+        failures.push(`${tableName}: ${error.message ?? error}`)
+      }
+    }
+  }
+
+  // Helper for HNSW index creation — uses case-insensitive multi-pattern
+  // error matching because ::hnsw create DDL may throw different error codes
+  // or messages across CozoDB versions (not just eval::stored_relation_conflict).
+  const createHnswIndexIfNotExists = async (db: AgentDatabase, ddl: string, indexName = 'memory_vec:hnsw') => {
+    try {
+      await withLockRetry(() => db.run(ddl))
+      console.log(`[MEMORY-SCHEMA] ✓ Created HNSW index: ${indexName}`)
+    } catch (error: any) {
+      // CozoDB error format varies across versions — the error code field,
+      // message wording, and casing are all unstable.  We normalise to a
+      // lowercase string that covers the known variants so that a CozoDB
+      // upgrade does not silently break idempotent schema creation.
+      const errMsg = (String(error.message ?? '') + ' ' + String(error.code ?? '')).toLowerCase()
+      if (
+        errMsg.includes('already exists') ||
+        errMsg.includes('stored_relation_conflict') ||
+        errMsg.includes('duplicate') ||
+        errMsg.includes('index_already')
+      ) {
+        // Index already exists — expected on every run after the first
+        schemaDebug(`[MEMORY-SCHEMA] ℹ HNSW index ${indexName} already exists`)
+      } else {
+        console.error(`[MEMORY-SCHEMA] ✗ Failed to create HNSW index ${indexName}:`, error)
+        failures.push(`${indexName}: ${error.message ?? error}`)
+      }
+    }
+  }
+
+  // 1. Memories table - Core long-term memory storage
+  await createTableIfNotExists('memories', `
+    :create memories {
+      memory_id: String
+      =>
+      agent_id: String,
+      tier: String,
+      system: Int,
+      category: String,
+      content: String,
+      context: String?,
+      source_conversations: String?,
+      source_message_ids: String?,
+      related_memories: String?,
+      confidence: Float,
+      created_at: Int,
+      last_reinforced_at: Int,
+      reinforcement_count: Int,
+      access_count: Int,
+      last_accessed_at: Int?,
+      promoted_at: Int?
+    }
+  `)
+
+  // 2. Memory vectors - Embeddings for semantic search
+  await createTableIfNotExists('memory_vec', `
+    :create memory_vec {
+      memory_id: String
+      =>
+      vec: <F32; 384>
+    }
+  `)
+
+  // 2b. HNSW vector index for semantic search on memory_vec
+  // Required by searchMemoriesByEmbedding() which queries ~memory_vec:hnsw{...}
+  await createHnswIndexIfNotExists(agentDb, `
+    ::hnsw create memory_vec:hnsw {
+        dim: 384,
+        m: 50,
+        dtype: F32,
+        fields: [vec],
+        distance: Cosine,
+        ef_construction: 200,
+    }
+  `)
+
+  // 3. Memory links - Graph relationships between memories
+  await createTableIfNotExists('memory_links', `
+    :create memory_links {
+      from_memory_id: String,
+      to_memory_id: String
+      =>
+      relationship: String,
+      created_at: Int
+    }
+  `)
+
+  // 4. Consolidation runs - Track consolidation history
+  await createTableIfNotExists('consolidation_runs', `
+    :create consolidation_runs {
+      run_id: String
+      =>
+      agent_id: String,
+      started_at: Int,
+      completed_at: Int?,
+      status: String,
+      conversations_processed: Int,
+      memories_created: Int,
+      memories_reinforced: Int,
+      memories_linked: Int,
+      llm_provider: String,
+      error: String?
+    }
+  `)
+
+  // 5. Consolidated conversations - Track which conversations have been processed
+  await createTableIfNotExists('consolidated_conversations', `
+    :create consolidated_conversations {
+      conversation_file: String
+      =>
+      agent_id: String,
+      run_id: String,
+      consolidated_at: Int,
+      message_count: Int,
+      memories_extracted: Int
+    }
+  `)
+
+  // Memories already checked for relationships, so the backfill never pays twice
+  await createTableIfNotExists('memory_link_checked', `
+    :create memory_link_checked {
+      memory_id: String
+      =>
+      checked_at: Int
+    }
+  `)
+
+  // ── Memory cards and the entity graph (F006) ──────────────────────────────
+  // The exchange a memory came from, kept in the agent's own DB: Claude Code
+  // deletes its transcripts after 30 days, so a pointer into the .jsonl would
+  // rot. conversation_file + message indexes still say where it was.
+  await createTableIfNotExists('memory_sources', `
+    :create memory_sources {
+      memory_id: String
+      =>
+      conversation_file: String,
+      msg_start: Int,
+      msg_end: Int,
+      ts: Int?,
+      exchange: String,
+      previous_exchange: String?
+    }
+  `)
+
+  // The readable memory: one statement plus a fixed-vocabulary action, written
+  // by the host's own Claude (haiku) and checked against its source by Jev.
+  // status: done | skipped (nothing durable) | rejected (not faithful)
+  await createTableIfNotExists('memory_cards', `
+    :create memory_cards {
+      memory_id: String
+      =>
+      statement: String,
+      action: String,
+      status: String,
+      model: String,
+      faithfulness: Float,
+      created_at: Int
+    }
+  `)
+
+  // Entities are the graph's nodes; memories are the evidence behind edges.
+  await createTableIfNotExists('entities', `
+    :create entities {
+      entity_id: String
+      =>
+      agent_id: String,
+      name: String,
+      type: String,
+      aliases: String,
+      mention_count: Int,
+      created_at: Int,
+      updated_at: Int
+    }
+  `)
+
+  await createTableIfNotExists('entity_vec', `
+    :create entity_vec {
+      entity_id: String
+      =>
+      vec: <F32; 384>
+    }
+  `)
+
+  await createHnswIndexIfNotExists(agentDb, `
+    ::hnsw create entity_vec:hnsw {
+        dim: 384,
+        m: 32,
+        dtype: F32,
+        fields: [vec],
+        distance: Cosine,
+        ef_construction: 100,
+    }
+  `, 'entity_vec:hnsw')
+
+  await createTableIfNotExists('memory_entities', `
+    :create memory_entities {
+      memory_id: String,
+      entity_id: String
+    }
+  `)
+
+  await createTableIfNotExists('entity_relations', `
+    :create entity_relations {
+      from_entity: String,
+      predicate: String,
+      to_entity: String,
+      memory_id: String
+      =>
+      created_at: Int
+    }
+  `)
+
+  // When each relation was stated and whether it was said to hold or to have
+  // ended (lib/memory/relations.ts). A relation's state is its latest statement.
+  await createTableIfNotExists('relation_statements', `
+    :create relation_statements {
+      from_entity: String,
+      predicate: String,
+      to_entity: String,
+      memory_id: String
+      =>
+      said_at: Int,
+      holds: Bool
+    }
+  `)
+
+  // Evidence behind a memory: one row per passage that stated it, across every
+  // session where it came up. Recurrence (distinct sessions) is a memory's weight.
+  await createTableIfNotExists('memory_evidence', `
+    :create memory_evidence {
+      memory_id: String,
+      evidence_id: String
+      =>
+      conversation_file: String,
+      msg_start: Int,
+      msg_end: Int,
+      ts: Int?,
+      passage: String,
+      exchange: String,
+      created_at: Int
+    }
+  `)
+
+  // Memories whose entities were checked for relations (so the backfill never pays twice)
+  await createTableIfNotExists('entity_relation_checked', `
+    :create entity_relation_checked {
+      memory_id: String
+      =>
+      checked_at: Int
+    }
+  `)
+
+  // SHA-256 of secret values found in this agent's conversations. Lets every
+  // later occurrence of the same value be redacted, in any form, without the
+  // database ever holding the value itself.
+  await createTableIfNotExists('secret_hashes', `
+    :create secret_hashes {
+      hash: String
+      =>
+      first_seen: Int
+    }
+  `)
+
+  // One-time data migrations already applied to this database
+  await createTableIfNotExists('memory_migrations', `
+    :create memory_migrations {
+      name: String
+      =>
+      applied_at: Int
+    }
+  `)
+
+  if (failures.length > 0) {
+    throw new Error(`Memory schema incomplete: ${failures.join('; ')}`)
+  }
+  console.log('[MEMORY-SCHEMA] ✅ Long-term memory schema initialized')
+}
+
+/** Retry an operation that failed only because another connection held the lock. */
+export async function withLockRetry<T>(fn: () => Promise<T> | T, attempts = 6): Promise<T> {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn()
+    } catch (error: any) {
+      const locked = /database is locked|code 5\b|SQLITE_BUSY/i.test(String(error?.message ?? error))
+      if (!locked || i >= attempts - 1) throw error
+      await new Promise(resolve => setTimeout(resolve, 150 * 2 ** i))
+    }
+  }
+}
+
+/**
+ * Create a new memory
+ */
+export async function createMemory(agentDb: AgentDatabase, memory: {
+  memory_id: string
+  agent_id: string
+  tier: MemoryTier
+  system: MemorySystem
+  category: MemoryCategory
+  content: string
+  context?: string
+  source_conversations?: string[]
+  source_message_ids?: string[]
+  related_memories?: string[]
+  confidence: number
+}): Promise<void> {
+  const now = Date.now()
+
+  await agentDb.run(`
+    ?[memory_id, agent_id, tier, system, category, content, context,
+      source_conversations, source_message_ids, related_memories,
+      confidence, created_at, last_reinforced_at, reinforcement_count,
+      access_count, last_accessed_at, promoted_at] <- [[
+      ${escapeForCozo(memory.memory_id)},
+      ${escapeForCozo(memory.agent_id)},
+      ${escapeForCozo(memory.tier)},
+      ${memory.system},
+      ${escapeForCozo(memory.category)},
+      ${escapeForCozo(memory.content)},
+      ${escapeForCozo(memory.context)},
+      ${escapeForCozo(memory.source_conversations ? JSON.stringify(memory.source_conversations) : undefined)},
+      ${escapeForCozo(memory.source_message_ids ? JSON.stringify(memory.source_message_ids) : undefined)},
+      ${escapeForCozo(memory.related_memories ? JSON.stringify(memory.related_memories) : undefined)},
+      ${memory.confidence},
+      ${now},
+      ${now},
+      1,
+      0,
+      null,
+      null
+    ]]
+    :put memories
+  `)
+}
+
+/** A float list as a CozoDB vector literal. Non-finite values would break the query. */
+export function toCozoVector(values: number[]): string {
+  return `vec([${values.map(v => (Number.isFinite(v) ? v : 0)).join(', ')}])`
+}
+
+/**
+ * Store memory embedding
+ */
+export async function storeMemoryEmbedding(
+  agentDb: AgentDatabase,
+  memoryId: string,
+  embedding: number[]
+): Promise<void> {
+  // CozoDB builds a vector from a list with vec([...]); `<...>` is only the
+  // column type syntax and fails to parse as a value, which meant no memory
+  // embedding was ever stored.
+  const vecString = toCozoVector(embedding)
+
+  await agentDb.run(`
+    ?[memory_id, vec] <- [[
+      ${escapeForCozo(memoryId)},
+      ${vecString}
+    ]]
+    :put memory_vec
+  `)
+}
+
+/**
+ * Reinforce existing memory (update when same insight is extracted again)
+ */
+export async function reinforceMemory(
+  agentDb: AgentDatabase,
+  memoryId: string,
+  additionalContext?: string
+): Promise<void> {
+  const now = Date.now()
+
+  // Get current memory
+  const result = await agentDb.run(`
+    ?[context, reinforcement_count] :=
+      *memories{memory_id, context, reinforcement_count},
+      memory_id = ${escapeForCozo(memoryId)}
+  `)
+
+  if (result.rows.length === 0) {
+    throw new Error(`Memory ${memoryId} not found`)
+  }
+
+  const currentContext = result.rows[0][0] as string | null
+  const currentCount = result.rows[0][1] as number
+
+  // Merge context if new info provided
+  let newContext = currentContext
+  if (additionalContext && additionalContext !== currentContext) {
+    newContext = currentContext
+      ? `${currentContext}\n---\n${additionalContext}`
+      : additionalContext
+  }
+
+  await agentDb.run(`
+    ?[memory_id, last_reinforced_at, reinforcement_count, context] <- [[
+      ${escapeForCozo(memoryId)},
+      ${now},
+      ${currentCount + 1},
+      ${escapeForCozo(newContext)}
+    ]]
+    :update memories
+  `)
+}
+
+/**
+ * Create link between memories
+ */
+export async function linkMemories(
+  agentDb: AgentDatabase,
+  fromMemoryId: string,
+  toMemoryId: string,
+  relationship: RelationshipType
+): Promise<void> {
+  const now = Date.now()
+
+  await agentDb.run(`
+    ?[from_memory_id, to_memory_id, relationship, created_at] <- [[
+      ${escapeForCozo(fromMemoryId)},
+      ${escapeForCozo(toMemoryId)},
+      ${escapeForCozo(relationship)},
+      ${now}
+    ]]
+    :put memory_links
+  `)
+}
+
+/**
+ * Search memories by embedding similarity
+ */
+export async function searchMemoriesByEmbedding(
+  agentDb: AgentDatabase,
+  agentId: string,
+  queryEmbedding: number[],
+  options: {
+    limit?: number
+    categories?: MemoryCategory[]
+    minConfidence?: number
+    tier?: MemoryTier
+    /** Bump access_count on the hits (a write). Off by default: only an injection counts (lib/memory/recall-log.ts). */
+    trackAccess?: boolean
+  } = {}
+): Promise<Array<{
+  memory_id: string
+  category: string
+  content: string
+  context: string | null
+  confidence: number
+  reinforcement_count: number
+  tier: string
+  similarity: number
+}>> {
+  const limit = options.limit || 10
+  const minConfidence = options.minConfidence || 0.5
+  const vecString = toCozoVector(queryEmbedding)
+
+  // Build category filter
+  let categoryFilter = ''
+  if (options.categories && options.categories.length > 0) {
+    const cats = options.categories.map(c => escapeForCozo(c)).join(', ')
+    categoryFilter = `, category in [${cats}]`
+  }
+
+  // Build tier filter
+  let tierFilter = ''
+  if (options.tier) {
+    tierFilter = `, tier = ${escapeForCozo(options.tier)}`
+  }
+
+  const query = `
+    ?[memory_id, category, content, context, confidence, reinforcement_count, tier, similarity] :=
+      ~memory_vec:hnsw{memory_id, vec | query: ${vecString}, k: ${limit * 2}, ef: 50, bind_distance: similarity},
+      *memories{memory_id, agent_id, category, content, context, confidence, reinforcement_count, tier},
+      agent_id = ${escapeForCozo(agentId)},
+      confidence >= ${minConfidence}
+      ${categoryFilter}
+      ${tierFilter}
+
+    :order similarity
+    :limit ${limit}
+  `
+
+  const result = await agentDb.run(query)
+
+  // Update access counts for returned memories
+  const now = Date.now()
+  for (const row of options.trackAccess ? result.rows : []) {
+    const memId = row[0] as string
+    await agentDb.run(`
+      ?[memory_id, access_count, last_accessed_at] :=
+        *memories{memory_id, access_count: old_count},
+        memory_id = ${escapeForCozo(memId)},
+        access_count = old_count + 1,
+        last_accessed_at = ${now}
+      :update memories
+    `)
+  }
+
+  return result.rows.map((row: unknown[]) => ({
+    memory_id: row[0] as string,
+    category: row[1] as string,
+    content: row[2] as string,
+    context: row[3] as string | null,
+    confidence: row[4] as number,
+    reinforcement_count: row[5] as number,
+    tier: row[6] as string,
+    similarity: row[7] as number
+  }))
+}
+
+/**
+ * Get memories by category
+ */
+export async function getMemoriesByCategory(
+  agentDb: AgentDatabase,
+  agentId: string,
+  category: MemoryCategory,
+  limit: number = 50
+): Promise<Array<{
+  memory_id: string
+  content: string
+  context: string | null
+  confidence: number
+  reinforcement_count: number
+  created_at: number
+}>> {
+  const result = await agentDb.run(`
+    ?[memory_id, content, context, confidence, reinforcement_count, created_at] :=
+      *memories{memory_id, agent_id, category, content, context, confidence, reinforcement_count, created_at},
+      agent_id = ${escapeForCozo(agentId)},
+      category = ${escapeForCozo(category)}
+
+    :order -reinforcement_count, -created_at
+    :limit ${limit}
+  `)
+
+  return result.rows.map((row: unknown[]) => ({
+    memory_id: row[0] as string,
+    content: row[1] as string,
+    context: row[2] as string | null,
+    confidence: row[3] as number,
+    reinforcement_count: row[4] as number,
+    created_at: row[5] as number
+  }))
+}
+
+/**
+ * Get related memories via graph traversal
+ */
+export async function getRelatedMemories(
+  agentDb: AgentDatabase,
+  memoryId: string,
+  depth: number = 2
+): Promise<Array<{
+  memory_id: string
+  relationship: string
+  content: string
+  distance: number
+}>> {
+  // Use CozoDB's graph traversal
+  const result = await agentDb.run(`
+    related[memory_id, relationship, distance] :=
+      from_id = ${escapeForCozo(memoryId)},
+      *memory_links{from_memory_id: from_id, to_memory_id: memory_id, relationship},
+      distance = 1
+
+    related[memory_id, relationship, distance] :=
+      related[prev_id, _, prev_distance],
+      prev_distance < ${depth},
+      *memory_links{from_memory_id: prev_id, to_memory_id: memory_id, relationship},
+      distance = prev_distance + 1
+
+    ?[memory_id, relationship, content, distance] :=
+      related[memory_id, relationship, distance],
+      *memories{memory_id, content}
+
+    :order distance
+  `)
+
+  return result.rows.map((row: unknown[]) => ({
+    memory_id: row[0] as string,
+    relationship: row[1] as string,
+    content: row[2] as string,
+    distance: row[3] as number
+  }))
+}
+
+/**
+ * Record a consolidation run
+ */
+export async function recordConsolidationRun(
+  agentDb: AgentDatabase,
+  run: {
+    run_id: string
+    agent_id: string
+    llm_provider: string
+  }
+): Promise<void> {
+  const now = Date.now()
+
+  await agentDb.run(`
+    ?[run_id, agent_id, started_at, completed_at, status,
+      conversations_processed, memories_created, memories_reinforced,
+      memories_linked, llm_provider, error] <- [[
+      ${escapeForCozo(run.run_id)},
+      ${escapeForCozo(run.agent_id)},
+      ${now},
+      null,
+      'running',
+      0,
+      0,
+      0,
+      0,
+      ${escapeForCozo(run.llm_provider)},
+      null
+    ]]
+    :put consolidation_runs
+  `)
+}
+
+/**
+ * Update consolidation run progress
+ */
+export async function updateConsolidationRun(
+  agentDb: AgentDatabase,
+  runId: string,
+  updates: {
+    status?: 'running' | 'completed' | 'failed'
+    conversations_processed?: number
+    memories_created?: number
+    memories_reinforced?: number
+    memories_linked?: number
+    error?: string
+  }
+): Promise<void> {
+  const now = Date.now()
+
+  // Build update fields
+  const fields: string[] = []
+  const values: string[] = []
+
+  if (updates.status) {
+    fields.push('status')
+    values.push(escapeForCozo(updates.status))
+    if (updates.status === 'completed' || updates.status === 'failed') {
+      fields.push('completed_at')
+      values.push(`${now}`)
+    }
+  }
+  if (updates.conversations_processed !== undefined) {
+    fields.push('conversations_processed')
+    values.push(`${updates.conversations_processed}`)
+  }
+  if (updates.memories_created !== undefined) {
+    fields.push('memories_created')
+    values.push(`${updates.memories_created}`)
+  }
+  if (updates.memories_reinforced !== undefined) {
+    fields.push('memories_reinforced')
+    values.push(`${updates.memories_reinforced}`)
+  }
+  if (updates.memories_linked !== undefined) {
+    fields.push('memories_linked')
+    values.push(`${updates.memories_linked}`)
+  }
+  if (updates.error) {
+    fields.push('error')
+    values.push(escapeForCozo(updates.error))
+  }
+
+  if (fields.length === 0) return
+
+  await agentDb.run(`
+    ?[run_id, ${fields.join(', ')}] <- [[
+      ${escapeForCozo(runId)},
+      ${values.join(', ')}
+    ]]
+    :update consolidation_runs
+  `)
+}
+
+/**
+ * Mark conversation as consolidated
+ */
+export async function markConversationConsolidated(
+  agentDb: AgentDatabase,
+  conversationFile: string,
+  agentId: string,
+  runId: string,
+  messageCount: number,
+  memoriesExtracted: number
+): Promise<void> {
+  const now = Date.now()
+
+  await agentDb.run(`
+    ?[conversation_file, agent_id, run_id, consolidated_at, message_count, memories_extracted] <- [[
+      ${escapeForCozo(conversationFile)},
+      ${escapeForCozo(agentId)},
+      ${escapeForCozo(runId)},
+      ${now},
+      ${messageCount},
+      ${memoriesExtracted}
+    ]]
+    :put consolidated_conversations
+  `)
+}
+
+/**
+ * How far each conversation has been consolidated (message offset), keyed by file.
+ */
+export async function getConsolidatedOffsets(
+  agentDb: AgentDatabase
+): Promise<Map<string, number>> {
+  const result = await agentDb.run(`
+    ?[conversation_file, message_count] :=
+      *consolidated_conversations{conversation_file, message_count}
+  `)
+  return new Map(result.rows.map((row: unknown[]) => [row[0] as string, row[1] as number]))
+}
+
+/**
+ * Check if conversation has been consolidated
+ */
+export async function isConversationConsolidated(
+  agentDb: AgentDatabase,
+  conversationFile: string
+): Promise<boolean> {
+  const result = await agentDb.run(`
+    ?[exists] :=
+      *consolidated_conversations{conversation_file},
+      conversation_file = ${escapeForCozo(conversationFile)},
+      exists = true
+
+    ?[exists] :=
+      not *consolidated_conversations{conversation_file: ${escapeForCozo(conversationFile)}},
+      exists = false
+  `)
+
+  return result.rows.length > 0 && result.rows[0][0] === true
+}
+
+/**
+ * Get memory statistics for an agent
+ */
+export async function getMemoryStats(
+  agentDb: AgentDatabase,
+  agentId: string
+): Promise<{
+  total_memories: number
+  by_category: Record<string, number>
+  by_tier: Record<string, number>
+  by_system: Record<number, number>
+  avg_confidence: number
+  total_reinforcements: number
+  total_accesses: number
+}> {
+  // Aggregations belong in the rule head; `count = count(x)` in the body is not
+  // valid CozoScript and made every stats request fail ("No implementation
+  // found for op count"), so the Memory tab's stats bar never loaded.
+  const result = await agentDb.run(`
+    ?[category, tier, system, count(memory_id), sum(confidence), sum(reinforcement_count), sum(access_count)] :=
+      *memories{memory_id, agent_id, category, tier, system, confidence, reinforcement_count, access_count},
+      agent_id = ${escapeForCozo(agentId)}
+  `)
+
+  const by_category: Record<string, number> = {}
+  const by_tier: Record<string, number> = {}
+  const by_system: Record<number, number> = {}
+  let total = 0
+  let confSum = 0
+  let reinfSum = 0
+  let accessSum = 0
+
+  for (const row of result.rows) {
+    const category = row[0] as string
+    const tier = row[1] as string
+    const system = row[2] as number
+    const count = row[3] as number
+
+    by_category[category] = (by_category[category] || 0) + count
+    by_tier[tier] = (by_tier[tier] || 0) + count
+    by_system[system] = (by_system[system] || 0) + count
+    total += count
+    confSum += row[4] as number
+    reinfSum += row[5] as number
+    accessSum += row[6] as number
+  }
+
+  return {
+    total_memories: total,
+    by_category,
+    by_tier,
+    by_system,
+    avg_confidence: total > 0 ? confSum / total : 0,
+    total_reinforcements: reinfSum,
+    total_accesses: accessSum
+  }
+}
+
+/**
+ * Promote a memory from warm to recurring (seen in 2+ sessions)
+ */
+export async function promoteMemory(
+  agentDb: AgentDatabase,
+  memoryId: string
+): Promise<void> {
+  const now = Date.now()
+
+  await agentDb.run(`
+    ?[memory_id, tier, promoted_at] <- [[
+      ${escapeForCozo(memoryId)},
+      'recurring',
+      ${now}
+    ]]
+    :update memories
+  `)
+}
+
+/**
+ * Get recent consolidation runs
+ */
+export async function getConsolidationRuns(
+  agentDb: AgentDatabase,
+  agentId: string,
+  limit: number = 10
+): Promise<Array<{
+  run_id: string
+  started_at: number
+  completed_at: number | null
+  status: string
+  conversations_processed: number
+  memories_created: number
+  memories_reinforced: number
+  llm_provider: string
+  error: string | null
+}>> {
+  const result = await agentDb.run(`
+    ?[run_id, started_at, completed_at, status, conversations_processed,
+      memories_created, memories_reinforced, llm_provider, error] :=
+      *consolidation_runs{run_id, agent_id, started_at, completed_at, status,
+        conversations_processed, memories_created, memories_reinforced,
+        llm_provider, error},
+      agent_id = ${escapeForCozo(agentId)}
+
+    :order -started_at
+    :limit ${limit}
+  `)
+
+  return result.rows.map((row: unknown[]) => ({
+    run_id: row[0] as string,
+    started_at: row[1] as number,
+    completed_at: row[2] as number | null,
+    status: row[3] as string,
+    conversations_processed: row[4] as number,
+    memories_created: row[5] as number,
+    memories_reinforced: row[6] as number,
+    llm_provider: row[7] as string,
+    error: row[8] as string | null
+  }))
+}

@@ -1,0 +1,176 @@
+# AI Maestro — Backlog
+
+Index of features and bugs. Each entry links to a detail file under [`backlog/`](./backlog/).
+
+## Naming Convention
+
+- **Features:** `F###-short-description.md`
+- **Bugs:** `B###-short-description.md`
+- IDs are zero-padded, sequential, and never reused.
+
+## Status Legend
+
+- `Todo` — Not started
+- `In Progress` — Actively being worked on
+- `Blocked` — Waiting on a dependency or decision
+- `Done` — Shipped / merged
+- `Wontfix` — Decided not to pursue
+
+## Features
+
+- **F001** — [A shared filesystem agents and humans can both reach](./backlog/F001-shared-agent-filesystem.md) — `Todo`
+- **F002** — [AWS Lambda MicroVM as an agent deployment mode](./backlog/F002-microvm-agent-deployment.md) — `Todo`
+- **F003** — [Native iOS selection and paste in the terminal](./backlog/F003-ios-terminal-selection.md) — `Todo`
+- **F004** — [Codex chat support (multi-provider transcript reader)](./backlog/F004-codex-chat-transcript.md) — `Done` (history+live+status; approval cards deferred, TUI-only)
+- **F005** — [Warn when a host's AMP scripts drift from the fleet](./backlog/F005-host-amp-script-staleness.md) — `Todo` (local half in 0.106.63)
+- **F006** — [Memory cards and an entity graph (the agent summarizes its own memory)](./backlog/F006-memory-cards-entity-graph.md) — `Done` (v0.40.1)
+- **F007** — [Measure whether recalled memory changes what an agent does](./backlog/F007-measure-memory-use.md) — `Todo`
+- **F008** — [Lessons become skills (procedural memory)](./backlog/F008-lessons-become-skills.md) — `Todo`
+- **F009** — [Corrections as their own kind of memory](./backlog/F009-memory-corrections.md) — `Done` (v0.43.0)
+- **F010** — [Deliver AMP messages through Claude Code's own session inbox](./backlog/F010-cross-session-inbox-delivery.md) — `Todo`
+- **F011** — [Each agent has its own browser, and you can watch it work](./backlog/F011-agent-browser.md) — `Todo`
+- **F012** — [Agents that look alive (animated avatars)](./backlog/F012-living-avatars.md) — `In Progress`
+- **F013** — [Stall alarm: tell a human when an agent is stuck](./backlog/F013-stall-alarm.md) — `Todo`
+- **F014** — [Ambiguity-aware restore: when unsure, do nothing](./backlog/F014-ambiguity-aware-restore.md) — `Todo`
+- **F015** — [AMP topics (channels) with replayable offsets](./backlog/F015-amp-topics.md) — `Todo`
+- **F016** — [Context budget: agents compact before they get expensive](./backlog/F016-context-budget.md) — `Todo` (status line advice shipped v0.45.9)
+- **F017** — [Research: prune stale tool output before a request is sent](./backlog/F017-context-pruning-proxy.md) — `Wontfix` (costs more than it saves; see docs/COST-OPTIMIZATION.md)
+- **F018** — [Research: keep the intelligence, give the tool work to cheap models](./backlog/F018-cheap-models-for-tool-work.md) — `Todo` (deprioritized)
+- **F019** — [Effort per agent](./backlog/F019-effort-per-agent.md) — `Todo`
+- **F020** — [No cold wakes on a large context](./backlog/F020-cold-wakes.md) — `Todo`
+- **F021** — [Audit instructions that trigger extra actions](./backlog/F021-action-instruction-audit.md) — `Todo`
+- **F022** — [Local models for small agents and AI Maestro's own background jobs](./backlog/F022-local-models.md) — `Blocked` (not ready yet)
+- **F023** — [Prompt-cache notes](./backlog/F023-prompt-cache-notes.md) — `Todo` (parked, low gain)
+- **F024** — [Agent Files Protocol (AFP) and the agent-files skill, backed by Garage](./backlog/F024-agent-files-afp.md) — `In progress` (spec published, spike running)
+- **F025** — [The chat header shows what the terminal status bar shows](./backlog/F025-chat-header-parity.md) — `Done` (0.49.8)
+
+- **F026** — [Agent runtime abstraction (Phase 0), and a Herdr evaluation](./backlog/F026-agent-runtime-abstraction-herdr.md) — `In Progress` (Phase 0 only; Herdr phases parked)
+- **F027** — [Every message wakes its agent, on any host, with or without the server](./backlog/F027-reliable-message-wake.md) — `In Progress` (sweeper 0.49.9, on by default 0.50.0; doorbell 0.50.2; one delivery path still open)
+- **F028** — [Grok Build agents, and approval cards for Grok and Codex](./backlog/F028-grok-build-support.md) — `Done` (0.60.0; open items listed in the file)
+- **F029** — [A test safety net for routes, headless mode and the hook](./backlog/F029-route-and-hook-safety-net.md) — `Done` (0.62.0)
+- **F030** — [Reply to an earlier message in the chat (quote-reply)](./backlog/F030-reply-to-an-earlier-message.md) — `Todo`
+- **F031** — [Stop advertising Aider; keep it launchable but deprecated](./backlog/F031-retire-aider-from-supported-agents.md) — `Done` (0.62.1)
+- **F032** — [Stop claiming GitHub Copilot as a supported agent](./backlog/F032-stop-claiming-github-copilot.md) — `Done` (0.62.1)
+- **F033** — [A local secret vault: agents use credentials without the model ever seeing them](./backlog/F033-secret-vault-agents-use-without-seeing.md) — `In Progress` (CLI 0.63.0; Claude Code mod 0.64.0; chat card 0.65.0; agent skill 0.66.0; per-agent scoping open)
+- **F034** — [Compare Google's A2UI with the Agent Actions Protocol](./backlog/F034-compare-a2ui-with-agent-actions-protocol.md) — `Todo` (research; pasted summary not yet verified)
+- **F035** — [Agents only write their own area: the outbox design (AMP delivery)](./backlog/F035-amp-outbox-delivery.md) — `Todo` (design note written, awaiting review; fixes #555; continues F027 Phase 3)
+- **F036** — [Pi and OpenClaw: from "runs in the terminal" to real support](./backlog/F036-pi-and-openclaw-support.md) — `In progress` (messaging tools for Pi 0.106.9; Pi launch 0.67.4; Node/zstd and launch-check findings from a mac-mini test)
+- **F037** — [Let the SQL skill change data, but only with a person's approval](./backlog/F037-sql-writes-with-approval.md) — `In Progress` (0.68.0: write door and terminal approval shipped; AI Maestro card, Claude Code mod and support hand-off open)
+- **F038** — [GitHub Copilot CLI: from "runs in the terminal" to real support](./backlog/F038-github-copilot-cli-support.md) — `In Progress` (launch 0.68.1; trust-question card, status, chat reader open; issue #572)
+- **F039** — [A way back in: an `ai-maestro` command, a desktop launcher and a PWA](./backlog/F039-desktop-launcher-and-pwa.md) — `Done` (0.77.0)
+- **F040** — [Waking and creating agents: launch options declared per tool, one-click wake](./backlog/F040-wake-and-create-ux-launch-options.md) — `In Progress` (step 1 shipped in 0.69.0; steps 2 to 4 open)
+- **F041** — [Windows without WSL: can psmux stand in for tmux?](./backlog/F041-windows-native-with-psmux.md) — `Todo` (documentation research only; probe script next)
+- **F042** — [Who may message whom: a policy on every send, with a reason on every denial](./backlog/F042-send-path-policy-with-reasons.md) — `Todo` (idea from lolad)
+- **F043** — [Pairing with another person's AI Maestro: invite codes, held senders, visible delivery state](./backlog/F043-federation-between-people.md) — `Todo` (idea from lolad; builds on F035)
+- **F044** — [Agent lifecycle and isolation: ideas from lolad to check against what we have](./backlog/F044-agent-lifecycle-and-isolation-ideas.md) — `Todo` (checklist)
+- **F045** — [A tmux self-check: run our exact tmux calls against any tmux binary](./backlog/F045-tmux-self-check-and-conformance-suite.md) — `Todo` (the F041 probe)
+- **F046** — [Plugin build: lock the upstream commits and show what changed](./backlog/F046-plugin-build-lock-file-and-upstream-diff.md) — `Todo`
+- **F047** — [Dependency hygiene: Node end of life, scheduled audit, npm supply chain](./backlog/F047-node-eol-and-dependency-hygiene.md) — `Todo`
+- **F048** — [A security status view per host](./backlog/F048-host-security-status-view.md) — `Todo`
+- **F049** — [Claude Code on Google Vertex AI, with the host's own login](./backlog/F049-claude-code-on-vertex-setup.md) — `In Progress` (script shipped 0.106.10; not yet run on a real host)
+- **F050** — [Voice and video with agents: the five stages, the pipeline and the providers (umbrella)](./backlog/F050-agent-initiated-voice-calls-umbrella.md) — `In Progress` (plan of record 2026-11-02)
+- **F051** — [Call lifecycle and coordinator (#697, #701, #709)](./backlog/F051-amp-rtc-call-lifecycle-and-coordinator.md) — `Wontfix` (merged into F059)
+- **F052** — [Real-time audio: media adapter and browser microphone (#698, #705, #710)](./backlog/F052-voice-media-adapter-and-browser-audio.md) — `Wontfix` (merged into F059)
+- **F053** — [An agent's call rings a locked iPhone (#699, #707)](./backlog/F053-incoming-agent-call-on-iphone.md) — `Wontfix` (merged into F059)
+- **F054** — [Shared voice rooms for people and agents (#703)](./backlog/F054-voice-rooms-in-zoom-view.md) — `Wontfix` (split into F061 and F062)
+- **F055** — [Call interoperability and failure tests (#700)](./backlog/F055-amp-rtc-interoperability-tests.md) — `Wontfix` (folded into each stage)
+- **F056** — [The AMP-RTC protocol drafts (agentmessaging/protocol #22-#24, #26-#31)](./backlog/F056-amp-rtc-protocol-drafts.md) — `Blocked` (until V1 runs a real call)
+- **F057** — [A directory of humans, owned by hosts the way agents are](./backlog/F057-humans-directory.md) — `In Progress`
+- **F058** — [Optional access token for instances exposed to the internet (experiment)](./backlog/F058-optional-access-token-internet.md) — `Todo`
+- **F059** — [V1: A voice call with an agent](./backlog/F059-v1-voice-call-with-an-agent.md) — `In Progress` (signalling done; the agent's own voice on calls next; then the real-time spike)
+- **F060** — [V2: The agent's face in a call (FaceTime with an agent)](./backlog/F060-v2-avatar-in-calls.md) — `Todo`
+- **F061** — [V3: An audio conference with people and agents](./backlog/F061-v3-audio-conference-people-and-agents.md) — `Todo`
+- **F062** — [V4: Video meetings in AI Maestro (our own Zoom)](./backlog/F062-v4-video-meetings-our-zoom.md) — `Todo`
+- **F063** — [V5: Agents join real Zoom, Google Meet and Teams meetings](./backlog/F063-v5-agents-in-zoom-meet-teams.md) — `Todo` (backlog)
+- **F064** — [V6: Real telephony, each agent has its own phone number](./backlog/F064-v6-real-telephony-agent-phone-numbers.md) — `Todo`
+- **F065** — [Secrets with a scope (agent, host, organization) and permissions](./backlog/F065-scoped-secrets-shared-across-org.md) — `Todo` (spec drafted; phase 1 needed by F059)
+- **F066** — [Audit trail: what each agent did, who authorized it, and under which rules](./backlog/F066-audit-trail-who-did-what-who-authorized.md) — `Todo` (spec drafted; slice 1 as an experiment; foundation for F067)
+- **F067** — [Agent governance: profiles, protected rules, escalation and a weekly check](./backlog/F067-agent-governance-profiles-and-checks.md) — `Todo` (from Jaime's helpdesk deployment)
+- **F068** — [An agent hands its work to subagents so it can answer a call fast](./backlog/F068-agent-delegates-work-to-answer-calls.md) — `Todo` (idea to test)
+- **F069** — [Doctor: one page that checks agents, hosts and installs, and offers the fix](./backlog/F069-doctor-fleet-health-checks.md) — `In Progress` (server in 0.106.63, page in 0.106.64, CLI in 0.106.70; mobile is ai-maestro-app's)
+- **F070** — [Notify a person when a long action finishes, and when an agent has a result](./backlog/F070-notify-long-actions-and-agent-results.md) — `Todo` (idea to shape)
+- **F071** — [Doctor: check the agent programs on each host (Claude Code, Codex, Pi, …)](./backlog/F071-doctor-agent-programs-check.md) — `Done` (0.106.69)
+- **F072** — [Create agent: show which programs each host can run, then offer to install the missing ones](./backlog/F072-create-agent-program-availability-and-install.md) — `Done` (phase 1 since F040; Install button in 0.106.70)
+- **F073** — [Hibernate idle agents by rule, and wake them for a message or a task](./backlog/F073-auto-hibernate-idle-agents.md) — `Todo` (idea to shape)
+- **F074** — [A person sees only the organizations they belong to, and can hide one](./backlog/F074-people-see-only-their-orgs.md) — `Todo`
+- **F075** — [First run creates an unnamed organization that every person and agent joins](./backlog/F075-first-run-creates-default-org.md) — `Todo`
+- **F076** — [Tasks go to idle agents by themselves and come back for review](./backlog/F076-tasks-dispatched-to-idle-agents-into-review.md) — `Todo` (design first; #638, #779)
+- **F077** — [A task records what was actually done (Result)](./backlog/F077-task-result-field.md) — `Done` (0.106.69, #776)
+- **F078** — [Agent devices, phase 1: an agent's own computers and cameras, paired and usable from its session](./backlog/F078-agent-devices-pair-and-use.md) — `In Progress` (steps 1 to 4 shipped; step 5 is F079)
+- **F079** — [Agent devices, phase 2: move a device to another agent, or unassign it, from the dashboard](./backlog/F079-agent-devices-transfer-from-dashboard.md) — `Todo` (device-protocol #10 first; #789)
+- **F080** — [Companion mode makes the phone one of the agent's devices](./backlog/F080-companion-mode-phone-is-a-device.md) — `In Progress` (small device works; live media waits for the protocol)
+- **F081** — [An agent's devices follow it through export, import, moves and deletion](./backlog/F081-agent-lifecycle-carries-devices.md) — `Todo`
+- **F082** — [What a person says to a device reaches the agent](./backlog/F082-device-input-reaches-the-agent.md) — `Done`
+- **F083** — [The agent and the person can see the active device, and jump](./backlog/F083-active-device-visible-and-jump.md) — `In Progress` (jump shipped; agent context and labels to do)
+- **F084** — [Doctor checks for agent devices](./backlog/F084-doctor-device-checks.md) — `Todo`
+- **F085** — [Set up a new device with one command from AI Maestro](./backlog/F085-install-device-bridge-from-maestro.md) — `Todo`
+- **F086** — [Open the device protocol: name, public repo, website and docs](./backlog/F086-device-protocol-public-site-docs.md) — `Done` (public; agentdevices.org)
+- **F087** — [See the conversation of any agent, with or without tmux](./backlog/F087-conversation-view-without-tmux.md) — `Todo` (spec written)
+- **F088** — [Wake agents that live outside AI Maestro when a message arrives](./backlog/F088-amp-gateway-wakes-outside-agents.md) — `Todo` (idea to shape)
+- **F089** — [One pattern for the mesh: a directory on every host](./backlog/F089-mesh-directory-one-pattern.md) — `Todo` (spec written)
+- **F090** — [Version history for an agent's documents, canvases and settings, with Git](./backlog/F090-version-history-for-documents-and-settings.md) — `Todo`
+- **F091** — [The Town: default town at install, join from the new machine, and merge](./backlog/F091-town-first-run-join-merge.md) — `Todo` (spec written)
+- **F092** — [One voice per agent, on every device and call](./backlog/F092-one-voice-per-agent.md) — `In Progress`
+- **F093** — [Search in the chat](./backlog/F093-chat-search.md) — `In Progress`
+- **F094** — [Days and times in the chat](./backlog/F094-chat-days-and-times.md) — `In Progress`
+- **F095** — [Talk to an agent without tapping: it listens all the time](./backlog/F095-always-listening.md) — `Todo`
+- **F096** — [Companion mode in the phone app](./backlog/F096-companion-mode-in-the-app.md) — `In Progress` (works on TestFlight)
+- **F097** — [Speech and hearing on another machine](./backlog/F097-voice-on-another-host.md) — `Todo`
+- **F098** — [Device conversations show in the agent's chat](./backlog/F098-device-conversations-in-the-chat.md) — `In Progress`
+- **F099** — [Hear a device's speech with ElevenLabs Scribe](./backlog/F099-elevenlabs-scribe-hearing.md) — `In Progress`
+- **F100** — [Experiment: a fast speaking side of the agent answers at its devices](./backlog/F100-speech-agent-experiment.md) — `In Progress` (built behind the flag; MacBook test next)
+- **F101** — [Kiosk auth: the owner proves it is them with a tap and a picture](./backlog/F101-kiosk-auth-by-face.md) — `Todo` (later)
+- **F102** — [Jev decides if a turn is light (the cerebellum answers) or heavy (the main session works)](./backlog/F102-jev-routes-cerebellum-turns.md) — `Todo`
+- **F103** — [A paired device can speak as its owner (the phone counts as Juan)](./backlog/F103-paired-device-speaks-as-person.md) — `In Progress`
+
+## Bugs
+
+- **B001** — [Two browsers on one agent fight over the terminal size](./backlog/B001-multi-client-terminal-sizing.md) — `Todo`
+- **B002** — [wterm and ws are behind](./backlog/B002-wterm-and-ws-updates.md) — `Todo`
+- **B003** — [Clicking a question option may not confirm it](./backlog/B003-option-click-missing-enter.md) — `Done` (does not reproduce on Claude Code 2.1.318; no code change)
+- **B004** — [Audit remaining shell-string external commands (git, aws) for injection](./backlog/B004-shell-string-external-command-audit.md) — `Done` (0.106.69)
+- **B005** — [Listener network posture (bind address / firewall)](./backlog/B005-listener-network-posture.md) — `Wontfix` (no auth is by design)
+- **B006** — [AMP signature refusals (403) leave no readable record](./backlog/B006-amp-refusals-not-recorded.md) — `Done` (0.106.69)
+- **B007** — [Leftovers from the skills and prompts audit](./backlog/B007-prompt-audit-leftovers.md) — `In Progress`
+- **B008** — [GET /api/agents/:id/tracking returns 500 for every agent](./backlog/B008-tracking-endpoint-500.md) — `Done`
+- **B009** — [A request for an unknown agent id creates an agent and a database folder](./backlog/B009-unknown-agent-id-creates-agent.md) — `Done` (0.60.4)
+- **B010** — [Shell injection and unchecked ids that become file paths](./backlog/B010-injection-and-unchecked-path-ids.md) — `Done` (0.62.0)
+- **B011** — [Agent status that is set and never cleared (wakes deferred or dropped)](./backlog/B011-status-set-and-never-cleared.md) — `Done` (0.62.0)
+- **B012** — [Headless routes behave differently from the Next.js routes](./backlog/B012-headless-routes-differ-from-next-routes.md) — `Done` (0.62.0)
+- **B013** — [Logs that grow without a limit (hook debug log 373 MB, pm2 log 3.4 GB); cap at 50 MB](./backlog/B013-unbounded-logs-need-rotation.md) — `Done` (0.60.5)
+- **B014** — [Logs and files that grow without limit across the AI Maestro ecosystem (epic, ranked, one fix per repo)](./backlog/B014-ecosystem-log-and-disk-hygiene.md) — `In Progress` (0.61.0; database retention open)
+- **B015** — [Clearing a staged notice with backspaces also deletes what a person was typing](./backlog/B015-staged-text-clear-deletes-human-typing.md) — `Done` (0.106.3)
+- **B016** — [AMP: a sender on the local provider domain is trusted without a signature check](./backlog/B016-amp-local-domain-sender-unverified.md) — `Todo`
+- **B017** — [Gateways: /api is open when ADMIN_TOKEN is unset](./backlog/B017-gateway-open-api-without-token.md) — `Todo`
+- **B018** — [Installers for agent-identity and agent-files run from main with no checksum](./backlog/B018-installers-unpinned-curl-bash.md) — `Todo`
+- **B019** — [The call screen says "connected" after 2.5 seconds, whatever happens](./backlog/B019-call-overlay-fakes-connection.md) — `Done` (0.106.18)
+- **B020** — [AI Maestro's own secrets are kept in plain files, outside the vault](./backlog/B020-service-secrets-outside-the-vault.md) — `Todo` (first step of F065 phase 1)
+- **B021** — [Agents on one host can read every secret and every agent key on it](./backlog/B021-agents-on-a-host-share-one-key-store.md) — `Todo` (accepted trade-off; docs only; containers isolate)
+- **B022** — [Hook state files are keyed by folder, not by agent or session](./backlog/B022-chat-state-files-keyed-by-folder.md) — `Todo` (found with #758)
+- **B023** — [Orphan tmux sessions are registered in folders other agents own](./backlog/B023-orphan-sessions-bypass-folder-rule.md) — `Done` (0.106.62)
+- **B024** — [System text (skills, Stop hook feedback, message notices) shows in the chat as the person's message](./backlog/B024-skill-text-shows-as-chat-message.md) — `Done` (0.106.68, #767)
+- **B025** — [The approval card shows the command, then only the options](./backlog/B025-approval-card-loses-command.md) — `Done` (0.106.67, #768)
+- **B026** — [Pasted text shows twice in the chat, once with raw `<pasted_content>` tags](./backlog/B026-pasted-text-shows-raw-wrapper-twice.md) — `Done` (0.106.66, #769)
+- **B027** — [A message sent while the agent works shows as Queued and as delivered at once](./backlog/B027-queued-message-shows-queued-and-delivered.md) — `Done` (0.106.68, #770)
+- **B028** — [The dashboard forgets which agent was open and opens another one](./backlog/B028-dashboard-forgets-open-agent.md) — `Done` (0.106.67, #773)
+- **B029** — [The meeting chat's poll has no timeout and hides every error](./backlog/B029-meeting-poll-no-timeout.md) — `Done` (0.106.69, #782)
+- **B030** — [A schedule run reports "success" without proof the prompt reached the agent](./backlog/B030-schedule-run-success-without-delivery.md) — `Done` (0.106.69)
+- **B031** — [The compaction summary shows in the chat as the person's message](./backlog/B031-compact-summary-shows-as-message.md) — `Done` (0.106.69, #786)
+- **B032** — [Agents with no tmux session: /term retries forever, and hibernated agents read as outside](./backlog/B032-no-tmux-session-close-code-and-last-runtime.md) — `Done` (0.106.71, #792)
+- **B033** — [A person's message shows a unique id, not their name](./backlog/B033-person-message-shows-id-not-name.md) — `Todo` (needs F089)
+- **B034** — [A message to anyone on a sleeping host is refused, not kept](./backlog/B034-message-refused-when-host-down.md) — `Todo`
+- **B035** — [Agent directory sync is never started](./backlog/B035-agent-directory-sync-never-started.md) — `Todo` (replaced by F089)
+- **B036** — [Hearing on the host guesses the language, and can write English as Russian](./backlog/B036-hearing-guesses-the-wrong-language.md) — `Done`
+- **B037** — [Words from a device reached the agent 15 seconds after they were ready (to check)](./backlog/B037-device-words-reached-agent-late.md) — `Todo`
+
+## Unfiled
+
+Pre-dating this structure, kept verbatim. Convert to `F###`/`B###` when picked up.
+
+- [ ] Create configuration system for app options (e.g., default working directory for new sessions)
+- [ ] Host Sync Phase 3: Retry queue for offline hosts
+  - Queue failed sync attempts when remote hosts are offline
+  - Exponential backoff retry (5min → 15min → 1hr → 4hrs)
+  - Background worker to process pending syncs
+  - Persist queue state across server restarts
+  - See `docs/HOST-SYNC-PLAN.md` for full details

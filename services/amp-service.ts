@@ -1,0 +1,2296 @@
+/**
+ * AMP Service
+ *
+ * Pure business logic extracted from app/api/v1/** routes.
+ * No HTTP concepts (Request, Response, NextResponse, headers) leak into this module.
+ * API routes become thin wrappers that call these functions.
+ *
+ * Covers:
+ *   GET    /api/v1/health                    -> getHealthStatus
+ *   GET    /api/v1/info                      -> getProviderInfo
+ *   POST   /api/v1/register                  -> registerAgent
+ *   POST   /api/v1/route                     -> routeMessage
+ *   GET    /api/v1/messages                   -> listPendingMessages (alias)
+ *   GET    /api/v1/messages/pending           -> listPendingMessages
+ *   DELETE /api/v1/messages/pending           -> acknowledgePendingMessage
+ *   DELETE /api/v1/messages/pending/:id       -> acknowledgePendingMessage
+ *   POST   /api/v1/messages/pending/ack       -> batchAcknowledgeMessages (spec path)
+ *   POST   /api/v1/messages/pending           -> batchAcknowledgeMessages (compat alias)
+ *   POST   /api/v1/messages/:id/read          -> sendReadReceipt
+ *   GET    /api/v1/agents                     -> listAMPAgents
+ *   GET    /api/v1/agents/me                  -> getAgentSelf
+ *   GET    /api/v1/agents/me/card             -> getAgentCard
+ *   PATCH  /api/v1/agents/me                  -> updateAgentSelf
+ *   DELETE /api/v1/agents/me                  -> deleteAgentSelf
+ *   GET    /api/v1/agents/resolve/:address    -> resolveAgentAddress
+ *   DELETE /api/v1/auth/revoke-key            -> revokeKey
+ *   POST   /api/v1/auth/rotate-key            -> rotateKey
+ *   POST   /api/v1/auth/rotate-keys           -> rotateKeypair
+ *   POST   /api/v1/federation/deliver         -> deliverFederated
+ */
+
+import { recordAmpRefusal } from '@/lib/amp-refusals'
+import crypto from 'crypto'
+import {
+  MAX_ATTACHMENT_SIZE,
+  MAX_TOTAL_ATTACHMENT_SIZE,
+  MAX_ATTACHMENTS_PER_MESSAGE,
+} from '@/lib/amp-attachments'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
+
+import { loadAgents, createAgent, getAgent, getAgentByName, getAgentByNameAnyHost, updateAgent, deleteAgent, markAgentAsAMPRegistered, checkMeshAgentExists, getAMPRegisteredAgents, folderOwner } from '@/lib/agent-registry'
+import { authenticateRequest, createApiKey, hashApiKey, extractApiKeyFromHeader, revokeApiKey, rotateApiKey, revokeAllKeysForAgent } from '@/lib/amp-auth'
+import { saveKeyPair, loadKeyPair, loadAllRegistrations, calculateFingerprint, verifySignature, generateKeyPair } from '@/lib/amp-keys'
+import { checkKnownKey, recordKnownKey, rotateKnownKey } from '@/lib/amp-known-keys'
+import { deriveDidKey } from '@/lib/amp-did'
+import { agentHasAddress, findAgentByAddress } from '@/lib/agent-addresses'
+import { revokeFingerprint, isRevoked } from '@/lib/amp-revocation'
+import { checkReplay } from '@/lib/amp-replay'
+import { verifyProviderRequest, senderBelongsToProvider, publicHexFromPem } from '@/lib/amp-federation-auth'
+import type { FetchProviderDocument } from '@/lib/amp-federation-auth'
+import { buildVerification, checkSignature, tenantOf } from '@/lib/amp-trust'
+import type { SignatureCheck, VerificationRecord } from '@/lib/amp-trust'
+import { canonicalStringify } from '@/lib/amp-canonical-json'
+import { queueMessage, getPendingMessages, acknowledgeMessage, acknowledgeMessages, cleanupAllExpiredMessages } from '@/lib/amp-relay'
+import { deliver } from '@/lib/message-delivery'
+import { initAgentAMPHome, isSafeMessageId } from '@/lib/amp-inbox-writer'
+import { deliverViaWebSocket } from '@/lib/amp-websocket'
+import { resolveAgentIdentifier } from '@/lib/messageQueue'
+import { getSelfHostId, getSelfHost, getHostById, isSelf, getOrganization } from '@/lib/hosts-config-server.mjs'
+import { AMP_PROTOCOL_VERSION, getAMPProviderDomain, buildAMPAddress } from '@/lib/types/amp'
+import type {
+  AMPHealthResponse,
+  AMPInfoResponse,
+  AMPRegistrationRequest,
+  AMPRegistrationResponse,
+  AMPRouteRequest,
+  AMPRouteResponse,
+  AMPPendingMessagesResponse,
+  AMPAgentResolveResponse,
+  AMPKeyRotationResponse,
+  AMPEnvelope,
+  AMPPayload,
+  AMPKeypairRotationRequest,
+} from '@/lib/types/amp'
+import { type ServiceResult } from '@/services/service-errors'
+import { personIdFromAddress } from '@/lib/person-address'
+import { personKeyFor, personHostFor } from '@/lib/person-keys'
+import { personAddress } from '@/lib/person-address'
+import { saveMessage as savePersonMessage } from '@/lib/person-mailbox'
+import { getPerson } from '@/lib/people-registry'
+import { pushMessage } from '@/lib/push-expo'
+import { checkPersonSend, personNonces, rawKeyToHex } from '@/lib/person-signing'
+import { findContactByAddress, isHttpUrl, isOneLine } from '@/services/contacts-service'
+import { isApprovalRequired } from '@/services/amp-registrations-service'
+
+// ---------------------------------------------------------------------------
+// Module-level state (shared across requests, lives in the service)
+// ---------------------------------------------------------------------------
+
+/** Track server start time for uptime calculation */
+const SERVER_START_TIME = Date.now()
+
+// ── Route rate limiter (in-memory, per-agent) ──────────────────────────────
+
+const MESH_DISCOVERY_TIMEOUT_MS = 3000
+const FORWARD_TIMEOUT_MS = 10000
+const MAX_PAYLOAD_SIZE = 1024 * 1024  // 1 MB
+const ROUTE_RATE_LIMIT_MAX = 60
+const ROUTE_RATE_LIMIT_WINDOW_MS = 60_000
+
+const routeRateLimitMap = new Map<string, { count: number; resetAt: number }>()
+
+interface RateLimitResult {
+  allowed: boolean
+  limit: number
+  remaining: number
+  resetAt: number
+}
+
+function checkRouteRateLimit(agentId: string): RateLimitResult {
+  const now = Date.now()
+  const entry = routeRateLimitMap.get(agentId)
+
+  if (!entry || now > entry.resetAt) {
+    routeRateLimitMap.set(agentId, { count: 1, resetAt: now + ROUTE_RATE_LIMIT_WINDOW_MS })
+    return { allowed: true, limit: ROUTE_RATE_LIMIT_MAX, remaining: ROUTE_RATE_LIMIT_MAX - 1, resetAt: now + ROUTE_RATE_LIMIT_WINDOW_MS }
+  }
+
+  if (entry.count >= ROUTE_RATE_LIMIT_MAX) {
+    return { allowed: false, limit: ROUTE_RATE_LIMIT_MAX, remaining: 0, resetAt: entry.resetAt }
+  }
+
+  entry.count++
+  // Periodic cleanup: remove expired entries every 100 checks
+  if (entry.count % 100 === 0) {
+    for (const [key, val] of routeRateLimitMap) {
+      if (now > val.resetAt) routeRateLimitMap.delete(key)
+    }
+  }
+  return { allowed: true, limit: ROUTE_RATE_LIMIT_MAX, remaining: ROUTE_RATE_LIMIT_MAX - entry.count, resetAt: entry.resetAt }
+}
+
+// ── Federation rate limiter (in-memory, per-provider) ──────────────────────
+
+const FEDERATION_RATE_LIMIT_MAX = 120
+const FEDERATION_RATE_LIMIT_WINDOW_MS = 60_000
+
+const federationRateLimitMap = new Map<string, { count: number; resetAt: number }>()
+
+function checkFederationRateLimit(providerKey: string): { allowed: boolean; remaining: number } {
+  const now = Date.now()
+  const entry = federationRateLimitMap.get(providerKey)
+
+  if (!entry || now > entry.resetAt) {
+    federationRateLimitMap.set(providerKey, { count: 1, resetAt: now + FEDERATION_RATE_LIMIT_WINDOW_MS })
+    return { allowed: true, remaining: FEDERATION_RATE_LIMIT_MAX - 1 }
+  }
+
+  if (entry.count >= FEDERATION_RATE_LIMIT_MAX) {
+    return { allowed: false, remaining: 0 }
+  }
+
+  entry.count++
+  if (entry.count % 100 === 0) {
+    for (const [key, val] of federationRateLimitMap) {
+      if (now > val.resetAt) federationRateLimitMap.delete(key)
+    }
+  }
+  return { allowed: true, remaining: FEDERATION_RATE_LIMIT_MAX - entry.count }
+}
+
+// ── Pending messages lazy cleanup ──────────────────────────────────────────
+
+let _lastCleanupAt = 0
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000
+
+function lazyCleanup() {
+  const now = Date.now()
+  if (now - _lastCleanupAt > CLEANUP_INTERVAL_MS) {
+    _lastCleanupAt = now
+    try { cleanupAllExpiredMessages() } catch { /* non-fatal */ }
+  }
+}
+
+// ── Federation replay protection (file-based) ─────────────────────────────
+
+const FEDERATION_DIR = path.join(os.homedir(), '.aimaestro', 'federation', 'delivered')
+let lastFederationCleanup = 0
+const FEDERATION_CLEANUP_INTERVAL = 3600_000  // 1 hour
+const FEDERATION_MAX_AGE = 86400_000  // 24 hours
+
+function ensureFederationDir() {
+  if (!fs.existsSync(FEDERATION_DIR)) {
+    fs.mkdirSync(FEDERATION_DIR, { recursive: true })
+  }
+}
+
+function cleanupOldFederationEntries() {
+  const now = Date.now()
+  if (now - lastFederationCleanup < FEDERATION_CLEANUP_INTERVAL) return
+  lastFederationCleanup = now
+
+  try {
+    const files = fs.readdirSync(FEDERATION_DIR)
+    for (const file of files) {
+      const filePath = path.join(FEDERATION_DIR, file)
+      try {
+        const stat = fs.statSync(filePath)
+        if (now - stat.mtimeMs > FEDERATION_MAX_AGE) {
+          fs.unlinkSync(filePath)
+        }
+      } catch {
+        // Ignore individual file errors
+      }
+    }
+  } catch {
+    // Directory may not exist yet
+  }
+}
+
+function trackMessageId(id: string): boolean {
+  ensureFederationDir()
+  cleanupOldFederationEntries()
+
+  const safeFilename = Buffer.from(id).toString('base64url')
+  const filePath = path.join(FEDERATION_DIR, safeFilename)
+
+  if (fs.existsSync(filePath)) {
+    return false // Replay detected
+  }
+
+  try {
+    fs.writeFileSync(filePath, id, 'utf-8')
+  } catch {
+    // If write fails, allow message through (fail open for delivery)
+  }
+
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract raw public key bytes from PEM format.
+ * Returns hex string of the 32-byte Ed25519 public key.
+ */
+function extractPublicKeyHex(pemKey: string): string | null {
+  try {
+    const { createPublicKey } = require('crypto')
+    const pubKeyObj = createPublicKey(pemKey)
+
+    if (pubKeyObj.asymmetricKeyType !== 'ed25519') {
+      return null
+    }
+
+    const rawPubKey = pubKeyObj.export({ type: 'spki', format: 'der' })
+    const publicKeyBytes = rawPubKey.subarray(12)
+    return publicKeyBytes.toString('hex')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Validate agent name format.
+ * Must be 1-63 chars, alphanumeric + hyphens, cannot start/end with hyphen.
+ */
+function isValidAgentName(name: string): boolean {
+  const nameRegex = /^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$|^[a-z0-9]$/
+  return nameRegex.test(name.toLowerCase())
+}
+
+/**
+ * Generate alternative name suggestions when a name is taken.
+ */
+function generateNameSuggestions(baseName: string): string[] {
+  const adjectives = ['cosmic', 'stellar', 'quantum', 'cyber', 'nexus', 'prime', 'alpha', 'beta']
+  const nouns = ['wolf', 'hawk', 'phoenix', 'dragon', 'titan', 'spark', 'nova', 'pulse']
+
+  const suggestions: string[] = []
+
+  suggestions.push(`${baseName}-2`)
+  suggestions.push(`${baseName}-3`)
+
+  const randAdj = adjectives[Math.floor(Math.random() * adjectives.length)]
+  const randNoun = nouns[Math.floor(Math.random() * nouns.length)]
+  suggestions.push(`${baseName}-${randAdj}-${randNoun}`)
+
+  return suggestions.slice(0, 3)
+}
+
+/**
+ * Decode a User Key (uk_...) to extract owner and tenant info.
+ * Format: uk_{base64({owner_id}:{tenant_id}:{random})}
+ */
+function decodeUserKey(token: string): { ownerId: string; tenantId: string } | null {
+  if (!token.startsWith('uk_')) return null
+
+  try {
+    const decoded = Buffer.from(token.substring(3), 'base64').toString('utf-8')
+    const parts = decoded.split(':')
+    if (parts.length >= 2) {
+      return { ownerId: parts[0], tenantId: parts[1] }
+    }
+  } catch {
+    // Invalid format
+  }
+  return null
+}
+
+/**
+ * Parse an AMP address into components.
+ *
+ * Address format: name@[scope.]tenant.provider
+ * Examples:
+ *   alice@rnd23blocks.aimaestro.local  -> { name: "alice", tenant: "rnd23blocks", provider: "aimaestro.local" }
+ *   bob@myrepo.github.rnd23blocks.aimaestro.local -> { name: "bob", tenant: "rnd23blocks", provider: "aimaestro.local", scope: "myrepo.github" }
+ *
+ * Returns null if the address cannot be parsed (e.g. bare name with no @).
+ */
+function parseAMPAddress(address: string): {
+  name: string
+  tenant: string
+  provider: string
+  scope?: string
+} | null {
+  const atIndex = address.indexOf('@')
+  if (atIndex === -1) return null
+
+  const name = address.substring(0, atIndex)
+  const domain = address.substring(atIndex + 1)
+  const parts = domain.split('.')
+
+  if (parts.length < 2) return null
+
+  const provider = parts.slice(-2).join('.')
+  const tenantParts = parts.slice(0, -2)
+
+  if (tenantParts.length === 0) return null
+
+  const tenant = tenantParts[tenantParts.length - 1]
+  const scope = tenantParts.length > 1 ? tenantParts.slice(0, -1).join('.') : undefined
+
+  return { name, tenant, provider, scope }
+}
+
+/** Generate a unique message ID: msg_{timestamp}_{random} */
+function generateMessageId(): string {
+  const timestamp = Date.now()
+  const random = Math.random().toString(36).substring(2, 9)
+  return `msg_${timestamp}_${random}`
+}
+
+/**
+ * Forward a message to a remote mesh host via HTTP.
+ */
+async function forwardToHost(
+  remoteHost: { url: string; id: string },
+  recipientName: string,
+  envelope: AMPEnvelope,
+  body: AMPRouteRequest,
+  selfHostId: string,
+  senderPublicPem?: string
+): Promise<{ ok: boolean; result?: Record<string, unknown>; error?: string }> {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), FORWARD_TIMEOUT_MS)
+
+  try {
+    const response = await fetch(`${remoteHost.url}/api/v1/route`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-From': selfHostId,
+        'X-AMP-Envelope-Id': envelope.id,
+        ...(envelope.signature ? { 'X-AMP-Signature': envelope.signature } : {}),
+      },
+      body: JSON.stringify({
+        from: envelope.from,
+        to: recipientName,
+        subject: body.subject,
+        payload: body.payload,
+        priority: body.priority,
+        in_reply_to: body.in_reply_to,
+        signature: envelope.signature,
+        // A person's message carries the key id; the next host looks the key up and checks it itself
+        ...(body.key_id ? { key_id: body.key_id, sender_kind: 'person' } : {}),
+        // The receiving host checks the signature with this key (protocol 07).
+        ...(senderPublicPem ? { sender_public_key: senderPublicPem } : {}),
+        _forwarded: {
+          original_from: envelope.from,
+          original_to: envelope.to,
+          forwarded_by: selfHostId,
+          forwarded_at: envelope.timestamp
+        }
+      })
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'unknown')
+      return { ok: false, error: `Remote host returned ${response.status}: ${errorText}` }
+    }
+
+    const result = await response.json()
+    return { ok: true, result }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      return { ok: false, error: `Forward to ${remoteHost.id} timed out after ${FORWARD_TIMEOUT_MS}ms` }
+    }
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+/** Options for deliverLocally() */
+interface LocalDeliveryOptions {
+  envelope: AMPEnvelope
+  payload: AMPPayload
+  localAgent: { id: string; name?: string; alias?: string; hostId?: string; sessions?: Array<{ status: string }> }
+  recipientAgentName: string
+  senderAgent: { id: string; hostId?: string } | null
+  senderName: string
+  forwardedFrom: string | null
+  senderPublicKeyHex: string | undefined
+  body: AMPRouteRequest
+  verification?: VerificationRecord
+}
+
+/**
+ * Deliver a message to a local agent via unified deliver() function.
+ *
+ * RETURNS the result — callers must check it. deliver() reports failure by
+ * returning `{delivered: false, error}` (no recipient UUID, inbox write
+ * failed), and this used to discard that, so the route answered 200
+ * `{status: 'delivered'}` for a message that was never written. amp-send then
+ * printed a success line with an id it had generated locally, and the message
+ * went nowhere with nothing anywhere saying so.
+ */
+async function deliverLocally(opts: LocalDeliveryOptions): Promise<{ delivered: boolean; error?: string }> {
+  const { envelope, payload, recipientAgentName, senderAgent, senderName, forwardedFrom, senderPublicKeyHex, body, verification } = opts
+
+  const result = await deliver({
+    envelope,
+    payload,
+    recipientAgentName,
+    senderPublicKeyHex,
+    senderName,
+    senderHost: senderAgent?.hostId || forwardedFrom || 'unknown',
+    recipientAgentId: opts.localAgent.id,
+    verification,
+    subject: body.subject,
+    priority: body.priority,
+    messageType: payload.type,
+  })
+
+  if (!result.delivered) {
+    console.error(
+      `[AMP] Local delivery FAILED for ${recipientAgentName}: ${result.error || 'unknown'}`
+    )
+  }
+  return { delivered: result.delivered, error: result.error }
+}
+
+// ===========================================================================
+// PUBLIC API -- called by API routes
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/health
+// ---------------------------------------------------------------------------
+
+export function getHealthStatus(): ServiceResult<AMPHealthResponse> {
+  const organization = getOrganization() || undefined
+  const providerDomain = getAMPProviderDomain(organization)
+
+  try {
+    const agents = loadAgents()
+    const onlineAgents = agents.filter((a: any) =>
+      a.sessions?.some((s: any) => s.status === 'online')
+    ).length
+
+    const uptimeSeconds = Math.floor((Date.now() - SERVER_START_TIME) / 1000)
+
+    return {
+      data: {
+        status: 'healthy',
+        version: AMP_PROTOCOL_VERSION,
+        provider: providerDomain,
+        federation: false,
+        agents_online: onlineAgents,
+        uptime_seconds: uptimeSeconds
+      },
+      status: 200,
+      headers: { 'Cache-Control': 'no-cache, no-store, must-revalidate' }
+    }
+  } catch (error) {
+    console.error('[AMP Health] Error:', error)
+
+    return {
+      data: {
+        status: 'unhealthy',
+        version: AMP_PROTOCOL_VERSION,
+        provider: providerDomain,
+        federation: false,
+        agents_online: 0,
+        uptime_seconds: Math.floor((Date.now() - SERVER_START_TIME) / 1000)
+      },
+      status: 503
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/info
+// ---------------------------------------------------------------------------
+
+export function getProviderInfo(): ServiceResult<AMPInfoResponse> {
+  const organization = getOrganization() || undefined
+  const providerDomain = getAMPProviderDomain(organization)
+
+  return {
+    data: {
+      provider: providerDomain,
+      version: `amp/${AMP_PROTOCOL_VERSION}`,
+      public_key: undefined,
+      fingerprint: undefined,
+      capabilities: [
+        'registration',
+        'local-delivery',
+        'relay-queue',
+        'mesh-routing',
+        'attachments',
+        // AMP spec 04, "AFP Attachments": the provider carries an attachment
+        // that references an Agent Files Protocol object and never fetches,
+        // scans or rewrites it.
+        'attachments:afp',
+      ],
+      // Spec section 9: providers advertise their attachment limits here, and
+      // section 5 REQUIRES a provider without antivirus infrastructure to
+      // declare `av_scanning: false` rather than let recipients assume files
+      // were scanned. We run the mandatory checks (size, digest, blocked types,
+      // magic bytes) and no AV, which is why attachments come back
+      // `basic_clean` and never `clean`.
+      attachment_limits: {
+        max_attachment_size: MAX_ATTACHMENT_SIZE,
+        max_total_attachment_size: MAX_TOTAL_ATTACHMENT_SIZE,
+        max_attachments_per_message: MAX_ATTACHMENTS_PER_MESSAGE,
+        av_scanning: false,
+        injection_scanning: false,
+      },
+      registration_modes: [isApprovalRequired() ? 'admin' : 'open'],
+      rate_limits: {
+        messages_per_minute: 60,
+        api_requests_per_minute: 100
+      }
+    },
+    status: 200,
+    headers: { 'Cache-Control': 'public, max-age=300' }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/register
+// ---------------------------------------------------------------------------
+
+export async function registerAgent(
+  body: AMPRegistrationRequest,
+  authHeader: string | null
+): Promise<ServiceResult<AMPRegistrationResponse>> {
+  try {
+    // Check for User Key authentication (D5)
+    let userKeyInfo: { ownerId: string; tenantId: string } | null = null
+    if (authHeader?.startsWith('Bearer uk_')) {
+      userKeyInfo = decodeUserKey(authHeader.substring(7))
+      if (!userKeyInfo) {
+        return {
+          data: { error: 'unauthorized', message: 'Invalid User Key format' },
+          status: 401
+        }
+      }
+      if (!body.tenant) {
+        body.tenant = userKeyInfo.tenantId
+      }
+    }
+
+    // Validate required fields
+    if (!body.tenant || typeof body.tenant !== 'string') {
+      return {
+        data: { error: 'missing_field', message: 'tenant is required (or provide a User Key via Authorization header)', field: 'tenant' },
+        status: 400
+      }
+    }
+
+    if (!body.name || typeof body.name !== 'string') {
+      return {
+        data: { error: 'missing_field', message: 'name is required', field: 'name' },
+        status: 400
+      }
+    }
+
+    if (!body.public_key || typeof body.public_key !== 'string') {
+      return {
+        data: { error: 'missing_field', message: 'public_key is required', field: 'public_key' },
+        status: 400
+      }
+    }
+
+    if (!body.key_algorithm || body.key_algorithm !== 'Ed25519') {
+      return {
+        data: { error: 'invalid_field', message: 'key_algorithm must be "Ed25519"', field: 'key_algorithm' },
+        status: 400
+      }
+    }
+
+    // Who this member is: top-level fields, or metadata until clients send them
+    const kind = body.kind ?? body.metadata?.kind
+    if (kind !== undefined && kind !== 'agent' && kind !== 'assistant') {
+      return {
+        data: { error: 'invalid_field', message: "kind must be 'agent' or 'assistant'", field: 'kind' },
+        status: 400
+      }
+    }
+    const platform = body.platform ?? body.metadata?.platform
+    if (platform !== undefined && !isOneLine(platform, 64)) {
+      return {
+        data: { error: 'invalid_field', message: 'platform must be one line of text, at most 64 characters', field: 'platform' },
+        status: 400
+      }
+    }
+    // A name, never a path: the owner's wake runs what is stored here
+    if (body.program !== undefined && (typeof body.program !== 'string' || !/^[\w .+-]{1,64}$/.test(body.program))) {
+      return {
+        data: { error: 'invalid_field', message: 'program must be a program name of at most 64 characters', field: 'program' },
+        status: 400
+      }
+    }
+    if (body.avatar !== undefined && !isHttpUrl(body.avatar)) {
+      return {
+        data: { error: 'invalid_field', message: 'avatar must be an http or https URL', field: 'avatar' },
+        status: 400
+      }
+    }
+
+    // Normalize name to lowercase
+    const normalizedName = body.name.toLowerCase()
+
+    // Validate name format
+    if (!isValidAgentName(normalizedName)) {
+      return {
+        data: { error: 'invalid_field', message: 'name must be 1-63 characters, alphanumeric and hyphens only, cannot start or end with hyphen', field: 'name' },
+        status: 400
+      }
+    }
+
+    // Validate public key format
+    const publicKeyHex = extractPublicKeyHex(body.public_key)
+    if (!publicKeyHex) {
+      return {
+        data: { error: 'invalid_field', message: 'Invalid public key format. Must be PEM-encoded Ed25519 public key.', field: 'public_key' },
+        status: 400
+      }
+    }
+
+    // Calculate fingerprint + canonical did:key. The did is DERIVED from the key
+    // by the server (never client-supplied), so an agent's identity cannot drift
+    // from its key — the structural guarantee the UUID never had.
+    const fingerprint = calculateFingerprint(publicKeyHex)
+    const did = deriveDidKey(publicKeyHex)
+
+    // Get host info
+    const selfHost = getSelfHost()
+    const selfHostIdValue = selfHost?.id || getSelfHostId()
+
+    // Get organization from hosts config
+    const configOrg = getOrganization()
+
+    // PHASE 2: Require organization to be set before AMP registration
+    if (!configOrg) {
+      return {
+        data: {
+          error: 'organization_not_set',
+          message: 'Organization must be configured before registering agents. Please complete the AI Maestro setup first.',
+          field: 'organization',
+          details: { setup_url: '/setup' }
+        },
+        status: 400
+      }
+    }
+
+    // Use the configured organization (ignore client-provided tenant if it differs)
+    const tenant = configOrg
+    if (body.tenant && body.tenant !== configOrg) {
+      return {
+        data: {
+          error: 'invalid_field',
+          message: `This AI Maestro instance is configured for organization '${configOrg}'. Cannot register under '${body.tenant}'.`,
+          field: 'tenant',
+          details: { expected_tenant: configOrg }
+        },
+        status: 400
+      }
+    }
+
+    // Check if public key fingerprint is already used by a different agent
+    const ampAgents = getAMPRegisteredAgents()
+    const duplicateKeyAgent = ampAgents.find((a: any) =>
+      a.metadata?.amp?.fingerprint === fingerprint &&
+      a.name?.toLowerCase() !== normalizedName
+    )
+    if (duplicateKeyAgent) {
+      return {
+        data: {
+          error: 'key_already_registered',
+          message: 'This public key is already associated with another agent',
+          details: { fingerprint }
+        },
+        status: 409
+      }
+    }
+
+    // Check if name already exists in this tenant (on this host)
+    const existingAgent = getAgentByName(normalizedName, selfHostIdValue)
+    let agent: ReturnType<typeof createAgent>
+
+    if (existingAgent) {
+      const hasAMP = existingAgent.metadata?.amp?.registeredVia
+      if (hasAMP) {
+        const existingFingerprint = existingAgent.metadata?.amp?.fingerprint
+        if (existingFingerprint && existingFingerprint === fingerprint) {
+          agent = existingAgent
+          console.log(`[AMP Register] Re-registering agent '${normalizedName}' (same key fingerprint, re-issuing API key)`)
+        } else {
+          return {
+            data: {
+              error: 'name_taken',
+              message: `Agent name '${normalizedName}' is already registered`,
+              details: { suggestions: generateNameSuggestions(normalizedName) }
+            },
+            status: 409
+          }
+        }
+      } else {
+        agent = existingAgent
+        console.log(`[AMP Register] Adopting existing agent '${normalizedName}' (${agent.id.substring(0, 8)}...)`)
+      }
+    } else {
+      // An AMP identity needs no folder; one another agent owns is left out rather than refusing the registration.
+      // An assistant lives elsewhere: no folder here is its own.
+      let ampFolder = kind === 'assistant' ? undefined : body.metadata?.working_directory as string || undefined
+      const ampFolderOwner = folderOwner(ampFolder)
+      if (ampFolderOwner) {
+        console.log(`[AMP Register] '${normalizedName}' registered without folder ${ampFolder}: it belongs to ${ampFolderOwner.name}`)
+        ampFolder = undefined
+      }
+      try {
+        agent = createAgent({
+          id: body.agent_id,
+          name: normalizedName,
+          label: body.alias,
+          avatar: body.avatar,
+          kind,
+          platform: platform as string | undefined,
+          // Only a record made here can wait: an agent already in the registry was never in doubt
+          registrationStatus: isApprovalRequired() ? 'pending' : undefined,
+          program: body.program ?? '',
+          taskDescription: body.metadata?.description as string || `AMP-registered agent: ${normalizedName}`,
+          workingDirectory: ampFolder,
+          runtime: 'api',
+          createSession: false,
+          metadata: {
+            amp: {
+              tenant,
+              scope: body.scope,
+              delivery: body.delivery,
+              fingerprint,
+              did,
+              registeredVia: 'amp-v1-api',
+              registeredAt: new Date().toISOString()
+            },
+            ...body.metadata
+          }
+        })
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'Failed to create agent'
+        return {
+          data: { error: 'internal_error', message: errorMessage },
+          status: 500
+        }
+      }
+    }
+
+    // Store the public key
+    try {
+      saveKeyPair(agent.id, {
+        privatePem: '',
+        publicPem: body.public_key,
+        publicHex: publicKeyHex,
+        fingerprint
+      })
+    } catch (err) {
+      console.error('[AMP Register] Failed to save public key:', err)
+    }
+
+    // Initialize AMP home directory and update .index.json with name→UUID mapping
+    // Without this, amp-inbox.sh resolves to a name-based directory instead of the UUID directory
+    // where the server writes incoming messages
+    try {
+      await initAgentAMPHome(normalizedName, agent.id)
+    } catch (err) {
+      console.warn('[AMP Register] Failed to init AMP home:', err)
+    }
+
+    // Get provider domain based on organization
+    const providerDomain = getAMPProviderDomain(tenant)
+
+    // Generate API key. A pending member gets it now, so that approval needs no second step on its side.
+    const pending = agent.registrationStatus === 'pending'
+    const apiKey = createApiKey(agent.id, tenant, `${normalizedName}@${providerDomain}`, pending ? 'pending' : 'active')
+
+    // Mark agent as AMP-registered
+    const registeredAt = new Date().toISOString()
+    const fullAddress = body.scope?.repo && body.scope?.platform
+      ? `${normalizedName}@${body.scope.repo}.${body.scope.platform}.${providerDomain}`
+      : `${normalizedName}@${providerDomain}`
+
+    // STRUCTURAL GUARD: an AMP address must belong to exactly one agent. Reject if
+    // a *different* agent already owns it. Together with the duplicate-key check
+    // above, this makes shared identity impossible via the registration path — the
+    // contamination that scripts/amp-identity-audit.mjs was built to catch entered
+    // by copying key files underneath this layer, never through here.
+    const addressOwner = getAMPRegisteredAgents().find((a: any) =>
+      ((a.metadata?.amp?.address as string) || '').toLowerCase() === fullAddress.toLowerCase() &&
+      a.id !== agent.id
+    )
+    if (addressOwner) {
+      return {
+        data: {
+          error: 'address_already_registered',
+          message: `AMP address '${fullAddress}' is already owned by a different agent`,
+          details: { address: fullAddress, ownerId: addressOwner.id }
+        },
+        status: 409
+      }
+    }
+
+    markAgentAsAMPRegistered(agent.id, {
+      address: fullAddress,
+      tenant,
+      fingerprint,
+      did,
+      registeredAt,
+      apiKeyHash: hashApiKey(apiKey)
+    })
+
+    // Build response
+    const hostEndpoint = selfHost?.url || `http://localhost:23000`
+
+    const response: AMPRegistrationResponse = {
+      address: fullAddress,
+      short_address: `${normalizedName}@${providerDomain}`,
+      local_name: normalizedName,
+      agent_id: agent.id,
+      tenant_id: tenant,
+      tenant,
+      api_key: apiKey,
+      provider: {
+        name: providerDomain,
+        endpoint: `${hostEndpoint}/api/v1`,
+        route_url: `${hostEndpoint}/api/v1/route`
+      },
+      fingerprint,
+      registered_at: registeredAt,
+      ...(pending ? { status: 'pending' as const, message: 'Waiting for the owner to approve this registration. Until then this key cannot send or receive.' } : {})
+    }
+
+    console.log(`[AMP Register] Registered agent: ${fullAddress} (${agent.id.substring(0, 8)}...)`)
+
+    return { data: response, status: 201 }
+
+  } catch (error) {
+    console.error('[AMP Register] Error:', error)
+    return {
+      data: { error: 'internal_error', message: error instanceof Error ? error.message : 'Internal server error' },
+      status: 500
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/route
+// ---------------------------------------------------------------------------
+
+/** Every refusal (401/403) is recorded (B006), on top of the console.warn lines inside. */
+export async function routeMessage(
+  body: AMPRouteRequest,
+  authHeader: string | null,
+  forwardedFrom: string | null,
+  envelopeIdHeader: string | null,
+  signatureHeader: string | null,
+  contentLength: string | null
+): Promise<ServiceResult<AMPRouteResponse>> {
+  const result = await routeMessageUnrecorded(body, authHeader, forwardedFrom, envelopeIdHeader, signatureHeader, contentLength)
+  if (result.status === 401 || result.status === 403) {
+    const d = result.data as { error?: string; message?: string; details?: { fingerprint?: string; from?: string } } | undefined
+    // A local agent's request carries no body.from; the refusal names the sender it checked
+    recordAmpRefusal({ endpoint: 'route', status: result.status, reason: d?.error || 'unknown', message: d?.message, from: body?.from || d?.details?.from, to: body?.to, via: forwardedFrom || undefined, fingerprint: d?.details?.fingerprint })
+  }
+  return result
+}
+
+async function routeMessageUnrecorded(
+  body: AMPRouteRequest,
+  authHeader: string | null,
+  forwardedFrom: string | null,
+  envelopeIdHeader: string | null,
+  signatureHeader: string | null,
+  contentLength: string | null
+): Promise<ServiceResult<AMPRouteResponse>> {
+  try {
+    // ── Authentication ─────────────────────────────────────────────────
+    let auth = authenticateRequest(authHeader)
+
+    if (!auth.authenticated && forwardedFrom) {
+      const forwardingHost = getHostById(forwardedFrom)
+      if (forwardingHost && forwardingHost.enabled !== false) {
+        auth = {
+          authenticated: true,
+          agentId: `mesh-${forwardedFrom}`,
+          tenantId: getOrganization() || 'default',
+          address: `mesh@${forwardedFrom}`
+        }
+        console.log(`[AMP Route] Accepting mesh-forwarded request from ${forwardedFrom} (trusted host; the sender signature is checked below)`)
+      }
+    }
+
+    if (!auth.authenticated) {
+      return {
+        data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+        status: 401
+      }
+    }
+
+    // ── Rate Limiting (S2) ────────────────────────────────────────────
+    const rateLimitKey = auth.agentId || forwardedFrom || 'unknown'
+    const rateLimit = checkRouteRateLimit(rateLimitKey)
+    const rateLimitHeaders = {
+      'X-RateLimit-Limit': String(rateLimit.limit),
+      'X-RateLimit-Remaining': String(rateLimit.remaining),
+      'X-RateLimit-Reset': String(Math.ceil(rateLimit.resetAt / 1000)),
+    }
+
+    if (!rateLimit.allowed) {
+      return {
+        data: { error: 'rate_limited', message: `Rate limit exceeded: ${ROUTE_RATE_LIMIT_MAX} requests per minute` },
+        status: 429,
+        headers: rateLimitHeaders
+      }
+    }
+
+    // ── Payload Size Limit (S10) ──────────────────────────────────────
+    if (contentLength && parseInt(contentLength, 10) > MAX_PAYLOAD_SIZE) {
+      return {
+        data: { error: 'payload_too_large', message: `Payload exceeds maximum size of ${MAX_PAYLOAD_SIZE} bytes` },
+        status: 413
+      }
+    }
+
+    // ── Body Validation ────────────────────────────────────────────────
+    if (!body.to || typeof body.to !== 'string') {
+      return {
+        data: { error: 'missing_field', message: 'to address is required', field: 'to' },
+        status: 400
+      }
+    }
+    if (!body.subject || typeof body.subject !== 'string') {
+      return {
+        data: { error: 'missing_field', message: 'subject is required', field: 'subject' },
+        status: 400
+      }
+    }
+    if (!body.payload || typeof body.payload !== 'object') {
+      return {
+        data: { error: 'missing_field', message: 'payload is required', field: 'payload' },
+        status: 400
+      }
+    }
+    if (!body.payload.type || !body.payload.message) {
+      return {
+        data: { error: 'invalid_field', message: 'payload must have type and message fields', field: 'payload' },
+        status: 400
+      }
+    }
+
+    // Strict identity mode: require a valid signature and reject mesh address
+    // spoofing outright. Default OFF for backward compatibility — enable with
+    // AMP_REQUIRE_SIGNATURES=1 once all senders sign. Invalid signatures are
+    // rejected regardless of this flag (see below).
+    const STRICT = process.env.AMP_REQUIRE_SIGNATURES === '1' || process.env.AMP_REQUIRE_SIGNATURES === 'true'
+
+    // ── Sender Resolution ──────────────────────────────────────────────
+    const isMeshForwarded = !!forwardedFrom && auth.agentId?.startsWith('mesh-')
+    // This host's own traffic entering as mesh (a person sending from the app): it still needs the whole mesh lookup
+    const fromThisHost = isMeshForwarded && isSelf(forwardedFrom!)
+    const senderAgent = isMeshForwarded ? null : getAgent(auth.agentId!)
+
+    if (!senderAgent && !isMeshForwarded) {
+      return {
+        data: { error: 'internal_error', message: 'Sender agent not found in registry' },
+        status: 500
+      }
+    }
+
+    const senderName = senderAgent?.name || senderAgent?.alias
+      || (isMeshForwarded && body.from ? body.from.split('@')[0] : 'unknown')
+
+    // ── Sender Address Validation for Mesh (D16) ──────────────────────
+    if (isMeshForwarded && body.from) {
+      const senderParsed = parseAMPAddress(body.from)
+      if (senderParsed) {
+        const fwdHost = getHostById(forwardedFrom!)
+        const expectedHostName = fwdHost?.name || forwardedFrom
+        if (senderParsed.tenant !== forwardedFrom && senderParsed.tenant !== expectedHostName) {
+          const spoofMsg = `Sender address tenant "${senderParsed.tenant}" does not match forwarding host "${forwardedFrom}" -- possible address spoofing`
+          if (STRICT) {
+            console.warn(`[AMP Route] REJECTED — ${spoofMsg}`)
+            return {
+              data: { error: 'unauthorized', message: spoofMsg, details: { senderTenant: senderParsed.tenant, forwardingHost: forwardedFrom } },
+              status: 403
+            }
+          }
+          console.warn(`[AMP Route] ${spoofMsg}`)
+        }
+      }
+    }
+
+    // ── Envelope Construction ──────────────────────────────────────────
+    const recipientParsed = parseAMPAddress(body.to)
+    const messageId = generateMessageId()
+    const now = new Date().toISOString()
+
+    let senderAddress: string
+    if (isMeshForwarded && body.from) {
+      senderAddress = body.from
+    } else if (senderAgent) {
+      const agentAmpAddress = senderAgent.metadata?.amp?.address as string | undefined
+      const agentName = senderAgent.name || senderAgent.alias || auth.address!.split('@')[0]
+      senderAddress = agentAmpAddress || `${agentName}@${getAMPProviderDomain(getOrganization() || undefined)}`
+    } else {
+      senderAddress = auth.address!
+    }
+
+    const envelope: AMPEnvelope = {
+      version: 'amp/0.1',
+      id: messageId,
+      from: senderAddress,
+      from_did: (senderAgent?.metadata?.amp?.did as string) || null,
+      to: body.to,
+      subject: body.subject,
+      priority: body.priority || 'normal',
+      timestamp: now,
+      expires_at: body.expires_at,
+      signature: '',
+      in_reply_to: body.in_reply_to,
+      thread_id: body.in_reply_to || messageId,
+      reply_to: senderAddress,
+    }
+
+    // ── Signature Verification ─────────────────────────────────────────
+    // A signature proves the sender holds the private key for its address. Rules:
+    //  • present + verifiable + INVALID  → REJECT (403). A bad signature is a
+    //    forgery/corruption, never a legit client — never deliver it (was warn-only).
+    //  • present + no local key to check → can't verify; reject in STRICT, else pass.
+    //  • absent                          → reject in STRICT, else pass (Phase-1 default).
+    // Mesh-forwarded messages carry no local keypair; they're gated by the
+    // trusted-host + address-tenant check above, not by this local key check.
+    const senderKeyPair = isMeshForwarded ? null : loadKeyPair(auth.agentId!)
+
+    // ── Identity Conflict Detection (AMP 07-security) ──────────────────
+    // The sender's registered key fingerprint must match what we've seen before
+    // for this address (TOFU). An unexplained change is a key-swap / contamination
+    // signal — refuse until resolved. This is the runtime control that would have
+    // caught the fleet-wide shared-key incident.
+    if (senderKeyPair?.publicHex && !isMeshForwarded) {
+      const senderFp = calculateFingerprint(senderKeyPair.publicHex)
+      // Revoked-key check (AMP 07-security §Key Revocation) — a rotated/compromised
+      // key is dead even if the signature would otherwise verify.
+      if (isRevoked(senderFp)) {
+        console.warn(`[AMP Route] REJECTED — key_revoked for ${senderAddress}: ${senderFp.slice(0, 20)}…`)
+        return {
+          data: { error: 'key_revoked', message: 'Message signed with a revoked key', details: { fingerprint: senderFp } },
+          status: 403
+        }
+      }
+      const conflict = checkKnownKey(senderAddress, senderFp)
+      if (conflict.status === 'conflict') {
+        console.warn(`[AMP Route] REJECTED — key_conflict for ${senderAddress}: known ${conflict.knownFingerprint?.slice(0, 20)}…, presented ${senderFp.slice(0, 20)}…`)
+        return {
+          data: {
+            error: 'key_conflict',
+            message: `Sender ${senderAddress} public key changed from its known fingerprint; resolve the conflict (or rotate with proof) before messaging`,
+            details: { address: senderAddress, knownFingerprint: conflict.knownFingerprint, presentedFingerprint: senderFp }
+          },
+          status: 409
+        }
+      }
+      recordKnownKey(senderAddress, senderFp, now)
+    }
+
+    // The key this signature is checked against: the sender's own registered
+    // key when it lives on this host, or, for mail forwarded by another mesh
+    // host, the key that host sends along with it (hosts in the mesh are trusted
+    // to speak for their own agents; the ledger below still pins the key).
+    const fwdMeta = isMeshForwarded ? ((body as any)._forwarded as { original_to?: string } | undefined) : undefined
+    const meshKeyHex = isMeshForwarded && typeof (body as any).sender_public_key === 'string'
+      ? extractPublicKeyHex((body as any).sender_public_key)
+      : null
+    let checkKeyHex = senderKeyPair?.publicHex || meshKeyHex || null
+    const signedFields = {
+      from: envelope.from,
+      // A forwarding host names the recipient by bare name; the sender signed the full address.
+      to: typeof fwdMeta?.original_to === 'string' ? fwdMeta.original_to : envelope.to,
+      subject: envelope.subject,
+      priority: body.priority || 'normal',
+      in_reply_to: body.in_reply_to || '',
+      payload: body.payload,
+    }
+    let signatureCheck: SignatureCheck = body.signature ? 'no_key' : 'unsigned'
+    let verifyReason: string | undefined
+    let personKeyHex: string | undefined
+
+    // A person's message (AMP spec 13): signed by one of their device keys, never an agent key. Every
+    // host runs the whole check itself, with its own nonce store, whoever forwarded it.
+    const personSender = personIdFromAddress(envelope.from)
+    if (personSender || typeof body.key_id === 'string') {
+      const key = typeof body.key_id === 'string' ? await personKeyFor(body.key_id, forwardedFrom) : null
+      const check = checkPersonSend({ fields: signedFields, signature: body.signature, personId: personSender ?? '', key, now: Date.parse(now), nonces: personNonces() })
+      if (!check.ok) {
+        console.warn(`[AMP Route] REJECTED — person ${check.reason} from ${envelope.from}`)
+        return { data: { error: `person_${check.reason}`, message: check.message, details: { from: envelope.from } } as any, status: 403 }
+      }
+      signatureCheck = 'verified'
+      checkKeyHex = rawKeyToHex(key!.publicKey)
+      personKeyHex = checkKeyHex ?? undefined
+      envelope.signature = body.signature as string
+    } else if (body.signature) {
+      if (checkKeyHex) {
+        // Mesh keys get the same pinning as local ones, but a changed key there
+        // downgrades the message to unverified instead of refusing it: the
+        // forwarding host is trusted, and a remote key rotation reaches this
+        // ledger only through this very path.
+        let meshKeyConflict = false
+        if (!senderKeyPair?.publicHex && meshKeyHex) {
+          const meshFp = calculateFingerprint(meshKeyHex)
+          if (isRevoked(meshFp)) {
+            console.warn(`[AMP Route] REJECTED — key_revoked (mesh) for ${envelope.from}: ${meshFp.slice(0, 20)}…`)
+            return {
+              data: { error: 'key_revoked', message: 'Message signed with a revoked key', details: { fingerprint: meshFp } },
+              status: 403
+            }
+          }
+          if (checkKnownKey(envelope.from, meshFp).status === 'conflict') {
+            meshKeyConflict = true
+          } else {
+            recordKnownKey(envelope.from, meshFp, now)
+          }
+        }
+        if (meshKeyConflict) {
+          signatureCheck = 'no_key'
+          verifyReason = 'key_conflict'
+        } else {
+          signatureCheck = checkSignature(signedFields, body.signature, checkKeyHex)
+          if (signatureCheck === 'bad') {
+            console.warn(`[AMP Route] REJECTED — invalid signature from ${envelope.from}`)
+            return {
+              data: { error: 'invalid_signature', message: 'Message signature failed verification', details: { from: envelope.from } },
+              status: 403
+            }
+          }
+          console.log(`[AMP Route] Verified signature from ${envelope.from}${isMeshForwarded ? ' (mesh-forwarded)' : ''}`)
+        }
+      } else if (STRICT && !isMeshForwarded) {
+        console.warn(`[AMP Route] REJECTED — no registered key to verify signature from ${envelope.from}`)
+        return {
+          data: { error: 'invalid_signature', message: 'Cannot verify signature: no registered key for sender', details: { from: envelope.from } },
+          status: 403
+        }
+      }
+      envelope.signature = body.signature
+    } else if (STRICT && !isMeshForwarded) {
+      console.warn(`[AMP Route] REJECTED — unsigned message from ${envelope.from} (AMP_REQUIRE_SIGNATURES enabled)`)
+      return {
+        data: { error: 'invalid_signature', message: 'A valid signature is required', details: { from: envelope.from } },
+        status: 403
+      }
+    } else {
+      console.log(`[AMP Route] No signature provided by ${envelope.from}`)
+    }
+
+    const recipientTenant = tenantOf(body.to) || (getOrganization() || 'default').toLowerCase()
+    const verification: VerificationRecord = buildVerification({
+      check: signatureCheck,
+      sameTenant: tenantOf(envelope.from) === recipientTenant,
+      method: isMeshForwarded ? 'mesh-forwarded' : 'route',
+      fields: signedFields,
+      publicHex: checkKeyHex,
+      now,
+    })
+    if (verifyReason) verification.reason = verifyReason
+    if (personSender) Object.assign(verification, { sender_kind: 'person', person_id: personSender })
+
+    // ── Provider Scope Check ───────────────────────────────────────────
+    const organization = getOrganization() || undefined
+    const providerDomain = getAMPProviderDomain(organization)
+
+    const isLocalProvider = !recipientParsed ||
+      recipientParsed.provider === providerDomain ||
+      recipientParsed.provider === 'aimaestro.local' ||
+      recipientParsed.provider.endsWith('.local')
+
+    if (!isLocalProvider) {
+      return {
+        data: {
+          error: 'external_provider',
+          message: `Recipient is on external provider "${recipientParsed?.provider}". Send directly to that provider using its route_url from your registration.`
+        },
+        status: 422
+      }
+    }
+
+    // ── A person recipient (AMP spec 13.5): their mailbox, on the host that holds them ──
+    const personRecipient = personIdFromAddress(fwdMeta?.original_to ?? body.to)
+    if (personRecipient) {
+      const person = getPerson(personRecipient)
+      if (person && person.active !== false) {
+        savePersonMessage(personRecipient, {
+          id: messageId, box: 'inbox', from: envelope.from, to: personAddress(personRecipient),
+          subject: envelope.subject, priority: envelope.priority, ...(body.in_reply_to ? { in_reply_to: body.in_reply_to } : {}),
+          timestamp: now, payload: body.payload as any, ...(envelope.signature ? { signature: envelope.signature } : {}),
+          sender_kind: personSender ? 'person' : 'agent', verified: verification.state === 'verified', status: 'unread',
+        })
+        const agentId = senderAgent?.id || (personSender ? undefined : getAgentByNameAnyHost(senderName)?.id)
+        pushMessage({ personId: personRecipient, messageId, agentAddress: envelope.from, agentId, senderName }).catch(() => {})
+        return { data: { id: messageId, status: 'delivered', method: 'local', delivered_at: now } as AMPRouteResponse, status: 200, headers: rateLimitHeaders }
+      }
+      // A forwarded message stops here: the host that forwarded it already asked every peer
+      const home = isMeshForwarded && !fromThisHost ? null : await personHostFor(personRecipient)
+      if (!home) {
+        return { data: { error: 'not_found', message: `No host holds the person ${personRecipient}` }, status: 404 }
+      }
+      const fwd = await forwardToHost(home, `p-${personRecipient}`, envelope, body, getSelfHostId(), senderKeyPair?.publicPem)
+      if (!fwd.ok) {
+        return { data: { error: 'internal_error', message: `Delivery to ${home.id} failed: ${fwd.error}` }, status: 502 }
+      }
+      return { data: { id: (fwd.result?.id as string) || messageId, status: 'delivered', method: 'mesh', delivered_at: now, remote_host: home.id } as AMPRouteResponse, status: 200, headers: rateLimitHeaders }
+    }
+
+    // ── Recipient Resolution ───────────────────────────────────────────
+    // Normalize to lowercase — agent names are case-insensitive
+    const recipientName = (recipientParsed?.name || body.to.split('@')[0]).toLowerCase()
+    const selfHostIdValue = getSelfHostId()
+
+    const targetTenant = recipientParsed?.tenant
+
+    const isExplicitRemote = targetTenant
+      && !isSelf(targetTenant)
+      && targetTenant !== organization
+
+    let resolvedHostId: string | undefined
+    let resolvedAgentId: string | undefined
+
+    if (isMeshForwarded && !fromThisHost) {
+      const localAgent = getAgentByName(recipientName, selfHostIdValue)
+      if (localAgent) {
+        resolvedHostId = selfHostIdValue
+        resolvedAgentId = localAgent.id
+      } else {
+        const resolved = resolveAgentIdentifier(recipientName)
+        if (resolved?.agentId) {
+          resolvedAgentId = resolved.agentId
+          resolvedHostId = selfHostIdValue
+        }
+      }
+    } else if (isExplicitRemote) {
+      resolvedHostId = targetTenant
+    } else {
+      const meshResult = await checkMeshAgentExists(recipientName, MESH_DISCOVERY_TIMEOUT_MS)
+      if (meshResult.exists && meshResult.host) {
+        resolvedHostId = meshResult.host
+        resolvedAgentId = meshResult.agent?.id
+      }
+
+      if (!resolvedAgentId) {
+        const resolved = resolveAgentIdentifier(recipientName)
+        if (resolved?.agentId) {
+          resolvedAgentId = resolved.agentId
+          resolvedHostId = selfHostIdValue
+        }
+      }
+    }
+
+    // ── Remote Delivery ────────────────────────────────────────────────
+    if (resolvedHostId && !isSelf(resolvedHostId)) {
+      const remoteHost = getHostById(resolvedHostId)
+
+      if (!remoteHost) {
+        if (!resolvedAgentId) {
+          console.error(`[AMP Route] Host '${resolvedHostId}' not in config and no UUID for ${recipientName} -- cannot queue`)
+          return {
+            data: { error: 'not_found', message: `Recipient '${recipientName}' not found and target host '${resolvedHostId}' is not configured` },
+            status: 404
+          }
+        }
+        console.log(`[AMP Route] Host '${resolvedHostId}' not in config, queuing for relay`)
+        queueMessage(resolvedAgentId, envelope, body.payload, senderKeyPair?.publicHex || '')
+        return {
+          data: { id: messageId, status: 'queued', method: 'relay', queued_at: now } as AMPRouteResponse,
+          status: 200,
+          headers: rateLimitHeaders
+        }
+      }
+
+      console.log(`[AMP Route] Forwarding to ${recipientName}@${resolvedHostId} via ${remoteHost.url}`)
+      const fwd = await forwardToHost(remoteHost, recipientName, envelope, body, selfHostIdValue, senderKeyPair?.publicPem)
+
+      if (fwd.ok) {
+        return {
+          data: {
+            id: (fwd.result?.id as string) || messageId,
+            status: 'delivered', method: 'mesh', delivered_at: now, remote_host: resolvedHostId
+          } as AMPRouteResponse,
+          status: 200,
+          headers: rateLimitHeaders
+        }
+      }
+
+      console.error(`[AMP Route] Mesh delivery to ${resolvedHostId} failed: ${fwd.error}`)
+      if (!resolvedAgentId) {
+        return {
+          data: { error: 'internal_error', message: `Mesh delivery to ${resolvedHostId} failed and no UUID to queue: ${fwd.error}` },
+          status: 502
+        }
+      }
+      queueMessage(resolvedAgentId, envelope, body.payload, senderKeyPair?.publicHex || '')
+      return {
+        data: {
+          id: messageId, status: 'queued', method: 'relay', queued_at: now,
+          error: `Mesh delivery to ${resolvedHostId} failed, queued for retry`
+        } as AMPRouteResponse,
+        status: 200,
+        headers: rateLimitHeaders
+      }
+    }
+
+    // ── Local Delivery ─────────────────────────────────────────────────
+    const localAgent = resolvedAgentId ? getAgent(resolvedAgentId) : null
+
+    if (!localAgent) {
+      if (!resolvedAgentId) {
+        return {
+          data: { error: 'not_found', message: `Recipient '${recipientName}' not found on any host` },
+          status: 404
+        }
+      }
+      queueMessage(resolvedAgentId, envelope, body.payload, senderKeyPair?.publicHex || '')
+      return {
+        data: { id: messageId, status: 'queued', method: 'relay', queued_at: now } as AMPRouteResponse,
+        status: 200
+      }
+    }
+
+    if (localAgent.registrationStatus === 'pending') {
+      return {
+        data: { error: 'recipient_pending', message: `Recipient '${recipientName}' is waiting for the owner to approve it` },
+        status: 403
+      }
+    }
+
+    const recipientAgentName = localAgent.name || localAgent.alias || recipientName
+    // A person's message carries operator authority only for agents they manage; to any other agent it is data
+    const operator = !!personSender && localAgent.humanManager === personSender
+    if (personSender) verification.operator = operator
+
+    try {
+      await deliverLocally({
+        envelope, payload: body.payload, localAgent, recipientAgentName,
+        senderAgent, senderName, forwardedFrom, senderPublicKeyHex: senderKeyPair?.publicHex || (operator ? personKeyHex : undefined), body, verification
+      })
+
+      return {
+        data: { id: messageId, status: 'delivered', method: 'local', delivered_at: now } as AMPRouteResponse,
+        status: 200,
+        headers: rateLimitHeaders
+      }
+
+    } catch (error) {
+      console.error('[AMP Route] Local delivery failed:', error)
+      queueMessage(localAgent.id, envelope, body.payload, senderKeyPair?.publicHex || '')
+      return {
+        data: {
+          id: messageId, status: 'queued', method: 'relay', queued_at: now,
+          error: 'Direct delivery failed, queued for relay'
+        } as AMPRouteResponse,
+        status: 200,
+        headers: rateLimitHeaders
+      }
+    }
+
+  } catch (error) {
+    console.error('[AMP Route] Error:', error)
+    return {
+      data: { error: 'internal_error', message: error instanceof Error ? error.message : 'Internal server error' },
+      status: 500
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/messages/pending
+// ---------------------------------------------------------------------------
+
+export function listPendingMessages(
+  authHeader: string | null,
+  limit?: number
+): ServiceResult<AMPPendingMessagesResponse> {
+  // Lazy cleanup of expired relay messages
+  lazyCleanup()
+
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  const effectiveLimit = limit ? Math.min(limit, 100) : 10
+  const result = getPendingMessages(auth.agentId!, effectiveLimit)
+
+  return {
+    data: result,
+    status: 200,
+    headers: { 'Cache-Control': 'no-cache, no-store, must-revalidate' }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/v1/messages/pending?id=<messageId>
+// ---------------------------------------------------------------------------
+
+export function acknowledgePendingMessage(
+  authHeader: string | null,
+  messageId: string | null
+): ServiceResult<{ acknowledged: boolean }> {
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  if (!messageId) {
+    return {
+      data: { error: 'missing_field', message: 'Message ID required (use DELETE /pending/:id or DELETE /pending?id=<messageId>)', field: 'id' },
+      status: 400
+    }
+  }
+
+  const acknowledged = acknowledgeMessage(auth.agentId!, messageId)
+
+  if (!acknowledged) {
+    return {
+      data: { error: 'not_found', message: `Message ${messageId} not found in pending queue` },
+      status: 404
+    }
+  }
+
+  return { data: { acknowledged: true }, status: 200 }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/messages/pending (batch ack)
+// ---------------------------------------------------------------------------
+
+export function batchAcknowledgeMessages(
+  authHeader: string | null,
+  ids: string[] | undefined
+): ServiceResult<{ acknowledged: number }> {
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    return {
+      data: { error: 'missing_field', message: 'ids array required', field: 'ids' },
+      status: 400
+    }
+  }
+
+  if (ids.length > 100) {
+    return {
+      data: { error: 'invalid_request', message: 'Maximum 100 messages per batch' },
+      status: 400
+    }
+  }
+
+  const acknowledged = acknowledgeMessages(auth.agentId!, ids)
+
+  return { data: { acknowledged }, status: 200 }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/messages/:id/read
+// ---------------------------------------------------------------------------
+
+export async function sendReadReceipt(
+  authHeader: string | null,
+  messageId: string,
+  originalSender?: string
+): Promise<ServiceResult<any>> {
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  // Build read receipt envelope
+  const receiptEnvelope: AMPEnvelope = {
+    version: 'amp/0.1',
+    id: `receipt_read_${messageId}_${Date.now()}`,
+    from: auth.address!,
+    to: originalSender || '',
+    subject: `Read: ${messageId}`,
+    priority: 'low',
+    timestamp: new Date().toISOString(),
+    signature: '',
+    thread_id: messageId,
+    in_reply_to: messageId,
+  }
+
+  const receiptPayload: AMPPayload = {
+    type: 'ack',
+    message: `Message ${messageId} has been read`,
+    context: {
+      receipt_type: 'read',
+      original_message_id: messageId,
+      read_at: new Date().toISOString(),
+      reader: auth.address,
+    },
+  }
+
+  // Attempt WebSocket delivery to original sender
+  let delivered = false
+  if (originalSender) {
+    delivered = deliverViaWebSocket(originalSender, receiptEnvelope, receiptPayload)
+  }
+
+  return {
+    data: {
+      receipt_sent: true,
+      message_id: messageId,
+      delivered_via: delivered ? 'websocket' : 'none',
+      read_at: new Date().toISOString(),
+    },
+    status: 200
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/agents
+// ---------------------------------------------------------------------------
+
+export function listAMPAgents(
+  authHeader: string | null,
+  search?: string | null
+): ServiceResult<any> {
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  let agents = getAMPRegisteredAgents().filter((a: any) => a.registrationStatus !== 'pending')
+
+  // Filter to same tenant
+  if (auth.tenantId) {
+    agents = agents.filter((a: any) =>
+      (a.metadata?.amp?.tenant as string) === auth.tenantId
+    )
+  }
+
+  // Apply search filter
+  if (search) {
+    const searchLower = search.toLowerCase()
+    agents = agents.filter((a: any) =>
+      (a.name?.toLowerCase().includes(searchLower)) ||
+      (a.alias?.toLowerCase().includes(searchLower)) ||
+      (a.label?.toLowerCase().includes(searchLower)) ||
+      ((a.metadata?.amp?.address as string)?.toLowerCase().includes(searchLower))
+    )
+  }
+
+  const agentList = agents.map((a: any) => ({
+    address: (a.metadata?.amp?.address as string) || `${a.name}@unknown`,
+    alias: a.alias || a.label,
+    online: a.sessions?.some((s: any) => s.status === 'online') || false,
+  }))
+
+  return {
+    data: { agents: agentList, total: agentList.length },
+    status: 200
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/agents/me
+// ---------------------------------------------------------------------------
+
+export function getAgentSelf(authHeader: string | null): ServiceResult<any> {
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  const agent = getAgent(auth.agentId!)
+  if (!agent) {
+    return {
+      data: { error: 'not_found', message: 'Agent not found' },
+      status: 404
+    }
+  }
+
+  const keyPair = loadKeyPair(auth.agentId!)
+
+  return {
+    data: {
+      address: auth.address,
+      alias: agent.alias || agent.label,
+      delivery: agent.metadata?.amp?.delivery || {},
+      fingerprint: keyPair?.fingerprint || agent.metadata?.amp?.fingerprint || null,
+      registered_at: agent.metadata?.amp?.registeredAt || agent.createdAt,
+      last_seen_at: agent.lastActive || null,
+    },
+    status: 200
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/agents/me/card
+// ---------------------------------------------------------------------------
+
+export function getAgentCard(authHeader: string | null): ServiceResult<any> {
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  const agent = getAgent(auth.agentId!)
+  if (!agent) {
+    return {
+      data: { error: 'not_found', message: 'Agent not found' },
+      status: 404
+    }
+  }
+
+  const keyPair = loadKeyPair(auth.agentId!)
+  if (!keyPair) {
+    return {
+      data: { error: 'not_found', message: 'Agent keypair not found' },
+      status: 404
+    }
+  }
+
+  const address = auth.address || `${agent.name}@${getAMPProviderDomain(getOrganization() || undefined)}`
+  const signedAt = new Date().toISOString()
+
+  // Build the card. `did` is the canonical self-certifying id (derived from the
+  // public key); address/fingerprint remain for compatibility.
+  const card: Record<string, unknown> = {
+    did: deriveDidKey(keyPair.publicHex),
+    address,
+    name: agent.name,
+    alias: agent.alias || agent.label || null,
+    public_key: keyPair.publicPem,
+    key_algorithm: 'Ed25519',
+    fingerprint: keyPair.fingerprint,
+    provider: getAMPProviderDomain(getOrganization() || undefined),
+    capabilities: ['messaging', 'read_receipts'],
+    signed_at: signedAt,
+  }
+
+  // The server holds only the agent's PUBLIC key (private keys never leave the
+  // agent — the core custody rule), so it cannot sign the card. Return it UNSIGNED
+  // and provider-asserted over the authenticated channel; a cryptographically
+  // signed card is generated client-side where the private key lives.
+  if (keyPair.privatePem && keyPair.privatePem.trim()) {
+    try {
+      const signable = `${address}|${keyPair.publicPem}|${signedAt}`
+      const privateKey = crypto.createPrivateKey(keyPair.privatePem)
+      card.signature = crypto.sign(null, Buffer.from(signable), privateKey).toString('base64')
+    } catch (err) {
+      console.warn('[AMP] Agent card returned unsigned (signing failed):', err)
+      card.signature = null
+    }
+  } else {
+    card.signature = null
+    card.provider_asserted = true   // authenticity relies on the authenticated channel, not a card signature
+  }
+
+  return { data: card, status: 200 }
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /api/v1/agents/me
+// ---------------------------------------------------------------------------
+
+export async function updateAgentSelf(
+  authHeader: string | null,
+  body: { alias?: string; delivery?: Record<string, unknown>; metadata?: Record<string, unknown> }
+): Promise<ServiceResult<any>> {
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  const agent = getAgent(auth.agentId!)
+  if (!agent) {
+    return {
+      data: { error: 'not_found', message: 'Agent not found' },
+      status: 404
+    }
+  }
+
+  // Update allowed fields
+  const updates: Record<string, unknown> = {}
+  if (body.alias !== undefined) {
+    updates.label = body.alias
+  }
+
+  // Merge delivery and metadata into agent's amp metadata
+  if (body.delivery !== undefined || body.metadata !== undefined) {
+    const existingAmpMeta = (agent.metadata?.amp || {}) as Record<string, unknown>
+    if (body.delivery !== undefined) {
+      existingAmpMeta.delivery = { ...(existingAmpMeta.delivery as Record<string, unknown> || {}), ...body.delivery }
+    }
+    updates.metadata = {
+      ...agent.metadata,
+      amp: existingAmpMeta,
+      ...(body.metadata || {})
+    }
+  }
+
+  if (Object.keys(updates).length > 0) {
+    updateAgent(auth.agentId!, updates as any)
+  }
+
+  return {
+    data: { updated: true, address: auth.address },
+    status: 200
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/v1/agents/me
+// ---------------------------------------------------------------------------
+
+export async function deleteAgentSelf(authHeader: string | null): Promise<ServiceResult<any>> {
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  // Revoke all API keys for this agent
+  revokeAllKeysForAgent(auth.agentId!)
+
+  // Hard delete with backup
+  const deleted = deleteAgent(auth.agentId!, true)
+  if (!deleted) {
+    return {
+      data: { error: 'not_found', message: 'Agent not found' },
+      status: 404
+    }
+  }
+
+  return {
+    data: {
+      deregistered: true,
+      address: auth.address,
+      deregistered_at: new Date().toISOString(),
+    },
+    status: 200
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/agents/resolve/:address
+// ---------------------------------------------------------------------------
+
+export function resolveAgentAddress(
+  authHeader: string | null,
+  address: string
+): ServiceResult<AMPAgentResolveResponse> {
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  const decodedAddress = decodeURIComponent(address)
+
+  // The address names the agent: any of the addresses it has, in any tenant.
+  // Falling back to the first name keeps older callers that pass a bare name working.
+  const organization = getOrganization() || undefined
+  const atIndex = decodedAddress.indexOf('@')
+  const agentName = atIndex >= 0 ? decodedAddress.substring(0, atIndex) : decodedAddress
+  const agent: any = (atIndex >= 0 ? findAgentByAddress(loadAgents() as any[], decodedAddress, organization) : undefined)
+    || getAgentByNameAnyHost(agentName)
+
+  if (!agent || agent.registrationStatus === 'pending') {
+    return {
+      data: { error: 'not_found', message: `Agent not found: ${decodedAddress}` },
+      status: 404
+    }
+  }
+
+  // The key held here belongs to the local identity only. For an address the agent
+  // has at another provider (its Crabmail address), the key is that provider's
+  // business: answering with the local key would present the wrong key for it.
+  const localAddress = ((agent.metadata?.amp?.address as string)
+    || (agent.name ? buildAMPAddress(agent.name, organization) : '')).toLowerCase()
+  // Mesh callers also spell the tenant as a host id (name@mini-lola.aimaestro.local):
+  // anything under our own provider domain is the local identity.
+  const isLocalIdentity = atIndex < 0 || !localAddress || decodedAddress.toLowerCase() === localAddress
+    || decodedAddress.toLowerCase().endsWith('.aimaestro.local')
+  const keyPair = isLocalIdentity ? loadKeyPair(agent.id) : null
+  const ampAddress = isLocalIdentity ? ((agent.metadata?.amp?.address as string) || decodedAddress) : decodedAddress
+  const registration = isLocalIdentity ? null
+    : loadAllRegistrations(agent.id).find(r => r.address?.toLowerCase() === decodedAddress.toLowerCase())
+
+  return {
+    data: {
+      address: ampAddress,
+      alias: agent.alias || agent.label,
+      public_key: keyPair?.publicPem || '',
+      key_algorithm: 'Ed25519',
+      fingerprint: keyPair?.fingerprint || registration?.fingerprint || (isLocalIdentity ? (agent.metadata?.amp?.fingerprint as string) : '') || '',
+      did: isLocalIdentity ? (deriveDidKey(keyPair?.publicHex) || (agent.metadata?.amp?.did as string) || null) : null,
+      online: agent.sessions?.some((s: any) => s.status === 'online') || false,
+    } as AMPAgentResolveResponse,
+    status: 200
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/v1/auth/revoke-key
+// ---------------------------------------------------------------------------
+
+export function revokeKey(authHeader: string | null): ServiceResult<any> {
+  const apiKey = extractApiKeyFromHeader(authHeader)
+
+  if (!apiKey) {
+    return {
+      data: { error: 'unauthorized', message: 'Missing or invalid Authorization header' },
+      status: 401
+    }
+  }
+
+  const revoked = revokeApiKey(apiKey)
+
+  if (!revoked) {
+    return {
+      data: { error: 'not_found', message: 'API key not found' },
+      status: 404
+    }
+  }
+
+  return {
+    data: { revoked: true, revoked_at: new Date().toISOString() },
+    status: 200
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/auth/rotate-key
+// ---------------------------------------------------------------------------
+
+export function rotateKey(authHeader: string | null): ServiceResult<AMPKeyRotationResponse> {
+  const apiKey = extractApiKeyFromHeader(authHeader)
+
+  if (!apiKey) {
+    return {
+      data: { error: 'unauthorized', message: 'Missing or invalid Authorization header' },
+      status: 401
+    }
+  }
+
+  const result = rotateApiKey(apiKey)
+
+  if (!result) {
+    return {
+      data: { error: 'unauthorized', message: 'Invalid or expired API key' },
+      status: 401
+    }
+  }
+
+  return {
+    data: result as AMPKeyRotationResponse,
+    status: 200
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/auth/rotate-keys
+// ---------------------------------------------------------------------------
+
+export async function rotateKeypair(body: AMPKeypairRotationRequest | null, authHeader: string | null): Promise<ServiceResult<any>> {
+  const auth = authenticateRequest(authHeader)
+
+  if (!auth.authenticated) {
+    return {
+      data: { error: auth.error || 'unauthorized', message: auth.message || 'Authentication required' },
+      status: 401
+    }
+  }
+
+  const agent = getAgent(auth.agentId!)
+  if (!agent) {
+    return {
+      data: { error: 'not_found', message: 'Agent not found' },
+      status: 404
+    }
+  }
+
+  let newKeyPair: { publicPem: string; privatePem: string; publicHex: string; fingerprint: string }
+
+  if (body && body.new_public_key && body.proof) {
+    // ── Proof-of-possession rotation ──────────────────────────────────────
+    if (body.key_algorithm && body.key_algorithm !== 'Ed25519') {
+      return {
+        data: { error: 'invalid_field', message: 'key_algorithm must be Ed25519', field: 'key_algorithm' },
+        status: 400
+      }
+    }
+
+    const newPublicKeyHex = extractPublicKeyHex(body.new_public_key)
+    if (!newPublicKeyHex) {
+      return {
+        data: { error: 'invalid_field', message: 'Invalid new_public_key format. Must be PEM-encoded Ed25519 public key.', field: 'new_public_key' },
+        status: 400
+      }
+    }
+
+    // Load old keypair to verify proof
+    const oldKeyPair = loadKeyPair(auth.agentId!)
+    if (!oldKeyPair) {
+      return {
+        data: { error: 'not_found', message: 'Existing keypair not found for agent' },
+        status: 404
+      }
+    }
+
+    // Verify proof: new_public_key_hex signed with old private key
+    const proofValid = verifySignature(newPublicKeyHex, body.proof, oldKeyPair.publicHex)
+    if (!proofValid) {
+      return {
+        data: { error: 'invalid_signature', message: 'Proof-of-possession verification failed. The proof must be the new public key hex signed with the old private key.' },
+        status: 401
+      }
+    }
+
+    const fingerprint = calculateFingerprint(newPublicKeyHex)
+    newKeyPair = {
+      publicPem: body.new_public_key,
+      privatePem: '',  // Agent holds its own private key — server does not store it
+      publicHex: newPublicKeyHex,
+      fingerprint,
+    }
+  } else if (body && (body.new_public_key || body.proof)) {
+    // Partial body — both fields required
+    const missing = !body.new_public_key ? 'new_public_key' : 'proof'
+    return {
+      data: { error: 'missing_field', message: `Both new_public_key and proof are required for proof-of-possession rotation`, field: missing },
+      status: 400
+    }
+  } else {
+    // ── Legacy: server-side key generation (backward compat) ──────────────
+    newKeyPair = await generateKeyPair()
+  }
+
+  saveKeyPair(auth.agentId!, newKeyPair)
+
+  // Update agent metadata with new fingerprint
+  const existingAmpMeta = (agent.metadata?.amp || {}) as Record<string, unknown>
+  const oldFp = (existingAmpMeta.fingerprint as string) || ''   // capture BEFORE overwrite (for revocation)
+  existingAmpMeta.fingerprint = newKeyPair.fingerprint
+  updateAgent(auth.agentId!, {
+    metadata: {
+      ...agent.metadata,
+      amp: existingAmpMeta,
+    }
+  } as any)
+
+  // Keep the Identity Conflict Detection ledger in sync so this AUTHORIZED
+  // rotation (the old key signed the new one — verified above) is not later
+  // flagged as a key-swap. Without this, conflict detection would refuse the
+  // rotated agent's next message (the footgun this closes).
+  const rotatedAddress = (auth.address as string) || (existingAmpMeta.address as string)
+  const rotNow = new Date().toISOString()
+  if (rotatedAddress) {
+    try { rotateKnownKey(rotatedAddress, newKeyPair.fingerprint, rotNow) } catch { /* best-effort */ }
+  }
+  // Revoke the superseded key (AMP 07-security §Key Revocation): the old fingerprint
+  // is added to the revocation list so messages signed with it are rejected.
+  if (oldFp && oldFp !== newKeyPair.fingerprint) {
+    try { revokeFingerprint(oldFp, rotatedAddress || '', 'key_rotation', newKeyPair.fingerprint, rotNow) } catch { /* best-effort */ }
+  }
+
+  return {
+    data: {
+      rotated: true,
+      address: auth.address,
+      fingerprint: newKeyPair.fingerprint,
+      public_key: newKeyPair.publicPem,
+      key_algorithm: 'Ed25519',
+    },
+    status: 200
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/federation/deliver
+// ---------------------------------------------------------------------------
+
+/** Every refusal (401/403) is recorded (B006). */
+export async function deliverFederated(
+  providerName: string | null,
+  body: { envelope: AMPEnvelope; payload: AMPPayload; sender_public_key?: string },
+  auth: { signature: string | null; timestamp: string | null; rawBody: string; fetchDoc?: FetchProviderDocument } = { signature: null, timestamp: null, rawBody: '' }
+): Promise<ServiceResult<any>> {
+  const result = await deliverFederatedUnrecorded(providerName, body, auth)
+  if (result.status === 401 || result.status === 403) {
+    const d = result.data as { error?: string; message?: string; details?: { fingerprint?: string } } | undefined
+    recordAmpRefusal({ endpoint: 'federation', status: result.status, reason: d?.error || 'unknown', message: d?.message, from: body?.envelope?.from, to: body?.envelope?.to, via: providerName || undefined, fingerprint: d?.details?.fingerprint })
+  }
+  return result
+}
+
+async function deliverFederatedUnrecorded(
+  providerName: string | null,
+  body: { envelope: AMPEnvelope; payload: AMPPayload; sender_public_key?: string },
+  auth: { signature: string | null; timestamp: string | null; rawBody: string; fetchDoc?: FetchProviderDocument } = { signature: null, timestamp: null, rawBody: '' }
+): Promise<ServiceResult<any>> {
+  try {
+    // ── Provider Identity ───────────────────────────────────────────────
+    if (!providerName) {
+      return {
+        data: { error: 'missing_header', message: 'X-AMP-Provider header is required' },
+        status: 400
+      }
+    }
+
+    // ── Rate Limiting (per-provider) ─────────────────────────────────────
+    const rateLimit = checkFederationRateLimit(providerName)
+    if (!rateLimit.allowed) {
+      return {
+        data: { error: 'rate_limited', message: 'Federation rate limit exceeded' },
+        status: 429,
+        headers: { 'Retry-After': '60' }
+      }
+    }
+
+    // ── Provider Authentication (06-federation) ─────────────────────────
+    // The forwarding provider must prove who it is. A header name alone proves
+    // nothing, and this endpoint is the one outsiders will reach.
+    const providerAuth = await verifyProviderRequest({
+      provider: providerName,
+      timestamp: auth.timestamp,
+      signature: auth.signature,
+      rawBody: auth.rawBody,
+      fetchDoc: auth.fetchDoc,
+    })
+    if (!providerAuth.ok) {
+      console.warn(`[Federation] REJECTED provider ${providerName}: ${providerAuth.message}`)
+      return { data: { error: providerAuth.error, message: providerAuth.message }, status: providerAuth.status }
+    }
+
+    // ── Body Validation ────────────────────────────────────────────────
+    const { envelope, payload, sender_public_key } = body
+
+    if (!envelope || !payload) {
+      return {
+        data: { error: 'invalid_request', message: 'envelope and payload are required' },
+        status: 400
+      }
+    }
+
+    // The id becomes a file name in the recipient's inbox: plain tokens only (B010).
+    if (!isSafeMessageId(envelope.id)) {
+      return {
+        data: { error: 'invalid_field', message: 'envelope.id must be 1-128 characters: letters, digits, underscore, hyphen', field: 'envelope.id' },
+        status: 400
+      }
+    }
+    if (typeof envelope.to !== 'string' || typeof envelope.from !== 'string') {
+      return {
+        data: { error: 'invalid_field', message: 'envelope.from and envelope.to must be strings', field: 'envelope' },
+        status: 400
+      }
+    }
+
+    // ── Replay Protection (AMP 07-security): dedup by id + timestamp freshness ──
+    const replay = checkReplay(envelope.id, envelope.timestamp, { nowMs: Date.now() })
+    if (!replay.ok) {
+      return {
+        data: { error: replay.reason!, message: `Replay rejected: ${replay.reason}` },
+        status: replay.reason === 'duplicate_message' ? 409 : 400
+      }
+    }
+
+    // ── Sender Verification (07-security) ───────────────────────────────
+    // Mail from outside is always strict: the sender must belong to the
+    // provider that forwarded it, and must have signed with the key the
+    // provider vouches for. An unsigned or badly signed message is refused,
+    // never delivered with a flag.
+    if (!senderBelongsToProvider(envelope.from, providerName)) {
+      console.warn(`[Federation] REJECTED — ${envelope.from} does not belong to provider ${providerName}`)
+      return {
+        data: { error: 'provider_mismatch', message: 'The sender address does not belong to the forwarding provider', details: { from: envelope.from, provider: providerName } },
+        status: 403
+      }
+    }
+    const fwdKeyHex = typeof sender_public_key === 'string' ? publicHexFromPem(sender_public_key) : null
+    if (!envelope.signature || !fwdKeyHex) {
+      return {
+        data: { error: 'invalid_signature', message: 'A signed message and the sender public key are required', details: { from: envelope.from } },
+        status: 403
+      }
+    }
+    const fwdFp = calculateFingerprint(fwdKeyHex)
+    if (isRevoked(fwdFp)) {
+      return { data: { error: 'key_revoked', message: 'Message signed with a revoked key', details: { fingerprint: fwdFp } }, status: 403 }
+    }
+    const fwdConflict = checkKnownKey(envelope.from, fwdFp)
+    if (fwdConflict.status === 'conflict') {
+      return {
+        data: {
+          error: 'key_conflict',
+          message: `Sender ${envelope.from} public key changed from its known fingerprint`,
+          details: { address: envelope.from, knownFingerprint: fwdConflict.knownFingerprint, presentedFingerprint: fwdFp }
+        },
+        status: 409
+      }
+    }
+    const fwdFields = {
+      from: envelope.from,
+      to: envelope.to,
+      subject: envelope.subject,
+      priority: envelope.priority || 'normal',
+      in_reply_to: envelope.in_reply_to || '',
+      payload,
+    }
+    const fwdCheck = checkSignature(fwdFields, envelope.signature, fwdKeyHex)
+    if (fwdCheck !== 'verified') {
+      console.warn(`[Federation] REJECTED — invalid signature from ${envelope.from}`)
+      return {
+        data: { error: 'invalid_signature', message: 'Message signature failed verification', details: { from: envelope.from } },
+        status: 403
+      }
+    }
+    recordKnownKey(envelope.from, fwdFp, new Date().toISOString())
+    const signatureVerified = true
+    const verification: VerificationRecord = buildVerification({
+      check: fwdCheck,
+      sameTenant: tenantOf(envelope.from) === tenantOf(envelope.to),
+      method: 'federation',
+      fields: fwdFields,
+      publicHex: fwdKeyHex,
+    })
+
+    // Who it is from, for clients: a saved contact, or an outsider they can offer to add or block.
+    // One of our own agents at its Crabmail address is neither.
+    const contact = findContactByAddress(envelope.from)
+    if (contact) Object.assign(verification, { sender_kind: 'contact', contact_id: contact.id })
+    else if (!findAgentByAddress(loadAgents() as any[], envelope.from, getOrganization() || undefined)) verification.sender_kind = 'unknown_outside'
+
+    // ── Recipient Resolution ────────────────────────────────────────────
+    const recipientName = envelope.to.split('@')[0]
+    const resolved = resolveAgentIdentifier(recipientName)
+    const localAgent = resolved?.agentId ? getAgent(resolved.agentId) : null
+
+    // The agent must actually have the address the mail is for. Matching the first
+    // name alone would deliver mail for sebastian@othertenant to our sebastian.
+    if (localAgent && (localAgent.registrationStatus === 'pending' || !agentHasAddress(localAgent, envelope.to, getOrganization() || undefined))) {
+      console.warn(`[Federation] REJECTED — ${localAgent.name || recipientName} has no address ${envelope.to}`)
+      return {
+        data: { error: 'not_found', message: `No agent here has the address '${envelope.to}'` },
+        status: 404
+      }
+    }
+
+    if (!localAgent) {
+      if (resolved?.agentId) {
+        queueMessage(resolved.agentId, envelope, payload, sender_public_key || '')
+        return {
+          data: {
+            id: envelope.id,
+            status: 'queued',
+            method: 'relay',
+            queued_at: new Date().toISOString(),
+          },
+          status: 200
+        }
+      }
+      return {
+        data: { error: 'not_found', message: `Recipient '${recipientName}' not found on any host` },
+        status: 404
+      }
+    }
+
+    // ── Local Delivery ──────────────────────────────────────────────────
+    const localResult = await deliver({
+      envelope,
+      payload,
+      recipientAgentName: localAgent.name || recipientName,
+      senderPublicKeyHex: signatureVerified ? fwdKeyHex : undefined,
+      verification,
+      senderName: envelope.from.split('@')[0],
+      senderHost: providerName,
+      recipientAgentId: localAgent.id,
+      subject: envelope.subject,
+      priority: envelope.priority,
+      messageType: payload.type,
+    })
+
+    // A failed inbox write is not a delivery. Reporting 200 'delivered' here is
+    // how a message to a recipient with no identity directory produced a
+    // success line and an id while going nowhere.
+    if (!localResult.delivered) {
+      console.error(
+        `[AMP] Local delivery FAILED for ${localAgent.name || recipientName}: ${localResult.error || 'unknown'}`
+      )
+      return {
+        data: {
+          error: 'delivery_failed',
+          message: `Could not deliver to '${recipientName}': ${localResult.error || 'inbox write failed'}`,
+        },
+        status: 502,
+      }
+    }
+
+    return {
+      data: {
+        id: envelope.id,
+        status: 'delivered',
+        method: 'local',
+        delivered_at: new Date().toISOString(),
+        verified: localResult.verified ?? false,
+      },
+      status: 200
+    }
+
+  } catch (error) {
+    console.error('[Federation] Error:', error)
+    return {
+      data: { error: 'internal_error', message: error instanceof Error ? error.message : 'Internal server error' },
+      status: 500
+    }
+  }
+}

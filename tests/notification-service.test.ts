@@ -1,0 +1,472 @@
+/**
+ * Tests for lib/notification-service.ts — pane readback verification.
+ *
+ * send-keys returning without throwing only proves bytes reached tmux, not
+ * that the agent's TUI accepted them. notifyAgent() therefore reads the pane
+ * back and looks for a per-message ref. This is the runtime-agnostic twin of
+ * the channel's amp_channel_ack: it needs no cooperation from whatever agent
+ * occupies the pane, so it covers Claude Code, Codex, Gemini CLI, Aider, or a
+ * bare shell equally.
+ *
+ * The contract these lock down:
+ *   verified: true   — read back off the pane (proof)
+ *   verified: false + notified: true  — sent, runtime can't be captured
+ *   notified: false  — pane readable and the message never appeared
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+
+const mockRuntime = {
+  sendKeys: vi.fn().mockResolvedValue(undefined),
+  capturePane: vi.fn().mockResolvedValue(''),
+  capturePaneRaw: vi.fn().mockResolvedValue(''),
+  repeatKey: vi.fn().mockResolvedValue(undefined),
+  sessionExists: vi.fn().mockResolvedValue(true),
+  describePane: vi.fn().mockResolvedValue({}),
+}
+
+vi.mock('@/lib/agent-runtime', () => ({
+  getRuntime: vi.fn(() => mockRuntime),
+}))
+
+const AGENT = {
+  id: 'agent-uuid-1',
+  name: 'receiver',
+  sessions: [{ index: 0, status: 'online' }],
+}
+
+vi.mock('@/lib/agent-registry', () => ({
+  getAgent: vi.fn(() => AGENT),
+  getAgentByName: vi.fn(() => AGENT),
+}))
+
+vi.mock('@/lib/hosts-config-server.mjs', () => ({
+  getSelfHostId: vi.fn(() => 'local'),
+  isSelf: vi.fn(() => true),
+}))
+
+vi.mock('@/types/agent', () => ({
+  computeSessionName: vi.fn((name: string) => name),
+}))
+
+const mockIdle = vi.hoisted(() => ({ hasHookReport: vi.fn(() => false) }))
+vi.mock('@/lib/session-idle', () => mockIdle)
+
+import { notifyAgent, messageRef, toSingleLine, __resetDeliveryGuard } from '@/lib/notification-service'
+
+const BASE = {
+  agentId: 'agent-uuid-1',
+  agentName: 'receiver',
+  fromName: 'sender',
+  fromHost: 'local',
+  subject: 'deploy failed',
+  messageId: 'abc12345-dead-beef-0000-111122223333',
+}
+
+/** What the pane would show once the notification rendered. */
+function paneWith(messageId: string) {
+  return `$ echo '...'\n[#${messageRef(messageId)}] [MESSAGE] From: sender - deploy failed\n$ `
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  __resetDeliveryGuard()
+  mockRuntime.sendKeys.mockResolvedValue(undefined)
+  mockRuntime.repeatKey.mockClear()
+  mockRuntime.repeatKey.mockResolvedValue(undefined)
+  mockRuntime.sessionExists.mockResolvedValue(true)
+  mockIdle.hasHookReport.mockReturnValue(false)
+  mockRuntime.describePane.mockReset()
+  mockRuntime.describePane.mockResolvedValue({})
+})
+
+describe('messageRef', () => {
+  it('derives the token from the TAIL of the id, where the entropy is', () => {
+    // Ids are `msg-<timestamp>-<random>`; slicing the head gave every message
+    // in a ~27h window the same ref, which both broke readback confirmation
+    // and made every notification look like the same message repeating.
+    expect(messageRef('msg-1787802846153-bk2096t')).toBe('3bk2096t')
+  })
+
+  it('is DISTINCT for messages sent moments apart', () => {
+    const a = messageRef('msg_1787805728539_j782cvq')
+    const b = messageRef('msg_1787805890480_pi3wqxz')
+    expect(a).not.toBe(b)
+  })
+
+  it('is stable for the same id', () => {
+    expect(messageRef(BASE.messageId)).toBe(messageRef(BASE.messageId))
+  })
+
+  it('never returns empty, even for a missing id', () => {
+    expect(messageRef('')).toBe('nomsgid')
+    expect(messageRef('---')).toBe('nomsgid')
+  })
+})
+
+describe('toSingleLine', () => {
+  it('collapses newlines so send-keys cannot submit early', () => {
+    expect(toSingleLine('line one\nline two\n\nline three', 100)).toBe('line one line two line three')
+  })
+
+  it('truncates with an ellipsis past the limit', () => {
+    const out = toSingleLine('x'.repeat(50), 10)
+    expect(out).toHaveLength(10)
+    expect(out.endsWith('…')).toBe(true)
+  })
+})
+
+describe('notifyAgent — pane readback', () => {
+  it('reports verified when the ref is read back off the pane', async () => {
+    mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+
+    const res = await notifyAgent(BASE)
+
+    expect(res).toMatchObject({ success: true, notified: true, verified: true })
+    // One send only — no wasteful resend once it is confirmed.
+    expect(mockRuntime.sendKeys).toHaveBeenCalledTimes(2) // text + Enter
+  })
+
+  it('matches the ref even when the pane hard-wraps it mid-token', async () => {
+    const ref = messageRef(BASE.messageId)
+    // tmux wrapped the line in the middle of the ref.
+    mockRuntime.capturePane.mockResolvedValue(`[#${ref.slice(0, 4)}\n${ref.slice(4)}] [MESSAGE] From: sender`)
+
+    const res = await notifyAgent(BASE)
+
+    expect(res.verified).toBe(true)
+  })
+
+  it('reports notified-but-unverified when the runtime cannot be captured', async () => {
+    mockRuntime.capturePane.mockResolvedValue('')
+
+    const res = await notifyAgent(BASE)
+
+    expect(res).toMatchObject({ success: true, notified: true, verified: false })
+    expect(res.reason).toMatch(/cannot verify/i)
+    // No resend: the check can never succeed here, so retrying would only
+    // double-deliver.
+    expect(mockRuntime.sendKeys).toHaveBeenCalledTimes(2)
+  })
+
+  it('resends, then reports NOT notified when the pane never shows the message', async () => {
+    // Pane is readable but our message never lands (TUI dropped the input).
+    mockRuntime.capturePane.mockResolvedValue('$ some unrelated pane content\n$ ')
+
+    const res = await notifyAgent(BASE)
+
+    expect(res).toMatchObject({ success: true, notified: false, verified: false })
+    expect(res.reason).toMatch(/not seen/i)
+    // Initial send + one resend, each text + Enter.
+    expect(mockRuntime.sendKeys).toHaveBeenCalledTimes(4)
+  })
+
+  it('does not mistake a DIFFERENT message on the pane for this one', async () => {
+    mockRuntime.capturePane.mockResolvedValue(paneWith('99999999-other-message'))
+
+    const res = await notifyAgent(BASE)
+
+    expect(res.notified).toBe(false)
+  })
+
+  it('recovers when the message renders late, without resending', async () => {
+    mockRuntime.capturePane
+      .mockResolvedValueOnce('$ ')
+      .mockResolvedValueOnce('$ ')
+      .mockResolvedValue(paneWith(BASE.messageId))
+
+    const res = await notifyAgent(BASE)
+
+    expect(res.verified).toBe(true)
+    expect(mockRuntime.sendKeys).toHaveBeenCalledTimes(2)
+  })
+
+  it('carries the message body into the pane, single-lined', async () => {
+    mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+
+    await notifyAgent({ ...BASE, body: 'the build broke\non step 3' })
+
+    const sent = mockRuntime.sendKeys.mock.calls[0][1] as string
+    expect(sent).toContain('the build broke on step 3')
+    expect(sent).not.toContain('\n')
+  })
+
+  it('includes the ref so the agent can tie the nudge to the inbox entry', async () => {
+    mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+
+    await notifyAgent(BASE)
+
+    const sent = mockRuntime.sendKeys.mock.calls[0][1] as string
+    expect(sent).toContain(`[#${messageRef(BASE.messageId)}]`)
+  })
+
+  it('sends PLAIN text when an agent TUI is live in the pane', async () => {
+    mockIdle.hasHookReport.mockReturnValue(true)
+    mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+
+    await notifyAgent(BASE)
+
+    const sent = mockRuntime.sendKeys.mock.calls[0][1] as string
+    expect(sent.startsWith('echo ')).toBe(false)
+    expect(sent).toContain('[MESSAGE]')
+  })
+
+  it('wraps in echo for a bare shell so the text is not EXECUTED', async () => {
+    mockIdle.hasHookReport.mockReturnValue(false)
+    mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+
+    await notifyAgent(BASE)
+
+    const sent = mockRuntime.sendKeys.mock.calls[0][1] as string
+    expect(sent.startsWith("echo '")).toBe(true)
+  })
+
+  describe('no hook report (a server restart empties them): the pane decides', () => {
+    // mini-lola, 2026-10-02: the first pushes after each deploy arrived as
+    // `echo '[#ref] [MESSAGE] ...'` typed into an agent's prompt, because the
+    // in-memory hook report was gone. The pane already said it was not a shell.
+    async function sentFor(paneInfo: Record<string, string> | Error) {
+      mockIdle.hasHookReport.mockReturnValue(false)
+      if (paneInfo instanceof Error) mockRuntime.describePane.mockRejectedValue(paneInfo)
+      else mockRuntime.describePane.mockResolvedValue(paneInfo)
+      mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+      await notifyAgent(BASE)
+      return mockRuntime.sendKeys.mock.calls[0][1] as string
+    }
+
+    it.each(['claude', '2.1.287', 'node', 'codex'])('sends PLAIN text when the pane runs %s', async command => {
+      const sent = await sentFor({ command })
+      expect(sent.startsWith('echo ')).toBe(false)
+      expect(sent).toContain('[MESSAGE]')
+    })
+
+    it.each(['bash', 'zsh', '-zsh', 'sh', 'fish', 'login'])('keeps the echo wrapper when the pane is at %s', async command => {
+      expect((await sentFor({ command })).startsWith("echo '")).toBe(true)
+    })
+
+    it('keeps the wrapper when the pane cannot say what runs in it', async () => {
+      expect((await sentFor({})).startsWith("echo '")).toBe(true)
+      expect((await sentFor({ command: '' })).startsWith("echo '")).toBe(true)
+    })
+
+    it('keeps the wrapper when tmux fails — absence of evidence is not evidence', async () => {
+      expect((await sentFor(new Error('no server running'))).startsWith("echo '")).toBe(true)
+    })
+
+    it('probes the first pane, the same target the notice is typed into', async () => {
+      await sentFor({ command: 'claude' })
+      expect(mockRuntime.describePane).toHaveBeenCalledWith('receiver:0.0')
+    })
+
+    it('does not probe at all while a hook report is fresh', async () => {
+      mockIdle.hasHookReport.mockReturnValue(true)
+      mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+      await notifyAgent(BASE)
+      expect(mockRuntime.describePane).not.toHaveBeenCalled()
+      expect((mockRuntime.sendKeys.mock.calls[0][1] as string).startsWith('echo ')).toBe(false)
+    })
+
+    it('stays safe when the runtime cannot introspect panes at all', async () => {
+      const original = mockRuntime.describePane
+      ;(mockRuntime as { describePane?: unknown }).describePane = undefined
+      try {
+        mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+        await notifyAgent(BASE)
+        expect((mockRuntime.sendKeys.mock.calls[0][1] as string).startsWith("echo '")).toBe(true)
+      } finally {
+        mockRuntime.describePane = original
+      }
+    })
+  })
+
+  describe('the sender shown is the one the envelope signs', () => {
+    // pas-lola, 2026-10-02: banner said ai-maestro@juans-macbook-pro, envelope
+    // said ai-maestro@rnd23blocks.aimaestro.local.
+    async function bannerFor(extra: Record<string, unknown>) {
+      mockIdle.hasHookReport.mockReturnValue(true)
+      mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+      await notifyAgent({ ...BASE, fromName: 'ai-maestro', fromHost: 'juans-macbook-pro', ...extra } as any)
+      return mockRuntime.sendKeys.mock.calls[0][1] as string
+    }
+
+    it('shows the signed address, not name@host-id', async () => {
+      const sent = await bannerFor({ fromAddress: 'ai-maestro@rnd23blocks.aimaestro.local' })
+      expect(sent).toContain('from ai-maestro@rnd23blocks.aimaestro.local')
+      expect(sent).not.toContain('juans-macbook-pro')
+    })
+
+    it('falls back to name@host when the envelope gave no address', async () => {
+      const sent = await bannerFor({})
+      expect(sent).toContain('from ai-maestro@juans-macbook-pro')
+    })
+  })
+
+  it('leads with the subject so stacked notifications are distinguishable', async () => {
+    mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+
+    await notifyAgent(BASE)
+
+    const sent = mockRuntime.sendKeys.mock.calls[0][1] as string
+    expect(sent.indexOf('deploy failed')).toBeLessThan(sent.indexOf('sender'))
+  })
+
+  it('skips cleanly when the session is gone', async () => {
+    mockRuntime.sessionExists.mockResolvedValue(false)
+
+    const res = await notifyAgent(BASE)
+
+    expect(res).toMatchObject({ notified: false, reason: 'Session not active' })
+    expect(mockRuntime.sendKeys).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * Staged text — the state that had eight of nine agents on one host deaf while
+ * every indicator read green.
+ *
+ * `capture-pane` shows the input box, so the old readback (needle anywhere on
+ * the pane) was satisfied by text that had been typed and never submitted. The
+ * pane adapter returned `confirmed`, which additionally suppressed the retry
+ * that would have rescued it.
+ */
+describe('notifyAgent — text staged in the input box', () => {
+  /** The ref is sitting in the input box, never accepted. */
+  function stagedPane(messageId: string) {
+    return `  earlier output\n╭────────╮\n│ > [#${messageRef(messageId)}] [MESSAGE] From: sender - deploy failed\n╰────────╯`
+  }
+
+  it('does NOT report verified when the message is only staged', async () => {
+    mockRuntime.capturePane.mockResolvedValue(stagedPane(BASE.messageId))
+    const res = await notifyAgent(BASE)
+    expect(res.verified).toBeFalsy()
+    expect(res.notified).toBe(false)
+  })
+
+  it('names the failure precisely, so the log points the right way', async () => {
+    // "Not seen in pane" would send whoever reads it looking for the opposite
+    // problem. The message IS on the pane — that is the point.
+    mockRuntime.capturePane.mockResolvedValue(stagedPane(BASE.messageId))
+    const res = await notifyAgent(BASE)
+    expect(res.reason).toMatch(/staged/i)
+  })
+
+  it('clears the input box before retyping, rather than sending Enter again', async () => {
+    // Measured in the field: Enter once fails, Enter twice fails,
+    // clear-and-retype then Enter succeeds 7 of 7. Typing on top of staged text
+    // just produces a doubled line.
+    //
+    // The clear is BACKSPACES, not C-u. C-u was used here for months and is a
+    // no-op in Claude Code's input — verified by hand on a live agent 15 Sep
+    // 2026, where a staged line survived two C-u and an Escape and only
+    // backspace removed characters. A clear that does not clear makes the retry
+    // WORSE than no retry: it appends to what is already staged.
+    mockRuntime.capturePane.mockResolvedValue(stagedPane(BASE.messageId))
+    await notifyAgent(BASE)
+
+    expect(mockRuntime.repeatKey).toHaveBeenCalled()
+    const [, key, times] = mockRuntime.repeatKey.mock.calls[0]
+    expect(key).toBe('BSpace')
+    expect(times).toBeGreaterThan(0)
+
+    // never again by a key that does nothing
+    const keys = mockRuntime.sendKeys.mock.calls.map((c: any[]) => c[1])
+    expect(keys).not.toContain('C-u')
+  })
+
+  it('clears at least as many characters as it typed', async () => {
+    // Too few backspaces leaves a fragment, and the retype lands on top of it.
+    mockRuntime.capturePane.mockResolvedValue(stagedPane(BASE.messageId))
+    await notifyAgent(BASE)
+    const typed = mockRuntime.sendKeys.mock.calls.map((c: any[]) => c[1])
+      .find((k: string) => k.includes('[MESSAGE]')) as string
+    const [, , times] = mockRuntime.repeatKey.mock.calls[0]
+    expect(times).toBeGreaterThanOrEqual(typed.length)
+  })
+
+  it('B015: with a person\'s text already in the box, deletes only what it typed', async () => {
+    let typed = ''
+    mockRuntime.sendKeys.mockImplementation(async (_t: string, k: string) => {
+      if (k.includes('[MESSAGE]')) typed = k
+    })
+    mockRuntime.capturePane.mockImplementation(async () =>
+      `Previous output.\n\n╭────────────────╮\n│ > half a sentence I was typing ${typed}\n╰────────────────╯\n`)
+    await notifyAgent(BASE)
+    const [, , times] = mockRuntime.repeatKey.mock.calls[0]
+    expect(times).toBe([...typed].length)
+  })
+
+  it('does not clear on the FIRST attempt — nothing is staged yet', async () => {
+    mockRuntime.capturePane.mockResolvedValue(paneWith(BASE.messageId))
+    await notifyAgent(BASE)
+    expect(mockRuntime.sendKeys.mock.calls.map((c: any[]) => c[1])).not.toContain('C-u')
+  })
+
+  it('still reports verified when a resend is accepted after staging', async () => {
+    // First attempt stages; the clear-and-retype gets through.
+    mockRuntime.capturePane
+      .mockResolvedValueOnce(stagedPane(BASE.messageId))
+      .mockResolvedValue(paneWith(BASE.messageId))
+    const res = await notifyAgent(BASE)
+    expect(res.verified).toBe(true)
+  })
+})
+
+describe('duplicate-delivery guard — the "hook fired twice" bug', () => {
+  // Measured on a customer host: 20 duplicate submissions, same session,
+  // identical prompt, ~1.2s apart. Two triggers (a routing-time push and a
+  // near-coincident poll/wake) each called notifyAgent for the SAME message, so
+  // it was typed into the pane and submitted twice. notifyAgent had nothing
+  // keyed to the message to notice.
+  const pane = paneWith(BASE.messageId)
+
+  beforeEach(() => {
+    mockRuntime.capturePane.mockResolvedValue(pane)
+    mockRuntime.capturePaneRaw.mockResolvedValue(pane)
+  })
+
+  it('delivers the first call', async () => {
+    const r = await notifyAgent({ ...BASE })
+    expect(r.notified).toBe(true)
+    expect(mockRuntime.sendKeys).toHaveBeenCalled()
+  })
+
+  it('SUPPRESSES a second call for the same message moments later', async () => {
+    await notifyAgent({ ...BASE })
+    mockRuntime.sendKeys.mockClear()
+    const r = await notifyAgent({ ...BASE })
+    expect(r.notified).toBe(false)
+    expect(r.reason).toMatch(/duplicate/i)
+    // The decisive assertion: nothing was typed into the pane the second time.
+    expect(mockRuntime.sendKeys).not.toHaveBeenCalled()
+  })
+
+  it('does NOT suppress a DIFFERENT message to the same agent', async () => {
+    await notifyAgent({ ...BASE })
+    mockRuntime.sendKeys.mockClear()
+    const other = 'zzz99999-dead-beef-0000-444455556666'
+    mockRuntime.capturePane.mockResolvedValue(paneWith(other))
+    mockRuntime.capturePaneRaw.mockResolvedValue(paneWith(other))
+    const r = await notifyAgent({ ...BASE, messageId: other })
+    expect(r.notified).toBe(true)
+    expect(mockRuntime.sendKeys).toHaveBeenCalled()
+  })
+
+  it('does NOT suppress the SAME message id to a DIFFERENT agent', async () => {
+    // The key is (agent, message): a broadcast of one message to several agents
+    // must reach each of them.
+    await notifyAgent({ ...BASE })
+    mockRuntime.sendKeys.mockClear()
+    const r = await notifyAgent({ ...BASE, agentId: 'agent-uuid-2', agentName: 'other' })
+    expect(r.notified).toBe(true)
+    expect(mockRuntime.sendKeys).toHaveBeenCalled()
+  })
+
+  it('records BEFORE sending, so two racing triggers cannot both pass the check', async () => {
+    // Fire both without awaiting the first — the guard must let exactly one land.
+    const [a, b] = await Promise.all([notifyAgent({ ...BASE }), notifyAgent({ ...BASE })])
+    const delivered = [a, b].filter((r) => r.notified).length
+    const suppressed = [a, b].filter((r) => r.reason?.match(/duplicate/i)).length
+    expect(delivered).toBe(1)
+    expect(suppressed).toBe(1)
+  })
+})

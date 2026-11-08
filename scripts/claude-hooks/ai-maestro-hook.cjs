@@ -1,0 +1,1454 @@
+#!/usr/bin/env node
+/**
+ * AI Maestro Agent Hook
+ *
+ * Universal hook for AI coding agents (Claude Code, Codex CLI, Gemini CLI).
+ * Captures agent events, writes state for the Chat interface, and injects
+ * AMP inbox notifications via each agent's native context injection.
+ *
+ * Supported agents and their event mappings:
+ *   Claude Code: Stop, Notification(idle_prompt), SessionStart
+ *   Codex CLI:   Stop, SessionStart
+ *   Gemini CLI:  AfterAgent, Notification, SessionStart
+ *
+ * State is written to: ~/.aimaestro/chat-state/<cwd-hash>.json
+ */
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const os = require('os');
+
+// Where AI Maestro listens. AIM_SERVER_URL moves it (a server on another port, a test instance);
+// the default is the usual local port.
+const aimBase = () => (process.env.AIM_SERVER_URL || 'http://localhost:23000').replace(/\/+$/, '');
+
+// Claude Code's native session id for this invocation (from the hook payload).
+// Single-shot process, so a module-level value set once in main() is sufficient.
+let currentSessionId = null;
+
+// Read stdin as JSON
+async function readStdin() {
+    return new Promise((resolve, reject) => {
+        let data = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', chunk => { data += chunk; });
+        process.stdin.on('end', () => {
+            try {
+                resolve(data ? JSON.parse(data) : {});
+            } catch (e) {
+                resolve({ raw: data });
+            }
+        });
+        process.stdin.on('error', reject);
+
+        // Timeout after 5 seconds
+        setTimeout(() => resolve({ timeout: true }), 5000);
+    });
+}
+
+// Hash the working directory to create a unique state file
+function hashCwd(cwd) {
+    return crypto.createHash('md5').update(cwd || '').digest('hex').substring(0, 16);
+}
+
+// ── Hook time budget ─────────────────────────────────────────────────────────
+// Claude Code kills a hook after 5s and DISCARDS its output ("UserPromptSubmit
+// hook timed out after 5s"). The injection path fetches the local API on every
+// user turn, and those fetches were unbounded — a slow or busy server (a build,
+// a restart, load) hung the hook past 5s and the message injection was thrown
+// away. Measured on a customer host.
+//
+// A discarded injection is only a DELAY — the Stop path and the 5-minute poll
+// both re-deliver — so it is always better to return early than to hang. Every
+// injection fetch now has a per-request timeout, and the whole injection step
+// has an overall deadline well under 5s.
+const HOOK_FETCH_TIMEOUT_MS = 1500;
+const INJECT_DEADLINE_MS = 3500;
+function withDeadline(promise, ms, fallback) {
+    return Promise.race([
+        promise,
+        new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
+    ]);
+}
+
+// The agent list, loaded at most once per hook run: the inbox check and
+// memory recall both need it and run in parallel.
+//
+// Read from the registry file first. The hook runs on the same host as its
+// agent, and GET /api/agents took 2.1-2.6 s under load (2026-09-23) against the
+// 1.5 s per-fetch budget: every inbox check and every memory recall timed out,
+// so no agent was told about messages or shown a memory. The HTTP call is kept
+// only as the fallback for hosts without a local registry (cloud containers).
+// Resolves null on a non-OK response; rejects on a network error so callers
+// keep their own fallbacks.
+function readLocalRegistry() {
+    try {
+        const file = path.join(os.homedir(), '.aimaestro', 'agents', 'registry.json');
+        const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+        const list = Array.isArray(data) ? data : (data && Array.isArray(data.agents) ? data.agents : null);
+        if (!list) return null;
+        return list
+            .filter(a => a && a.id && a.status !== 'deleted' && !a.deletedAt)
+            .map(a => ({
+                id: a.id,
+                name: a.name,
+                alias: a.alias,
+                workingDirectory: a.workingDirectory,
+                session: { workingDirectory: a.sessions && a.sessions[0] && a.sessions[0].workingDirectory },
+            }));
+    } catch (e) {
+        return null;
+    }
+}
+
+let agentsPromise = null;
+function fetchAgentsOnce() {
+    if (!agentsPromise) {
+        const local = readLocalRegistry();
+        agentsPromise = local
+            ? Promise.resolve(local)
+            : fetch(`${aimBase()}/api/agents`, { signal: AbortSignal.timeout(HOOK_FETCH_TIMEOUT_MS) })
+                .then(res => (res.ok ? res.json().then(d => d.agents || []) : null));
+    }
+    return agentsPromise;
+}
+
+// Resolve the agent for this hook invocation.
+// Priority: AIM_AGENT_ID env (exact) > AIM_AGENT_NAME / CLAUDE_AGENT_NAME env
+// (exact) > cwd exact match.
+function resolveAgent(cwd, agents) {
+    const envId = process.env.AIM_AGENT_ID;
+    if (envId) {
+        const byId = agents.find(a => a.id === envId);
+        if (byId) {
+            debugLog({ event: 'resolved_agent_from_env', source: 'id', value: envId });
+            return byId;
+        }
+    }
+    // AIM_AGENT_NAME is what AI Maestro's launcher sets. CLAUDE_AGENT_NAME is
+    // what the AMP tooling reads and what the documented detached-session hint
+    // in .claude/settings.local.json actually writes — so accept both.
+    //
+    // Two names for one concept is how a detached session ends up with no
+    // identity at all: the hint file said CLAUDE_AGENT_NAME=ai-maestro, this
+    // function only looked for AIM_AGENT_NAME, fell through to the cwd match,
+    // found three agents sharing that directory, and correctly refused to
+    // guess. The result was an agent that received messages and was never once
+    // told about them, because the ONE delivery route that does not need a tmux
+    // pane could not work out who it was talking to.
+    const envName = process.env.AIM_AGENT_NAME || process.env.CLAUDE_AGENT_NAME;
+    if (envName) {
+        const byName = agents.find(a => a.name === envName);
+        if (byName) {
+            debugLog({ event: 'resolved_agent_from_env', source: 'name', value: envName });
+            return byName;
+        }
+    }
+    // cwd match — but ONLY when it uniquely identifies one agent. Many agents can
+    // share a working directory (a dev dir, /private/tmp, or $HOME), so returning the
+    // FIRST match silently misattributes a session to the wrong agent — e.g. every
+    // detached session started from $HOME becoming "piano-instructor", or a session
+    // in the dev dir picking a random one of the agents that live there. When the cwd
+    // is ambiguous we refuse to guess and return null: the session shows no identity
+    // rather than a wrong one. To identify such a session, launch it with AIM_AGENT_ID
+    // or AIM_AGENT_NAME (AI Maestro's launcher sets these; manual sessions don't).
+    const cwdMatches = agentsForCwd(cwd, agents);
+    if (cwdMatches.length === 1) return cwdMatches[0];
+    if (cwdMatches.length > 1) {
+        debugLog({ event: 'ambiguous_cwd_no_guess', cwd, count: cwdMatches.length });
+    }
+    return null;
+}
+
+// The agents whose folder is exactly cwd. Not a subfolder: a plain session in repo/docs would then send
+// the agent's heartbeat, replace its claudeSessionId and get its messages (#758 review).
+function agentsForCwd(cwd, agents) {
+    if (!cwd) return [];
+    const here = path.resolve(cwd);
+    return agents.filter(a => {
+        const wd = a.workingDirectory || a.session?.workingDirectory || a.sessions?.[0]?.workingDirectory;
+        return !!wd && !a.deletedAt && path.resolve(wd) === here;
+    });
+}
+
+// Said to the person when this session cannot be linked to an agent: it would otherwise run, and the
+// agent would show offline with nothing to say why. Null when the session has no agent to be linked to.
+function unlinkedNotice(cwd, agents) {
+    if (!agents || resolveAgent(cwd, agents)) return null;
+    const matches = agentsForCwd(cwd, agents);
+    if (matches.length < 2) return null;
+    const names = matches.map(a => a.name).filter(Boolean);
+    return `This session is not linked to an AI Maestro agent: ${names.length} agents use this folder (${names.join(', ')}), so none of them shows online. `
+        + `Restart it as one of them: AIM_AGENT_NAME=<name> claude --continue. Each agent should have its own folder (a git worktree works).`;
+}
+
+// The hookState the server relays to chat clients: only for events that produce a card or a notice.
+function buildHookStateData(state) {
+    if (!(state.status === 'permission_request' || state.notificationType)) return undefined;
+    return {
+        status: state.status,
+        toolName: state.toolName,
+        toolInput: state.toolInput,
+        description: state.description,
+        options: state.options,
+        message: state.message,
+        notificationType: state.notificationType,
+        // Claude Code's observe-only report: no options, the chat takes them from the pane
+        ...(state.observed && { observed: true }),
+    };
+}
+
+// Broadcast status update via WebSocket (non-blocking)
+async function broadcastStatusUpdate(cwd, state) {
+    try {
+        // Find the session name for this working directory
+        const agents = await fetchAgentsOnce();
+        if (!agents) return;
+        const agent = resolveAgent(cwd, agents);
+
+        if (!agent) return;
+
+        const sessionName = agent.name || agent.alias || agent.session?.tmuxSessionName;
+        if (!sessionName) return;
+
+        // Build hookState payload for events that produce meaningful state
+        const hookStateData = buildHookStateData(state);
+
+        // Broadcast the status update
+        await fetch(`${aimBase()}/api/sessions/activity/update`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                sessionName,
+                agentId: agent.id,
+                status: state.status,
+                hookStatus: state.status,
+                notificationType: state.notificationType,
+                ...(hookStateData && { hookState: hookStateData })
+            })
+        });
+
+        // Also send heartbeat so standalone agents appear in dashboard. Include
+        // Claude Code's native session id (present in the hook payload) so the
+        // registry can link the agent to its transcript / support native resume.
+        if (agent.id) {
+            await fetch(`${aimBase()}/api/agents/${encodeURIComponent(agent.id)}/heartbeat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: state.status, claudeSessionId: currentSessionId })
+            }).catch(() => {});
+        }
+
+        debugLog({ event: 'status_broadcast', sessionName, agentId: agent.id, status: state.status });
+    } catch (err) {
+        debugLog({ event: 'status_broadcast_error', error: err.message });
+    }
+}
+
+// The process that ran this hook. A shell between them (`sh -c`, when the shell does not exec) is skipped;
+// /proc exists on Linux only, and macOS's sh execs the hook, so there the parent is Claude itself.
+function claudePid() {
+    const ppid = process.ppid;
+    try {
+        const comm = fs.readFileSync(`/proc/${ppid}/comm`, 'utf8').trim();
+        if (/^(sh|bash|dash|zsh)$/.test(comm)) {
+            const stat = fs.readFileSync(`/proc/${ppid}/stat`, 'utf8');
+            const parent = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+            if (parent > 1) return parent;
+        }
+    } catch (e) {}
+    return ppid;
+}
+
+// Write state to file. Returns the broadcast promise so callers can await if needed.
+function writeState(cwd, state) {
+    const stateDir = path.join(os.homedir(), '.aimaestro', 'chat-state');
+    fs.mkdirSync(stateDir, { recursive: true });
+
+    const cwdHash = hashCwd(cwd);
+    const stateFile = path.join(stateDir, `${cwdHash}.json`);
+
+    const fullState = {
+        ...state,
+        cwd,
+        cwdHash,
+        // The Claude process that ran this hook: the server checks it is still alive before treating the
+        // agent as running outside tmux (a crash or a reboot writes no SessionEnd)
+        pid: claudePid(),
+        updatedAt: new Date().toISOString()
+    };
+
+    fs.writeFileSync(stateFile, JSON.stringify(fullState, null, 2));
+
+    // Also write to a "by-cwd" index for easy lookup
+    const indexFile = path.join(stateDir, 'index.json');
+    let index = {};
+    try {
+        index = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+    } catch (e) {}
+    index[cwd] = cwdHash;
+    fs.writeFileSync(indexFile, JSON.stringify(index, null, 2));
+
+    // Broadcast status update via WebSocket
+    return broadcastStatusUpdate(cwd, state).catch(() => {});
+}
+
+// Debug log: 25 MB active + 25 MB previous = 50 MB ceiling (B013: it used to grow without
+// limit, 373 MB in nine months). One file is moved aside when it passes the cap; a file
+// that is far past it (written before this existed) is cut to its tail instead of being
+// copied whole into the backup.
+const DEBUG_LOG_MAX_BYTES = 25 * 1024 * 1024;
+const DEBUG_LOG_TAIL_BYTES = 5 * 1024 * 1024;
+const DEBUG_FIELD_MAX_CHARS = 1000;
+
+function rotateDebugLog(file, maxBytes = DEBUG_LOG_MAX_BYTES, tailBytes = DEBUG_LOG_TAIL_BYTES) {
+    try {
+        const size = fs.statSync(file).size;
+        if (size <= maxBytes) return 'none';
+        if (size > maxBytes * 2) {
+            const fd = fs.openSync(file, 'r');
+            const buf = Buffer.alloc(tailBytes);
+            fs.readSync(fd, buf, 0, tailBytes, size - tailBytes);
+            fs.closeSync(fd);
+            const nl = buf.indexOf(10); // start at a line boundary
+            fs.writeFileSync(file, nl >= 0 ? buf.subarray(nl + 1) : buf);
+            return 'trimmed';
+        }
+        fs.renameSync(file, file + '.1');
+        return 'rotated';
+    } catch (e) {
+        return 'error'; // logging must never break the hook
+    }
+}
+
+// Long strings (prompts, tool outputs, whole tool batches) are what made the log large.
+// Clip each one but keep every line valid JSON so the log stays greppable and parseable.
+function clipForLog(value, max = DEBUG_FIELD_MAX_CHARS, depth = 0) {
+    if (typeof value === 'string') {
+        return value.length > max ? value.slice(0, max) + `...[+${value.length - max} chars]` : value;
+    }
+    if (depth > 6 || value === null || typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value.slice(0, 50).map(v => clipForLog(v, max, depth + 1));
+    const out = {};
+    for (const k of Object.keys(value)) out[k] = clipForLog(value[k], max, depth + 1);
+    return out;
+}
+
+// Log to debug file. Off by default (AIM_HOOK_DEBUG=1 turns it on): it used to
+// write at least two lines per hook event. Error-level entries are always kept.
+function isErrorEvent(data) {
+    const ev = data && typeof data.event === 'string' ? data.event : '';
+    return /error|failed/i.test(ev);
+}
+
+function debugLog(data) {
+    if (process.env.AIM_HOOK_DEBUG !== '1' && !isErrorEvent(data)) return;
+    try {
+        writeDebugLine(data);
+    } catch (e) { /* logging must never break the hook */ }
+}
+
+function writeDebugLine(data) {
+    const debugFile = path.join(os.homedir(), '.aimaestro', 'chat-state', 'hook-debug.log');
+    const timestamp = new Date().toISOString();
+    const line = `[${timestamp}] ${JSON.stringify(clipForLog(data))}\n`;
+    rotateDebugLog(debugFile);
+    fs.appendFileSync(debugFile, line);
+}
+
+// chat-state/ holds one file set per cwd and was never pruned. On SessionStart,
+// delete state files untouched for 30 days and drop index.json keys whose cwd is
+// gone. Best effort: never throws, touches only files this hook writes.
+const CHAT_STATE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const CHAT_STATE_FILE_RE = /^[0-9a-f]{16}(\.notified|\.announced|\.recalled)?\.json$/;
+
+function pruneChatState(stateDir, now = Date.now(), maxAgeMs = CHAT_STATE_MAX_AGE_MS) {
+    const result = { deleted: 0, indexDropped: 0 };
+    try {
+        for (const name of fs.readdirSync(stateDir)) {
+            if (!CHAT_STATE_FILE_RE.test(name)) continue;
+            try {
+                const p = path.join(stateDir, name);
+                if (now - fs.statSync(p).mtimeMs > maxAgeMs) { fs.unlinkSync(p); result.deleted++; }
+            } catch (e) { /* skip this file */ }
+        }
+        const indexFile = path.join(stateDir, 'index.json');
+        const index = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+        let changed = false;
+        for (const cwd of Object.keys(index)) {
+            if (!fs.existsSync(cwd)) { delete index[cwd]; result.indexDropped++; changed = true; }
+        }
+        if (changed) fs.writeFileSync(indexFile, JSON.stringify(index, null, 2));
+    } catch (e) { /* best effort */ }
+    return result;
+}
+
+// Detect which AI agent is calling this hook
+function detectAgent(input) {
+    // Gemini CLI sets GEMINI_SESSION_ID or has gemini-specific fields
+    if (process.env.GEMINI_SESSION_ID || process.env.GEMINI_PROJECT_DIR) return 'gemini';
+    // Grok Build (xAI) runs Claude-style hooks from ~/.claude/settings.json but
+    // its stdin carries BOTH key styles: Claude's snake_case (hook_event_name,
+    // session_id, transcript_path) plus its own camelCase (hookEventName,
+    // sessionId, transcriptPath, stopHookActive, notificationType). Several
+    // fields exist ONLY in camelCase (stopHookActive, notificationType), so
+    // detect it first and read through the helpers below.
+    if (input.hookEventName !== undefined) return 'grok';
+    if (/[\\/]\.grok[\\/]sessions[\\/]/.test(String(input.transcript_path || input.transcriptPath || ''))) return 'grok';
+    // Codex CLI sets model field with gpt- prefix or has turn_id. Its rollout
+    // transcripts live under ~/.codex/sessions, which identifies it when it runs a
+    // model without the gpt- prefix (o-series, a custom provider).
+    if (typeof input.model === 'string' && input.model.startsWith('gpt-')) return 'codex';
+    if (input.turn_id !== undefined) return 'codex';
+    if (/[\\/]\.codex[\\/]sessions[\\/]/.test(String(input.transcript_path || input.transcriptPath || ''))) return 'codex';
+    // Default to Claude Code
+    return 'claude';
+}
+
+// True when the agent is already continuing because of an earlier Stop block.
+// Claude sends stop_hook_active; Grok sends ONLY stopHookActive.
+// Parsed strictly: a string such as "false" is truthy, and reading it as active
+// would silently turn the AMP Stop-block delivery off.
+function isStopHookActive(input) {
+    const truthy = (v) => v === true || v === 'true' || v === 1;
+    return truthy(input.stop_hook_active) || truthy(input.stopHookActive);
+}
+
+// Agents whose Stop hook honors {decision:'block', reason} (Claude-compatible).
+function supportsStopBlock(agent) {
+    return agent === 'claude' || agent === 'grok';
+}
+
+// Normalize event names across agents to our internal names
+function normalizeEvent(hookEvent, agent) {
+    // Gemini's AfterAgent = Claude/Codex's Stop
+    if (agent === 'gemini' && hookEvent === 'AfterAgent') return 'Stop';
+    return hookEvent;
+}
+
+// Build the context injection response in the correct format for each agent
+function buildContextResponse(agent, hookEvent, message) {
+    if (!message) return {};
+
+    switch (agent) {
+        case 'codex':
+            // Codex CLI uses systemMessage field
+            return { systemMessage: message };
+        case 'gemini':
+            // Gemini CLI uses systemMessage or additionalContext
+            return { systemMessage: message };
+        case 'grok':
+            // Grok discards stdout on SessionStart, Notification and
+            // UserPromptSubmit (docs 10-hooks.md), so context injection cannot
+            // reach it from here. AMP delivery for Grok is the Stop block.
+            return {};
+        case 'claude':
+        default:
+            // Claude Code uses hookSpecificOutput.additionalContext
+            return {
+                hookSpecificOutput: {
+                    hookEventName: hookEvent,
+                    additionalContext: message
+                }
+            };
+    }
+}
+
+// A prompt that IS a message notice typed into the pane ("[#ref] [MESSAGE] ..."): the message is already here.
+function carriesMessageNotice(prompt) {
+    return typeof prompt === 'string' && /\[#[0-9a-z]+\] \[MESSAGE\] /.test(prompt);
+}
+
+// A person talking to the agent at one of its devices (lib/device-events.ts). They are waiting for its voice:
+// nothing is added to the prompt, so the agent answers at once instead of reading its inbox (2026-11-07).
+function isDeviceTurn(prompt) {
+    return typeof prompt === 'string' && /\[MESSAGE\] Someone at your device /.test(prompt);
+}
+
+// Check for unread messages using AMP CLI (standalone — no AI Maestro needed)
+async function checkUnreadMessagesStandalone(prompt) {
+    // This path cannot tell which message the prompt carries, so it would announce the very message being read
+    if (carriesMessageNotice(prompt)) return null;
+    const { execSync } = require('child_process');
+    try {
+        const output = execSync('amp-inbox.sh --count 2>/dev/null', {
+            encoding: 'utf8',
+            timeout: 3000,
+            env: { ...process.env, PATH: process.env.PATH }
+        }).trim();
+
+        // amp-inbox.sh --count returns a number
+        const count = parseInt(output, 10);
+        if (isNaN(count) || count === 0) return null;
+
+        return `${count} unread AMP message${count === 1 ? '' : 's'} in your inbox. List them with: amp-inbox.sh`;
+    } catch (err) {
+        debugLog({ event: 'standalone_inbox_check_failed', error: err.message });
+        return null;
+    }
+}
+
+// Check for unread messages for this agent
+async function checkUnreadMessages(cwd, prompt) {
+    try {
+        // Find agent by working directory
+        const agents = await fetchAgentsOnce();
+        if (!agents) return null;
+        const agent = resolveAgent(cwd, agents);
+
+        if (!agent) {
+            debugLog({ event: 'no_agent_for_cwd', cwd });
+            return null;
+        }
+
+        // Check for unread messages
+        const messagesResponse = await fetch(
+            `${aimBase()}/api/messages?agent=${encodeURIComponent(agent.id)}&box=inbox&status=unread`,
+            { signal: AbortSignal.timeout(HOOK_FETCH_TIMEOUT_MS) }
+        );
+        if (!messagesResponse.ok) return null;
+
+        const messagesData = await messagesResponse.json();
+        const messages = messagesData.messages || [];
+
+        if (messages.length === 0) return null;
+
+        // Dedup BEFORE announcing. Without this the notice was rebuilt from the
+        // live unread list on every single user turn — measured on mini-lola
+        // 2026-09-19: 39 injections against 3 Stop blocks, `count=1` on every
+        // one of them, 17:57 through 19:46. Same message, twenty-odd identical
+        // "you have a new message" announcements.
+        const announced = loadAnnounced(cwd);
+        const decision = decideInboxAnnouncement({ messages, announced, now: Date.now(), prompt });
+        if (!decision.notice) {
+            if (decision.carriedIds && decision.carriedIds.length) saveAnnounced(cwd, decision.announced);
+            debugLog({ event: 'inbox_announce_suppressed', agentId: agent.id, count: messages.length });
+            return null;
+        }
+        saveAnnounced(cwd, decision.announced);
+        debugLog({
+            event: 'unread_messages_found',
+            agentId: agent.id,
+            count: messages.length,
+            fresh: decision.freshIds.length,
+            reminders: decision.reminderIds.length,
+        });
+        return decision.notice;
+    } catch (err) {
+        debugLog({ event: 'message_check_error', error: err.message });
+        // Fall back to standalone AMP check (works without AI Maestro)
+        return checkUnreadMessagesStandalone(prompt);
+    }
+}
+
+// Drain the meeting inject queue for this session
+async function drainMeetingInjectQueue(cwd) {
+    try {
+        // Resolve agent to get session name
+        const agents = await fetchAgentsOnce();
+        if (!agents) return null;
+        const agent = resolveAgent(cwd, agents);
+        if (!agent) return null;
+
+        const sessionName = agent.name || agent.alias || agent.session?.tmuxSessionName;
+        if (!sessionName) return null;
+
+        const queueResponse = await fetch(
+            `${aimBase()}/api/meetings/inject-queue?session=${encodeURIComponent(sessionName)}`,
+            { signal: AbortSignal.timeout(HOOK_FETCH_TIMEOUT_MS) }
+        );
+        if (!queueResponse.ok) return null;
+
+        const queueData = await queueResponse.json();
+        if (!queueData.messages || queueData.messages.length === 0) return null;
+
+        debugLog({ event: 'meeting_queue_drained', sessionName, count: queueData.count });
+
+        // Combine all queued messages into one context block
+        const combined = queueData.messages.map(m => m.text).join('\n\n---\n\n');
+        return combined;
+    } catch (err) {
+        debugLog({ event: 'meeting_queue_drain_error', error: err.message });
+        return null;
+    }
+}
+
+// ── Stop-hook AMP delivery ──────────────────────────────────────────────────
+// Fetch raw unread messages (with IDs) for dedup on the Stop-hook block path.
+// Returns { agentId, messages } or null.
+async function fetchUnreadMessages(cwd) {
+    const agents = await fetchAgentsOnce();
+    if (!agents) return null;
+    const agent = resolveAgent(cwd, agents);
+    if (!agent) { debugLog({ event: 'no_agent_for_cwd', cwd }); return null; }
+
+    const messagesResponse = await fetch(
+        `${aimBase()}/api/messages?agent=${encodeURIComponent(agent.id)}&box=inbox&status=unread`,
+        { signal: AbortSignal.timeout(2500) }
+    );
+    if (!messagesResponse.ok) return null;
+    const messagesData = await messagesResponse.json();
+    const messages = messagesData.messages || [];
+    if (messages.length === 0) return null;
+    return { agentId: agent.id, messages };
+}
+
+function formatMessageSender(msg) {
+    const name = msg.fromAlias || (msg.from ? msg.from.substring(0, 8) : 'unknown');
+    const host = msg.fromHost ? ` (${msg.fromHost})` : '';
+    return `${name}${host}`;
+}
+
+// ── Inbox announcement dedup (context-injection path) ───────────────────────
+//
+// TWO paths announce unread AMP messages and only one of them used to dedup:
+//
+//   Stop hook              decideStopDelivery + <hash>.notified.json   once per message
+//   context injection      checkUnreadMessages                         EVERY user turn
+//
+// The injection path fires far more often (39 vs 3 in one measured day), so the
+// path without dedup was the one doing nearly all the talking. A notifier that
+// repeats itself trains the reader to ignore it, and then the one real alert is
+// the one that gets dismissed — which is exactly what happened on 2026-09-19.
+//
+// The two stores are deliberately SEPARATE. Letting an injection consume the
+// Stop path's first-fire would disarm the Stop block, and the Stop block is the
+// forcing mechanism — the only one that can start a turn on an already-idle
+// agent. Share the logic, not the state.
+//
+// Repeats are rate-limited rather than silenced outright: a message that is
+// still unread an hour later is worth mentioning again, just not every turn,
+// and not in words that make it sound like it just arrived.
+const INBOX_REMIND_MS = Number(process.env.AIM_INBOX_REMIND_MS || 30 * 60 * 1000);
+const ANNOUNCED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const ANNOUNCED_CAP = 200;
+
+// Keep the newest entries, drop anything past the TTL. Pure.
+function pruneAnnounced(announced, now, ttlMs, cap) {
+    const ttl = typeof ttlMs === 'number' ? ttlMs : ANNOUNCED_TTL_MS;
+    const max = typeof cap === 'number' ? cap : ANNOUNCED_CAP;
+    const kept = Object.entries(announced || {})
+        .filter(([, t]) => typeof t === 'number' && now - t < ttl)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, max);
+    return Object.fromEntries(kept);
+}
+
+// The AMP filesystem store names messages with underscores (msg_123_abc) while
+// the HTTP API reports the same message with hyphens (msg-123-abc). pas-lola
+// spotted the divergence; it is harmless where she expected it (both sides of
+// the dedup comparison come from the API) but NOT harmless here — an id in the
+// API's form is rejected by amp-read.sh:
+//
+//     $ amp-read.sh msg-1789863849489-zl8spaj
+//     Error: Message not found
+//
+// So anything we print for a human or an agent to act on gets converted first.
+function ampMessageId(id) {
+    return typeof id === 'string' && id.startsWith('msg-') ? id.replace(/-/g, '_') : id;
+}
+
+// Wording carries the distinction the old code lost: `fresh` messages are new,
+// `reminders` are explicitly NOT. Calling a two-hour-old message "new" on the
+// twentieth announcement is the part that destroys trust in the notifier.
+//
+// The notice also names the message ID. It used to identify a message only by
+// sender and subject — and a reply carries `Re: <same subject>` from the same
+// sender, so a genuinely new message in a live thread produced a notice byte
+// -identical to the repeats around it. That is not a cosmetic problem: it is
+// precisely what made a real message indistinguishable from noise on
+// 2026-09-19. An id is the one thing that tells them apart.
+//
+// This text rides on up to every user prompt, so it states facts and the one
+// command that acts on them. It used to end with "Please check your inbox
+// using the agent-messaging skill." as well: a second instruction for the same
+// action, added to every notice, that the skill's own trigger already covers.
+function buildInboxNotice(fresh, reminders) {
+    const parts = [];
+    if (fresh.length === 1) {
+        const m = fresh[0];
+        const subject = m.subject ? ` about "${m.subject}"` : '';
+        const urgent = m.priority === 'urgent' ? '[URGENT] ' : '';
+        parts.push(`${urgent}You have a new message from ${formatMessageSender(m)}${subject}. Read it with: amp-read.sh ${ampMessageId(m.id)}`);
+    } else if (fresh.length > 1) {
+        const urgentCount = fresh.filter(m => m.priority === 'urgent').length;
+        const senders = [...new Set(fresh.map(formatMessageSender))].slice(0, 3).join(', ');
+        const urgent = urgentCount > 0 ? `[${urgentCount} URGENT] ` : '';
+        parts.push(`${urgent}You have ${fresh.length} new messages from ${senders}. List them with: amp-inbox.sh`);
+    }
+    if (reminders.length > 0) {
+        const senders = [...new Set(reminders.map(formatMessageSender))].slice(0, 3).join(', ');
+        const ids = reminders.slice(0, 3).map(m => ampMessageId(m.id)).join(', ');
+        parts.push(reminders.length === 1
+            ? `Still unread from earlier: a message from ${senders} (${ids}).`
+            : `Still unread from earlier: ${reminders.length} messages from ${senders} (${ids}).`);
+    }
+    return parts.join(' ');
+}
+
+// The token the server types into an agent's pane for a message: the last eight
+// letters and digits of its id, as `[#abc12345]`. Must stay the same as
+// messageRef() in lib/notification-service.ts.
+function messageRefOf(id) {
+    const alnum = String(id || '').replace(/[^a-zA-Z0-9]/g, '');
+    return alnum.slice(-8) || 'nomsgid';
+}
+
+// Messages the PROMPT ITSELF already announced. A pane push is typed into the
+// agent's input and submitted as its prompt, so UserPromptSubmit then fires for
+// that very prompt and, without this, announced the same message a second time
+// in the same turn ("You have a new message from X ... Read it with ..."), on
+// top of the push that carries it. Seen on mini-lola 2026-10-02, repeatedly.
+// A message whose [#ref] is already in the prompt has been announced; say so
+// once, not twice.
+function carriedByPrompt(messages, prompt) {
+    if (typeof prompt !== 'string' || prompt.length === 0) return [];
+    return (messages || []).filter(m => m && m.id && prompt.includes(`[#${messageRefOf(m.id)}]`));
+}
+
+// Pure decision — no I/O, unit-testable. `announced` maps message id to the ms
+// timestamp it was last announced at. Returns notice:null when there is nothing
+// worth saying, which is the common case and the whole point.
+function decideInboxAnnouncement({ messages, announced, now, remindAfterMs, prompt }) {
+    const seen0 = (announced && typeof announced === 'object' && !Array.isArray(announced)) ? announced : {};
+    const gap = typeof remindAfterMs === 'number' ? remindAfterMs : INBOX_REMIND_MS;
+    // Messages the prompt already carries count as announced right now: record
+    // them so they are not announced as "new" on the next turn either.
+    const carried = carriedByPrompt(messages, prompt);
+    const carriedIds = carried.map(m => m.id);
+    const seen = carried.length ? { ...seen0, ...Object.fromEntries(carriedIds.map(id => [id, now])) } : seen0;
+    const skip = new Set(carriedIds);
+    const fresh = [];
+    const reminders = [];
+    for (const m of messages || []) {
+        if (!m || !m.id || skip.has(m.id)) continue;
+        const last = seen[m.id];
+        if (typeof last !== 'number') fresh.push(m);
+        else if (now - last >= gap) reminders.push(m);
+    }
+    if (fresh.length === 0 && reminders.length === 0) {
+        return { notice: null, announced: seen, freshIds: [], reminderIds: [], carriedIds };
+    }
+    const next = { ...seen };
+    for (const m of fresh.concat(reminders)) next[m.id] = now;
+    return {
+        notice: buildInboxNotice(fresh, reminders),
+        announced: pruneAnnounced(next, now),
+        freshIds: fresh.map(m => m.id),
+        reminderIds: reminders.map(m => m.id),
+        carriedIds,
+    };
+}
+
+function announcedFile(cwd) {
+    return path.join(os.homedir(), '.aimaestro', 'chat-state', `${hashCwd(cwd)}.announced.json`);
+}
+function loadAnnounced(cwd) {
+    try {
+        const o = JSON.parse(fs.readFileSync(announcedFile(cwd), 'utf8'));
+        return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
+    } catch (e) { return {}; }
+}
+function saveAnnounced(cwd, announced) {
+    try {
+        fs.mkdirSync(path.join(os.homedir(), '.aimaestro', 'chat-state'), { recursive: true });
+        fs.writeFileSync(announcedFile(cwd), JSON.stringify(announced));
+    } catch (e) { debugLog({ event: 'save_announced_failed', error: e.message }); }
+}
+
+// Per-cwd dedup so each message triggers the Stop-hook block exactly once.
+function notifiedIdsFile(cwd) {
+    return path.join(os.homedir(), '.aimaestro', 'chat-state', `${hashCwd(cwd)}.notified.json`);
+}
+function loadNotifiedIds(cwd) {
+    try { const a = JSON.parse(fs.readFileSync(notifiedIdsFile(cwd), 'utf8')); return Array.isArray(a) ? a : []; }
+    catch (e) { return []; }
+}
+function saveNotifiedIds(cwd, ids) {
+    try {
+        fs.mkdirSync(path.join(os.homedir(), '.aimaestro', 'chat-state'), { recursive: true });
+        fs.writeFileSync(notifiedIdsFile(cwd), JSON.stringify(ids.slice(-200)));
+    } catch (e) { debugLog({ event: 'save_notified_ids_failed', error: e.message }); }
+}
+
+// ── Memory recall ────────────────────────────────────────────────────────────
+// Agents should check memory before re-reading files. On SessionStart the hook
+// injects the agent's standing decisions and preferences; on each user prompt,
+// the long-term memories nearest to that prompt. Each memory is injected at most
+// once per session, so a long session is not re-told the same thing every turn.
+const RECALL_PROMPT_LIMIT = 3;
+const RECALL_PRIMER_LIMIT = 6;
+const RECALL_MEMORY_CHARS = 500;
+
+function recalledFile(cwd) {
+    return path.join(os.homedir(), '.aimaestro', 'chat-state', `${hashCwd(cwd)}.recalled.json`);
+}
+function loadRecalled(cwd, sessionId) {
+    try {
+        const o = JSON.parse(fs.readFileSync(recalledFile(cwd), 'utf8'));
+        return (o && o.sessionId === sessionId && Array.isArray(o.ids)) ? o.ids : [];
+    } catch (e) { return []; }
+}
+function saveRecalled(cwd, sessionId, ids) {
+    try {
+        fs.mkdirSync(path.join(os.homedir(), '.aimaestro', 'chat-state'), { recursive: true });
+        fs.writeFileSync(recalledFile(cwd), JSON.stringify({ sessionId, ids: ids.slice(-300) }));
+    } catch (e) { debugLog({ event: 'save_recalled_failed', error: e.message }); }
+}
+
+// Pure: what the agent knows about the entities its prompt names — their
+// relations, current first, "no longer" when one ended. Returns null when empty.
+function buildEntityNotice(entities) {
+    if (!Array.isArray(entities) || entities.length === 0) return null;
+    const blocks = entities
+        .filter(e => e && e.name && Array.isArray(e.relations) && e.relations.length > 0)
+        .map(e => [`**${e.name}**${e.type && e.type !== 'other' ? ` (${e.type})` : ''}`, ...e.relations.map(r => `- ${r}`)].join('\n'));
+    if (blocks.length === 0) return null;
+    // The legend explains only markers that appear. It used to end with "Verify
+    // before acting" on every notice: an open-ended instruction to re-check,
+    // attached to every prompt that names a known entity.
+    const ended = blocks.some(b => b.includes('(no longer)'));
+    return [
+        '## Memory: what you know about the things this prompt names',
+        `Relations from your earlier sessions; before changing one of these, consider what depends on it.${ended ? ' "(no longer)" means a later session said the relation ended.' : ''} memory-search.sh --about <name> shows the memories behind them.`,
+        '',
+        blocks.join('\n\n'),
+    ].join('\n');
+}
+
+// Append one line per injection to the agent's own recall log. Consolidation
+// folds it into access counts; it is also the raw data for "did the agent use
+// its memory". Never throws.
+const RECALL_LOG_MAX_BYTES = 5 * 1024 * 1024;
+const RECALL_LOG_TAIL_BYTES = 1024 * 1024;
+
+function logRecall(agentId, entry) {
+    try {
+        if (!/^[A-Za-z0-9_-]+$/.test(agentId)) return;
+        const dir = path.join(os.homedir(), '.aimaestro', 'agents', agentId);
+        if (!fs.existsSync(dir)) return;
+        const recallFile = path.join(dir, 'memory-recalls.jsonl');
+        rotateDebugLog(recallFile, RECALL_LOG_MAX_BYTES, RECALL_LOG_TAIL_BYTES);
+        fs.appendFileSync(recallFile, JSON.stringify({ at: Date.now(), ...entry }) + '\n');
+    } catch (e) { debugLog({ event: 'recall_log_failed', error: e.message }); }
+}
+
+// Pure: turn recalled memories into the context block. Returns null when empty.
+function buildMemoryNotice(memories, { primer }) {
+    if (!Array.isArray(memories) || memories.length === 0) return null;
+    const lines = memories.map(m => {
+        // A memory card's statement when there is one (short, written for
+        // reading); otherwise the verbatim passage.
+        const text = String(m.statement || m.content || '').replace(/\s+/g, ' ').trim();
+        const clipped = text.length > RECALL_MEMORY_CHARS ? `${text.slice(0, RECALL_MEMORY_CHARS)}…` : text;
+        // When it was last said in a session; created_at is when it was consolidated
+        const when = m.said_at || m.created_at;
+        const date = when ? new Date(when).toISOString().slice(0, 10) : 'undated';
+        // Weight: knowledge that came up in several sessions is more likely to matter
+        const weight = m.sessions > 1 ? ` · seen in ${m.sessions} sessions` : '';
+        // A correction: the user told the agent it was wrong; say so
+        const kind = m.card && m.card.action === 'corrected' ? 'correction' : m.category;
+        return `- [${kind}${weight} · ${date}] ${clipped}`;
+    });
+    const title = primer
+        ? '## Memory: your standing decisions, preferences, and corrections you were given'
+        : '## Memory: notes from your past sessions on this topic';
+    // Rides on any prompt that recalls something, so it carries only what the
+    // agent cannot infer from the lines themselves. Dropped: "verify anything
+    // you act on" (an open-ended re-check on every recall) and "Search for more
+    // with memory-search.sh" (a standing nudge to make a tool call that the
+    // memory-search skill already describes). The correction note appears only
+    // when a correction does.
+    const hasCorrection = memories.some(m => m && m.card && m.card.action === 'corrected');
+    const legend = 'From your earlier sessions. Check them before re-reading files or re-deciding; they can be out of date.'
+        + (hasCorrection ? ' A "correction" is something the user told you that you had wrong.' : '');
+    return [
+        title,
+        legend,
+        '',
+        ...lines,
+    ].join('\n');
+}
+
+// Pure: drop memories already injected this session.
+function selectFreshMemories(memories, alreadyIds, limit) {
+    const seen = new Set(alreadyIds);
+    return (memories || []).filter(m => m && m.memory_id && !seen.has(m.memory_id)).slice(0, limit);
+}
+
+async function recallMemories(cwd, sessionId, prompt) {
+    try {
+        const agents = await fetchAgentsOnce();
+        if (!agents) return null;
+        const agent = resolveAgent(cwd, agents);
+        if (!agent) return null;
+
+        const primer = !prompt;
+        const limit = primer ? RECALL_PRIMER_LIMIT : RECALL_PROMPT_LIMIT;
+        const qs = primer ? `limit=${limit}` : `limit=${limit + 3}&q=${encodeURIComponent(String(prompt).slice(0, 2000))}`;
+        const res = await fetch(`${aimBase()}/api/agents/${encodeURIComponent(agent.id)}/memory/recall?${qs}`, {
+            signal: AbortSignal.timeout(HOOK_FETCH_TIMEOUT_MS * 2),
+        });
+        if (!res.ok) return null;
+
+        const already = loadRecalled(cwd, sessionId);
+        const body = await res.json();
+        const fresh = selectFreshMemories(body.memories, already, limit);
+        // An entity's relations are shown once per session, like a memory
+        const freshEntities = (body.entities || []).filter(e => e && e.entity_id && !already.includes(`entity:${e.entity_id}`));
+        if (fresh.length === 0 && freshEntities.length === 0) return null;
+
+        saveRecalled(cwd, sessionId, [...already, ...fresh.map(m => m.memory_id), ...freshEntities.map(e => `entity:${e.entity_id}`)]);
+        logRecall(agent.id, {
+            session: sessionId || null,
+            kind: primer ? 'primer' : 'prompt',
+            ids: fresh.map(m => m.memory_id),
+            entities: freshEntities.map(e => e.name),
+        });
+        debugLog({ event: 'memory_recalled', agentId: agent.id, primer, count: fresh.length, entities: freshEntities.length });
+        return [buildEntityNotice(freshEntities), buildMemoryNotice(fresh, { primer })].filter(Boolean).join('\n\n') || null;
+    } catch (err) {
+        debugLog({ event: 'memory_recall_error', error: err.message });
+        return null;
+    }
+}
+
+// Multi-line reason handed back to Claude on a Stop-hook block — its instruction
+// to read + respond before going idle.
+function buildAmpBlockReason(messages) {
+    const urgentCount = messages.filter(m => m.priority === 'urgent').length;
+    // Lead with the count and the word, not a bracketed tag.
+    //
+    // Claude Code renders a Stop hook's `decision: block` as "Stop hook error:"
+    // followed by the start of this string, TRUNCATED to the label width. We
+    // cannot change its wording (nothing failed here — block is the documented
+    // way to hand work back to an agent), but we choose what survives the
+    // truncation. Leading with "[AMP]" made the label read
+    //
+    //     Stop hook error: [A
+    //
+    // which tells the reader nothing at all. Putting the count first means even
+    // a dozen characters carry the message: "1 unread AMP m…".
+    const header = messages.length === 1
+        ? `1 unread AMP message in your inbox:`
+        : `${messages.length} unread AMP messages in your inbox${urgentCount > 0 ? ` (${urgentCount} urgent)` : ''}:`;
+    // Each line carries the id amp-read.sh accepts, so the agent can open a
+    // message directly instead of first listing the inbox to find it.
+    const lines = messages.slice(0, 10).map((m, i) => {
+        const urgent = m.priority === 'urgent' ? '[URGENT] ' : '';
+        const subj = m.subject ? ` — "${m.subject}"` : '';
+        return `  ${i + 1}. ${urgent}from ${formatMessageSender(m)}${subj} (${ampMessageId(m.id)})`;
+    });
+    const more = messages.length > 10 ? `  …and ${messages.length - 10} more (amp-inbox.sh lists them)` : '';
+    // "Reply where one is needed", not "respond to these": an unconditional
+    // reply instruction makes two agents answer each other's acknowledgements,
+    // and every reply wakes the other side for another turn.
+    return [
+        header, ...lines, more, '',
+        `Read ${messages.length === 1 ? 'it' : 'them'} with amp-read.sh <id>, reply with amp-reply.sh <id> "..." where a reply is needed, then continue.`,
+    ].filter(Boolean).join('\n');
+}
+
+// Drop messages we've already surfaced (dedup) and those lacking an id.
+function filterFreshMessages(messages, alreadyIds) {
+    const already = new Set(alreadyIds || []);
+    return (messages || []).filter(m => m && m.id && !already.has(m.id));
+}
+
+// Pure Stop-hook decision — no I/O, unit-testable. Returns:
+//   { block: false, freshIds: [] }                        → let the agent go idle
+//   { block: true, response: {...}, freshIds: [...] }     → force a continuation
+function decideStopDelivery({ agent, stopHookActive, messages, alreadyIds }) {
+    // decision:block is a Claude Code (and Grok) capability; never loop
+    // (stop_hook_active / stopHookActive).
+    if (!supportsStopBlock(agent) || stopHookActive) return { block: false, freshIds: [] };
+    const fresh = filterFreshMessages(messages, alreadyIds);
+    if (fresh.length === 0) return { block: false, freshIds: [] };
+    return {
+        block: true,
+        response: { decision: 'block', reason: buildAmpBlockReason(fresh) },
+        freshIds: fresh.map(m => m.id),
+    };
+}
+
+// Status to record when a session starts. Claude Code and Grok Build start at an
+// empty prompt (reported in #551; Grok confirmed from a live session's hook log), so
+// they are idle until UserPromptSubmit says otherwise.
+//
+// 'compact' returns null = "do not touch the recorded status". It fires mid-turn (auto
+// compaction, seen in a live hook log with PostToolBatch events right after it) AND for
+// a manual /compact at an idle prompt (seen with no event after it), so any fixed
+// answer is wrong half the time; the status already recorded is right both times.
+//
+// Codex and Gemini return 'started': a start that claims nothing. Their SessionStart
+// semantics are unverified and neither installs a prompt-submit hook, so 'active'
+// (what this used to record) stuck until the first Stop and made every wake defer.
+// 'started' reads as "no hook report" downstream (claimsActivity), so the PTY and,
+// for Codex, the transcript decide.
+function sessionStartStatus(agent, source) {
+    if (agent === 'claude' || agent === 'grok') return source === 'compact' ? null : 'idle';
+    return 'started';
+}
+
+// ── Per-event state transitions ──────────────────────────────────────────────
+// reduceState is the whole status model of the hook as one pure function, so a
+// replayed event sequence (tests/helpers/hook-replay.ts) can assert the recorded
+// status after every step. main() only does I/O around it.
+
+const SETTLE_EVENTS = new Set(['Stop', 'StopFailure', 'StopCancelled']);
+// A PostToolBatch (async hook) can be processed just after the Stop of the same turn.
+const LATE_BATCH_GRACE_MS = 3000;
+// Only rewrite an already-'active' status this often, so a busy agent does not cost a
+// file write and two HTTP calls per tool batch. Well inside the 15 minute status TTL.
+const ACTIVE_REFRESH_MS = 60 * 1000;
+const PRIOR_PROMPTS_KEPT = 8;
+
+// Claude sends snake_case, Grok sends both styles, some fields camelCase only.
+function pick(input, snake, camel) {
+    const v = input[snake] !== undefined ? input[snake] : input[camel];
+    return v === undefined ? null : v;
+}
+
+function promptIdOf(input) {
+    return pick(input, 'prompt_id', 'promptId');
+}
+
+// A subagent's own turn ending says nothing about the session. Grok tags these events
+// with subagentType; Claude puts agent_id on events fired inside a subagent.
+function isSubagentEvent(input) {
+    return !!(pick(input, 'subagent_type', 'subagentType') || input.agent_id);
+}
+
+// A settle report (Stop, idle_prompt...) for a turn that is already over, arriving after
+// a newer turn started. Hooks run as separate processes and Grok documents that a
+// cancelled turn's report can arrive after the next UserPromptSubmit. Only a prompt id
+// we have SEEN AND LEFT counts as stale: an id we never saw start (a turn the agent
+// began on its own) must still settle, or the state would stick.
+function isStaleSettle(prev, input) {
+    const id = promptIdOf(input);
+    if (!id || !prev || prev.status !== 'active' || !prev.promptId) return false;
+    return id !== prev.promptId && Array.isArray(prev.priorPromptIds) && prev.priorPromptIds.includes(id);
+}
+
+// Carry prompt-id bookkeeping into the state about to be written.
+function trackPrompt(prev, input, state) {
+    const id = promptIdOf(input) || (prev && prev.promptId) || null;
+    let prior = (prev && Array.isArray(prev.priorPromptIds)) ? prev.priorPromptIds : [];
+    if (prev && prev.promptId && id && id !== prev.promptId) {
+        prior = [prev.promptId, ...prior.filter(p => p !== prev.promptId)].slice(0, PRIOR_PROMPTS_KEPT);
+    }
+    return { ...state, ...(id && { promptId: id }), ...(prior.length && { priorPromptIds: prior }) };
+}
+
+function ageOf(prev, now) {
+    const t = prev && prev.updatedAt ? new Date(prev.updatedAt).getTime() : NaN;
+    return Number.isFinite(t) ? now - t : Infinity;
+}
+
+/**
+ * Next state for one hook event, or null to leave the recorded state alone.
+ *   prev   the state file as last written (or null)
+ *   ctx    { event, input, agent, now, blocked }  (blocked = a Stop that forced a continuation)
+ * Does not handle PermissionRequest (needs the tool-description builder in main()).
+ */
+function reduceState(prev, ctx) {
+    const { event, input, agent } = ctx;
+    const now = ctx.now || Date.now();
+    const sessionId = input.session_id || input.sessionId;
+    const transcriptPath = input.transcript_path || input.transcriptPath;
+    const base = { sessionId, transcriptPath, lastEvent: event };
+    const make = (state) => trackPrompt(prev, input, { ...state, ...base });
+
+    if (SETTLE_EVENTS.has(event) && isSubagentEvent(input)) return null;
+
+    switch (event) {
+        case 'UserPromptSubmit':
+            return make({ status: 'active', message: null });
+
+        case 'PostToolBatch': {
+            // A tool batch finishing proves the agent is working, whatever was recorded:
+            //  - blocked on a permission/question: it was answered (Claude fires no event for that)
+            //  - idle / idle_prompt: it resumed on its own (a background task or monitor woke
+            //    it; seen in a live hook log as minutes of PostToolBatch after a Stop)
+            //  - active: refresh, so a long turn is not aged out to idle after 15 minutes
+            if (!prev) return make({ status: 'active', message: null });
+            // The last batch of a turn can be processed just after that turn's Stop.
+            const justSettled = ['Stop', 'StopFailure', 'StopCancelled', 'SessionEnd'].includes(prev.lastEvent)
+                && ageOf(prev, now) < LATE_BATCH_GRACE_MS
+                && (!prev.sessionId || prev.sessionId === sessionId);
+            if (justSettled) return null;
+            if (prev.status === 'active') {
+                if (ageOf(prev, now) < ACTIVE_REFRESH_MS) return null;
+                return make({ status: 'active', message: null });
+            }
+            return make({ status: 'active', message: null });
+        }
+
+        case 'Notification': {
+            const type = pick(input, 'notification_type', 'notificationType') || input.type;
+            if (type === 'idle_prompt') {
+                if (isSubagentEvent(input) || isStaleSettle(prev, input)) return null;
+                return make({ status: 'waiting_for_input', message: input.message || 'Waiting for your input...', notificationType: type });
+            }
+            if (type === 'permission_prompt' || type === 'elicitation_dialog') {
+                // permission_prompt fires ~6s AFTER PermissionRequest. When that already wrote the
+                // state with full tool data, keep it: it is strictly more informative.
+                if (type === 'permission_prompt' && prev && prev.status === 'permission_request' && ageOf(prev, now) < 30000) return null;
+                return make({ status: 'waiting_for_input', message: input.message || 'Waiting for your input...', notificationType: type });
+            }
+            return null;
+        }
+
+        case 'Stop':
+            if (isStaleSettle(prev, input)) return null;
+            return make({ status: ctx.blocked ? 'active' : 'idle', message: null });
+
+        case 'StopFailure': {
+            // The turn ended on an API error: nothing is running any more.
+            if (isStaleSettle(prev, input)) return null;
+            return make({ status: 'idle', message: null, stopFailure: pick(input, 'error_type', 'error') || 'unknown' });
+        }
+
+        case 'StopCancelled':
+            // Grok only: interrupt, declined permission prompt, max turns, no progress.
+            if (isStaleSettle(prev, input)) return null;
+            return make({ status: 'idle', message: null, stopCancelled: input.reason || 'unknown' });
+
+        case 'SessionEnd':
+            // The session is gone. 'ended' claims nothing (see claimsActivity), so the agent
+            // stops reading as working/needs-you from a report nobody will ever clear. A
+            // SessionEnd processed after the NEXT session's start (it is async) must not
+            // clobber that session.
+            if (prev && prev.sessionId && sessionId && prev.sessionId !== sessionId) return null;
+            return make({ status: 'ended', message: null, endReason: input.reason || null });
+
+        case 'SessionStart': {
+            const status = sessionStartStatus(agent, input.source);
+            if (status === null) return null;
+            return make({ status, message: null, source: input.source });
+        }
+
+        default:
+            return null;
+    }
+}
+
+function readState(cwd) {
+    try {
+        return JSON.parse(fs.readFileSync(path.join(os.homedir(), '.aimaestro', 'chat-state', `${hashCwd(cwd)}.json`), 'utf8'));
+    } catch (e) {
+        return null;
+    }
+}
+
+// Main: read the event, handle it, answer, exit. handleEvent holds the logic so a
+// test can replay a sequence of events in-process (tests/helpers/hook-replay.ts).
+async function main() {
+    const input = await readStdin();
+    const hookResponse = await handleEvent(input);
+
+    // Output hook response (may include additionalContext for inbox notifications).
+    // Force immediate exit — pending fire-and-forget fetches (broadcastStatusUpdate)
+    // can keep the event loop alive past Claude Code's hook deadline.
+    process.stdout.write(JSON.stringify(hookResponse));
+    process.exit(0);
+}
+
+// What a permission report may carry: a short summary of what is asked, never the whole tool
+// input (a Write holds a whole file, a Bash command can hold a token). The state file and the
+// server's status feed both see this.
+const PERMISSION_TEXT_MAX = 300;
+
+function clipText(value, max = PERMISSION_TEXT_MAX) {
+    const text = String(value == null ? '' : value);
+    return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function summarizeToolInput(toolName, toolInput) {
+    const input = toolInput && typeof toolInput === 'object' ? toolInput : {};
+    const out = {};
+    if (typeof input.command === 'string') out.command = clipText(input.command);
+    if (typeof input.file_path === 'string') out.file_path = clipText(input.file_path);
+    if (typeof input.path === 'string') out.path = clipText(input.path);
+    if (toolName === 'AskUserQuestion' && Array.isArray(input.questions) && input.questions[0]) {
+        const q = input.questions[0];
+        out.question = clipText(typeof q === 'string' ? q : q.question || q.header || '');
+    }
+    return out;
+}
+
+// A human-readable line saying what is being asked, clipped.
+function describePermission(toolName, toolInput) {
+    const input = toolInput && typeof toolInput === 'object' ? toolInput : {};
+    if (toolName === 'Edit' && input.file_path) return clipText(`Edit ${input.file_path}?`);
+    if (toolName === 'Write' && input.file_path) return clipText(`Create ${input.file_path}?`);
+    if (toolName === 'Bash' && input.command) return clipText(`Run: ${input.command}`);
+    if (toolName === 'Read' && input.file_path) return clipText(`Read ${input.file_path}?`);
+    if (toolName === 'Grep' && input.path) return clipText(`Search in ${input.path}?`);
+    if (toolName === 'AskUserQuestion') return 'Claude has a question';
+    if (toolName === 'ExitPlanMode') return 'Review the plan';
+    return clipText(`Allow ${toolName}?`);
+}
+
+async function handleEvent(input) {
+    agentsPromise = null; // one agent-list load per event (a process handles exactly one)
+    currentSessionId = input.session_id || null;
+
+    // Log all input for debugging
+    debugLog({ event: 'hook_received', input });
+
+    const agent = detectAgent(input);
+    const rawEvent = input.hook_event_name || process.env.CLAUDE_HOOK_EVENT;
+    const hookEvent = normalizeEvent(rawEvent, agent);
+    const cwd = input.cwd || process.env.GEMINI_CWD || process.cwd();
+    const sessionId = input.session_id;
+    const transcriptPath = input.transcript_path;
+
+    // Record the state reduceState derives for this event (null = leave it alone).
+    const record = async (event, extra) => {
+        const next = reduceState(readState(cwd), { event, input, agent, blocked: !!(extra && extra.blocked) });
+        if (next) await writeState(cwd, next);
+        return next;
+    };
+
+    debugLog({ event: 'agent_detected', agent, rawEvent, hookEvent });
+
+    // Hook response — may be enriched with context injection for inbox notifications
+    let hookResponse = {};
+
+    // Handle different hook events
+    switch (hookEvent) {
+        case 'PostToolBatch': {
+            // Registered async (runs in the background, never delays the agent).
+            // A tool batch finishing proves the agent is working: it clears a
+            // permission/question that was answered (Claude fires no event for that),
+            // wakes an idle state after a background task resumed the agent, and
+            // refreshes 'active' so a long turn does not age out. See reduceState.
+            const next = await record('PostToolBatch');
+            if (next) debugLog({ event: 'tool_batch_active', cwd });
+            break;
+        }
+
+        case 'PermissionRequest': {
+            // Claude Code is about to ask for a decision (a tool, a question, a plan). Other agents
+            // get their pending approvals from the pane (lib/pane-approval.mjs), so an event from
+            // one of them is ignored here, as it always was before this hook was registered.
+            if (agent !== 'claude') break;
+            // Input includes: tool_name, tool_input, permission_suggestions (no tool_use_id).
+            const toolName = String(input.tool_name || input.toolName || 'a tool');
+            const rawToolInput = input.tool_input || input.toolInput || {};
+
+            // Observe-only. Claude Code builds each dialog's options itself and they cannot be derived
+            // from this payload (permission_suggestions does not list them all: a Bash prompt can have
+            // a "switch to auto mode" line it never mentions), so a card built from them could map a
+            // key to the wrong choice. Report that a decision is pending and what is asked, as a short
+            // summary and never the whole input, with no options: the server builds the card's options
+            // and keys from the pane, as it does for any option-less permission_request. The hook never
+            // answers the dialog.
+            // Await the HTTP broadcast — this is the critical path for the chat UI. Other hooks
+            // fire-and-forget, but this must reach WebSocket clients before process.exit() kills it.
+            await writeState(cwd, trackPrompt(readState(cwd), input, {
+                status: 'permission_request',
+                toolName,
+                toolInput: summarizeToolInput(toolName, rawToolInput),
+                description: describePermission(toolName, rawToolInput),
+                options: [],
+                observed: true,
+                ...(input.agent_id && { agentId: String(input.agent_id) }),
+                message: `Claude wants to ${toolName.toLowerCase()}`,
+                sessionId,
+                transcriptPath,
+                lastEvent: 'PermissionRequest'
+            }));
+            break;
+        }
+
+        case 'Notification': {
+            const notificationType = pick(input, 'notification_type', 'notificationType') || input.type;
+            const written = await record('Notification');
+
+            if (notificationType === 'idle_prompt' && written) {
+                // Claude is waiting for regular input - perfect time to check messages!
+                // Check for unread messages and meeting inject queue
+                // Grok drops stdout on Notification: draining would lose the queue.
+                const [idleMessagePrompt, meetingContext] = agent === 'grok' ? [null, null] : await withDeadline(Promise.all([
+                    checkUnreadMessages(cwd),
+                    drainMeetingInjectQueue(cwd)
+                ]), INJECT_DEADLINE_MS, [null, null]);
+                const combined = [idleMessagePrompt, meetingContext].filter(Boolean).join('\n\n');
+                if (combined) {
+                    debugLog({ event: 'injecting_context', cwd, agent, trigger: 'idle_prompt', hasInbox: !!idleMessagePrompt, hasMeeting: !!meetingContext });
+                    hookResponse = buildContextResponse(agent, rawEvent, combined);
+                }
+            } else if (!written) {
+                debugLog({ event: 'notification_skipped', notificationType });
+            }
+            break;
+        }
+
+        case 'Stop': {
+            // The reliable AMP delivery slot. Injecting context on idle_prompt /
+            // UserPromptSubmit cannot start a turn on an already-idle agent — the
+            // failure that forced operators to manually type "check your inbox".
+            // Returning { decision: "block", reason } forces the agent to read +
+            // respond before it goes idle. Loop-safe: honor stop_hook_active
+            // (never block twice in a row) and dedup on message IDs.
+            let blocked = false;
+            // Grok also fires Stop with reason "shutdown" as the session closes;
+            // a block there would be lost, so don't consume messages for it.
+            if (supportsStopBlock(agent) && !isStopHookActive(input) && input.reason !== 'shutdown') {
+                try {
+                    const unread = await fetchUnreadMessages(cwd);
+                    const alreadyIds = loadNotifiedIds(cwd);
+                    const decision = decideStopDelivery({
+                        agent,
+                        stopHookActive: isStopHookActive(input),
+                        messages: unread ? unread.messages : [],
+                        alreadyIds,
+                    });
+                    if (decision.block) {
+                        saveNotifiedIds(cwd, [...alreadyIds, ...decision.freshIds]);
+                        debugLog({ event: 'stop_block_delivery', cwd, count: decision.freshIds.length });
+                        hookResponse = decision.response;
+                        blocked = true;
+                    }
+                } catch (err) {
+                    debugLog({ event: 'stop_block_check_failed', error: err.message });
+                }
+            }
+            // MUST be awaited: process.exit(0) at the end of run() kills any
+            // in-flight fetch. Measured on a customer estate 10-14 Sep 2026,
+            // 0 of 56 Stop broadcasts reached the server without this.
+            await record('Stop', { blocked });
+            break;
+        }
+
+        case 'StopFailure':
+        case 'StopCancelled':
+        case 'SessionEnd':
+            // The turn (or session) ended without a Stop: an API error, an interrupt
+            // (Grok), a kill or a quit. Nothing else would ever clear 'active'.
+            await record(hookEvent);
+            break;
+
+        case 'SessionStart':
+            // Session started - record the session info.
+            // A fresh session sits at an empty prompt, so it is idle: 'active' here
+            // is never cleared until the first Stop, and the wake queue then defers
+            // every message for HOOK_STATUS_TTL_MS (15 min). UserPromptSubmit reports
+            // 'active' as soon as a turn starts. See sessionStartStatus.
+            await record('SessionStart');
+
+            pruneChatState(path.join(os.homedir(), '.aimaestro', 'chat-state'));
+
+            // Check for unread messages and meeting inject queue
+            // ...and the agent's standing decisions/preferences from long-term memory.
+            // Each part has its own deadline so a slow recall never costs the inbox.
+            // Grok ignores SessionStart stdout, so skip (draining would lose it).
+            const noInject = agent === 'grok';
+            const [startMessagePrompt, startMeetingContext, startMemory] = noInject ? [null, null, null] : await Promise.all([
+                withDeadline(checkUnreadMessages(cwd), INJECT_DEADLINE_MS, null),
+                withDeadline(drainMeetingInjectQueue(cwd), INJECT_DEADLINE_MS, null),
+                withDeadline(recallMemories(cwd, sessionId, null), INJECT_DEADLINE_MS, null)
+            ]);
+            const startCombined = [startMessagePrompt, startMeetingContext, startMemory].filter(Boolean).join('\n\n');
+            if (startCombined) {
+                debugLog({ event: 'injecting_context', cwd, agent, trigger: 'session_start', hasInbox: !!startMessagePrompt, hasMeeting: !!startMeetingContext, hasMemory: !!startMemory });
+                hookResponse = buildContextResponse(agent, rawEvent, startCombined);
+            }
+            if (agent === 'claude') {
+                const notice = unlinkedNotice(cwd, await fetchAgentsOnce().catch(() => null));
+                if (notice) {
+                    debugLog({ event: 'unlinked_session', cwd });
+                    // systemMessage is shown to the person; the model gets the same line so it can explain
+                    hookResponse = { ...(hookResponse || buildContextResponse(agent, rawEvent, notice)), systemMessage: notice };
+                }
+            }
+            break;
+
+        case 'UserPromptSubmit': {
+            // The only event that means "a turn just STARTED".
+            //
+            // Without this the dashboard could never show an agent as working:
+            // SessionStart fires once per session, Stop reports idle at the end,
+            // and nothing in between said the agent was busy. An agent that took
+            // a twelve-minute turn stayed 'idle' throughout.
+            await record('UserPromptSubmit');
+
+            // Drain on every user prompt — this is the reliable delivery slot
+            // for Claude Code. SessionStart can be preempted by other plugins'
+            // hooks; UserPromptSubmit fires once per user turn and is rarely contended.
+            //
+            // Memory recall runs alongside: the long-term memories nearest to what
+            // the user just asked, so the agent sees past decisions before it
+            // starts reading files.
+            // Grok discards an allowing UserPromptSubmit hook's output: skip.
+            const [upsInbox, upsMeeting, upsMemory] = agent === 'grok' || isDeviceTurn(input.prompt) ? [null, null, null] : await Promise.all([
+                withDeadline(checkUnreadMessages(cwd, input.prompt), INJECT_DEADLINE_MS, null),
+                withDeadline(drainMeetingInjectQueue(cwd), INJECT_DEADLINE_MS, null),
+                input.prompt ? withDeadline(recallMemories(cwd, sessionId, input.prompt), INJECT_DEADLINE_MS, null) : null
+            ]);
+            const upsContext = [upsMeeting, upsInbox, upsMemory].filter(Boolean).join('\n\n');
+            if (upsContext) {
+                debugLog({ event: 'injecting_context', cwd, agent, trigger: 'user_prompt_submit', hasInbox: !!upsInbox, hasMeeting: !!upsMeeting, hasMemory: !!upsMemory });
+                hookResponse = buildContextResponse(agent, rawEvent, upsContext);
+            }
+            break;
+        }
+
+        default:
+            // Unknown event - just log it
+            if (process.env.DEBUG) {
+                console.error(`[ai-maestro-hook] Unknown event: ${hookEvent}`);
+            }
+    }
+
+    return hookResponse;
+}
+
+// Only run when invoked directly (node ai-maestro-hook.cjs). When require()'d
+// by the test suite, export the pure decision helpers instead of executing.
+if (require.main === module) {
+    main().catch(err => {
+        console.error('[ai-maestro-hook] Error:', err);
+        process.exit(0); // Don't block Claude
+    });
+}
+
+module.exports = {
+    aimBase,
+    carriesMessageNotice,
+    isDeviceTurn,
+    buildHookStateData,
+    resolveAgent,
+    agentsForCwd,
+    unlinkedNotice,
+    summarizeToolInput,
+    describePermission,
+    rotateDebugLog,
+    debugLog,
+    pruneChatState,
+    logRecall,
+    clipForLog,
+    sessionStartStatus,
+    readLocalRegistry,
+    buildMemoryNotice,
+    buildEntityNotice,
+    selectFreshMemories,
+    buildAmpBlockReason,
+    filterFreshMessages,
+    decideStopDelivery,
+    formatMessageSender,
+    decideInboxAnnouncement,
+    carriedByPrompt,
+    messageRefOf,
+    buildInboxNotice,
+    pruneAnnounced,
+    ampMessageId,
+    detectAgent,
+    isStopHookActive,
+    buildContextResponse,
+    reduceState,
+    handleEvent,
+};

@@ -1,0 +1,1069 @@
+'use client'
+
+import { useSessionActivity } from '@/hooks/useSessionActivity'
+import { avatarStateForPresence } from './LiveAvatar'
+import AgentHeaderBar from './AgentHeaderBar'
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
+import { useTerminal } from '@/hooks/useTerminal'
+import { useWebSocket } from '@/hooks/useWebSocket'
+import { createResizeMessage } from '@/lib/websocket'
+import { isTouchOnTerminal } from '@/lib/terminal-touch'
+import { useTerminalRegistry } from '@/contexts/TerminalContext'
+import { useDeviceType } from '@/hooks/useDeviceType'
+import MobileKeyToolbar from './MobileKeyToolbar'
+import type { Session } from '@/types/session'
+import { useToast } from '@/contexts/ToastContext'
+
+// PERFORMANCE: Hoist static JSX to avoid recreation on every render
+const LoadingSpinner = (
+  <div className="absolute inset-0 flex items-center justify-center bg-terminal-bg">
+    <div className="text-center">
+      {/* Wrap in div for hardware-accelerated animation */}
+      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-400 mx-auto mb-2" />
+      <p className="text-sm text-gray-400">Initializing terminal...</p>
+    </div>
+  </div>
+)
+
+interface TerminalViewProps {
+  session: Session
+  isVisible?: boolean
+  hideFooter?: boolean  // Hide notes/prompt footer (used in MobileDashboard)
+  hideHeader?: boolean  // Hide terminal header (used in MobileDashboard)
+  /** The agent's avatar and API base, for the live face in the header */
+  avatar?: { src?: string | null; hostUrl?: string }
+  onConnectionStatusChange?: (isConnected: boolean) => void  // Callback for connection status changes
+}
+
+export default function TerminalView({ session, isVisible: _isVisible = true, hideFooter = false, hideHeader = false, onConnectionStatusChange, avatar }: TerminalViewProps) {
+  const { presenceOf, snapshotOf } = useSessionActivity()
+  const { addToast } = useToast()
+  const [isDraggingFile, setIsDraggingFile] = useState(false)
+  const [isUploading, setIsUploading] = useState(false)
+
+  /**
+   * Hand files to the agent (#270).
+   *
+   * The bytes go to the server, which writes them to disk on the agent's own
+   * host and tells the agent the path — agent CLIs read files from disk, and
+   * pushing a megabyte of base64 through a TUI keystroke-batch would be both
+   * enormous and mangled.
+   */
+  const uploadFiles = useCallback(async (files: File[]) => {
+    if (files.length === 0) return
+    const agentId = session.agentId
+    if (!agentId) {
+      addToast({ type: 'error', title: 'Cannot attach files', message: 'This session has no registered agent.' })
+      return
+    }
+
+    setIsUploading(true)
+    try {
+      const form = new FormData()
+      // A pasted screenshot has no name. The server generates one from the MIME
+      // type rather than inventing a uuid, because the agent quotes the path
+      // back to a human.
+      for (const f of files) form.append('files', f, f.name || '')
+
+      const res = await fetch(`/api/agents/${agentId}/files`, { method: 'POST', body: form })
+      const data = await res.json().catch(() => ({}))
+
+      if (!res.ok) {
+        addToast({
+          type: 'error',
+          title: 'Could not attach the file',
+          message: data?.message || `Upload failed (${res.status})`,
+        })
+        return
+      }
+
+      // Saved and announced are separate outcomes: the file can land safely
+      // while the agent cannot be told (no session, or a program that never
+      // started). Reporting that as plain success would be a claim we have not
+      // earned.
+      if (data?.announced === false) {
+        addToast({
+          type: 'warning',
+          title: 'File saved, but the agent was not told',
+          message: `${data.announceError || 'The agent could not be reached.'} The file is at ${data.files?.[0]?.path ?? 'the upload directory'}.`,
+          duration: 15000,
+        })
+        return
+      }
+
+      const n = data?.files?.length ?? files.length
+      addToast({
+        type: 'success',
+        title: n === 1 ? 'File sent to the agent' : `${n} files sent to the agent`,
+        message: data?.files?.[0]?.path || '',
+      })
+    } catch (err) {
+      addToast({
+        type: 'error',
+        title: 'Could not attach the file',
+        message: err instanceof Error ? err.message : 'Unknown error',
+      })
+    } finally {
+      setIsUploading(false)
+    }
+  }, [session.agentId, addToast])
+  const terminalRef = useRef<HTMLDivElement>(null)
+  const [isReady, setIsReady] = useState(false)
+  const messageBufferRef = useRef<string[]>([])
+  const historyCompleteRef = useRef(false)
+  const lastSentSizeRef = useRef<{ cols: number; rows: number } | null>(null)
+  const [notes, setNotes] = useState('')
+  const [promptDraft, setPromptDraft] = useState('')
+  const { isTouch } = useDeviceType()
+  const isMobile = isTouch // backward compat for touch scroll handler
+  const [copyFeedback, setCopyFeedback] = useState(false)
+  const [pasteFeedback, setPasteFeedback] = useState(false)
+  const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+
+  // Agent-centric storage: Use agentId as primary key (falls back to session.id for backward compatibility)
+  const storageId = session.agentId || session.id
+
+  // CRITICAL: Initialize notesCollapsed from localStorage SYNCHRONOUSLY during render
+  // This ensures the terminal container has the correct height BEFORE xterm.js initializes
+  const [notesCollapsed, setNotesCollapsed] = useState(() => {
+    if (typeof window === 'undefined') return false
+    const mobile = window.innerWidth < 768
+    const collapsedKey = `agent-notes-collapsed-${session.agentId || session.id}`
+    const savedCollapsed = localStorage.getItem(collapsedKey)
+    if (savedCollapsed !== null) {
+      return savedCollapsed === 'true'
+    }
+    return mobile // Default to collapsed on mobile, expanded on desktop
+  })
+
+  const FOOTER_TAB_STORAGE_KEY = 'terminal-footer-tab'
+
+  const [footerTab, setFooterTab] = useState<'notes' | 'prompt'>(() => {
+    if (typeof window === 'undefined') return 'prompt'
+    const stored = localStorage.getItem(FOOTER_TAB_STORAGE_KEY)
+    return stored === 'notes' ? 'notes' : 'prompt'
+  })
+
+  const [loggingEnabled, setLoggingEnabled] = useState(() => {
+    if (typeof window === 'undefined') return true
+    const loggingKey = `agent-logging-${session.agentId || session.id}`
+    const savedLogging = localStorage.getItem(loggingKey)
+    return savedLogging !== null ? savedLogging === 'true' : true
+  })
+
+  const [globalLoggingEnabled, setGlobalLoggingEnabled] = useState(false)
+
+  // Copy-on-select: opt-in (global setting). useTerminal reads the same
+  // localStorage key on each selection, so no re-init is needed on toggle.
+  // Copy-on-select is a preference now: Settings → Terminal (useTerminal reads it)
+
+  // Copy/paste handlers defined after useTerminal below
+
+  // Fetch global logging configuration on mount
+  useEffect(() => {
+    fetch('/api/config')
+      .then(res => res.json())
+      .then(data => setGlobalLoggingEnabled(data.loggingEnabled))
+      .catch(err => console.error('Failed to fetch config:', err))
+  }, [])
+
+  const { registerTerminal, unregisterTerminal, reportActivity } = useTerminalRegistry()
+
+  const { terminal, initializeTerminal, fitTerminal, setSendData } = useTerminal({
+    sessionId: session.id,
+    disableWebGL: isTouch,  // MOBILE FIX: WebGL context loss on backgrounding causes blank terminals
+    onRegister: (fitAddon) => {
+      // Register terminal when it's fully initialized
+      registerTerminal(session.id, fitAddon)
+    },
+    onUnregister: () => {
+      // Unregister when terminal is disposed
+      unregisterTerminal(session.id)
+    },
+  })
+
+  // Store terminal in a ref so the WebSocket callback can access the current value
+  const terminalInstanceRef = useRef<typeof terminal>(null)
+  const hasConnectedOnceRef = useRef(false)
+
+  useEffect(() => {
+    terminalInstanceRef.current = terminal
+  }, [terminal])
+
+  const focusTerminal = useCallback(() => {
+    const term = terminalInstanceRef.current
+    if (!term) return
+    try {
+      term.focus()
+    } catch {}
+  }, [])
+
+  // Copy terminal content to clipboard (touch devices)
+  const handleTerminalCopy = useCallback(async () => {
+    if (!terminal) return
+    try {
+      // First copy selection if any
+      const selection = terminal.getSelection()
+      if (selection) {
+        await navigator.clipboard.writeText(selection)
+        setCopyFeedback(true)
+        setTimeout(() => setCopyFeedback(false), 1500)
+        return
+      }
+      // Otherwise copy visible screen
+      const buffer = terminal.buffer.active
+      const lines: string[] = []
+      const start = buffer.viewportY
+      for (let i = start; i < start + terminal.rows; i++) {
+        const line = buffer.getLine(i)
+        if (line) lines.push(line.translateToString(true))
+      }
+      while (lines.length > 0 && !lines[lines.length - 1].trim()) lines.pop()
+      await navigator.clipboard.writeText(lines.join('\n'))
+      setCopyFeedback(true)
+      setTimeout(() => setCopyFeedback(false), 1500)
+    } catch {
+      // execCommand fallback
+      const buffer = terminal.buffer.active
+      const lines: string[] = []
+      for (let i = Math.max(0, buffer.length - terminal.rows); i < buffer.length; i++) {
+        const line = buffer.getLine(i)
+        if (line) lines.push(line.translateToString(true))
+      }
+      const ta = document.createElement('textarea')
+      ta.value = lines.join('\n')
+      ta.style.cssText = 'position:fixed;opacity:0'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+      setCopyFeedback(true)
+      setTimeout(() => setCopyFeedback(false), 1500)
+    }
+  }, [terminal])
+
+  // Paste from clipboard into terminal (touch devices)
+  const handleTerminalPaste = useCallback(async () => {
+    if (!terminal) return
+    try {
+      const text = await navigator.clipboard.readText()
+      if (text) {
+        terminal.paste(text)
+        setPasteFeedback(true)
+        setTimeout(() => setPasteFeedback(false), 1500)
+      }
+    } catch {
+      // Clipboard API denied - show temporary paste input
+      const input = document.createElement('textarea')
+      input.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:9999;width:280px;height:80px;padding:12px;border-radius:12px;border:1px solid #4B5563;background:#1F2937;color:#E5E7EB;font-size:14px'
+      input.placeholder = 'Paste here, then tap outside...'
+      document.body.appendChild(input)
+      input.focus()
+      input.addEventListener('blur', () => {
+        const val = input.value
+        if (val && terminal) {
+          terminal.paste(val)
+          setPasteFeedback(true)
+          setTimeout(() => setPasteFeedback(false), 1500)
+        }
+        document.body.removeChild(input)
+      }, { once: true })
+    }
+  }, [terminal])
+
+  const { isConnected, sendMessage, connectionError, errorHint, connectionMessage } = useWebSocket({
+    sessionId: session.id,
+    hostId: session.hostId,  // Pass host ID for remote session routing
+    socketPath: session.socketPath,  // Custom tmux socket (e.g., OpenClaw agents)
+    initialCols: terminal?.cols,   // Pass actual terminal dimensions so PTY spawns at correct size
+    initialRows: terminal?.rows,
+    autoConnect: isReady,  // Connect once terminal is ready — stay connected across tab switches
+    onOpen: () => {
+      reportActivity(session.id)
+      onConnectionStatusChange?.(true)
+      // Reset history gate — server will send history then history-complete
+      historyCompleteRef.current = false
+      lastSentSizeRef.current = null
+      // On reconnect, clear the terminal before fresh history arrives.
+      // Without this, the 5000-line history dump from the server is appended
+      // to existing content, causing visible duplication every reconnect cycle.
+      if (hasConnectedOnceRef.current) {
+        const term = terminalInstanceRef.current
+        if (term) {
+          term.clear()
+        }
+      }
+      hasConnectedOnceRef.current = true
+    },
+    onClose: () => {
+      // Notify parent of connection status change
+      onConnectionStatusChange?.(false)
+    },
+    onMessage: (data) => {
+      // Check if this is a control message (JSON)
+      try {
+        const parsed = JSON.parse(data)
+
+        // Handle history-complete message
+        if (parsed.type === 'history-complete') {
+          try {
+            const term = terminalInstanceRef.current
+            if (term) {
+              term.scrollToBottom()
+              term.focus()
+            }
+          } catch {
+            // Renderer not ready
+          }
+          // Unlock resize forwarding — from now on, only real user-initiated
+          // resizes (browser window drag, notes panel toggle) will be sent.
+          historyCompleteRef.current = true
+          return
+        }
+
+        // Handle container connection message
+        if (parsed.type === 'connected') {
+          console.log(`[CONTAINER] Connected to agent: ${parsed.agentId}`)
+          return
+        }
+
+        // Server capability advertisement — consumed (currently unused; the
+        // tmux copy-mode scroll feature was removed). Drop so it isn't written
+        // to the terminal.
+        if (parsed.type === 'server-caps') {
+          return
+        }
+
+        // Any other JSON with a 'type' field is a protocol message — drop it
+        // so raw JSON like {"type":"ping"} never appears in the terminal
+        if (parsed.type) {
+          return
+        }
+        // JSON without a 'type' field is likely terminal output (e.g., CLI tool
+        // printing JSON) — fall through to write it
+      } catch {
+        // Not JSON - it's terminal data, continue processing
+      }
+
+      // Write data to terminal - keep this simple, no state updates during write
+      // State updates during rapid writes can cause React reconciliation issues
+      if (terminalInstanceRef.current) {
+        terminalInstanceRef.current.write(data)
+      } else {
+        messageBufferRef.current.push(data)
+      }
+    },
+  })
+
+  // Keep the useTerminal sendData ref in sync with the current WebSocket sendMessage function
+  // This allows the Cmd+V paste handler in useTerminal.ts (registered once during init) to always
+  // use the latest WebSocket send function without re-registering the key handler
+  useEffect(() => {
+    if (isConnected) {
+      setSendData(sendMessage)
+    } else {
+      setSendData(null)
+    }
+    return () => setSendData(null)
+  }, [isConnected, sendMessage, setSendData])
+
+  // Initialize terminal ONCE on mount - never re-initialize
+  // Tab-based architecture: terminal stays mounted, just hidden via CSS
+  useEffect(() => {
+    let cleanup: (() => void) | undefined
+    let retryCount = 0
+    const maxRefRetries = 10 // Quick retries for DOM ref only
+    const refRetryDelay = 50 // ms
+    let retryTimer: NodeJS.Timeout | null = null
+    let resizeObserver: ResizeObserver | null = null
+    let mounted = true
+
+    const doInit = async (containerElement: HTMLDivElement) => {
+      if (!mounted) return
+      try {
+        cleanup = await initializeTerminal(containerElement)
+        if (mounted) {
+          setIsReady(true)
+        }
+      } catch (error) {
+        console.error(`[INIT-ERROR] Failed to initialize terminal for session ${session.id}:`, error)
+      }
+    }
+
+    const tryInit = () => {
+      if (!mounted) return
+
+      // Wait for the DOM ref to be ready (quick retries)
+      if (!terminalRef.current) {
+        if (retryCount < maxRefRetries) {
+          retryCount++
+          retryTimer = setTimeout(tryInit, refRetryDelay)
+        }
+        return
+      }
+
+      const containerElement = terminalRef.current
+
+      // Check if container already has dimensions
+      const rect = containerElement.getBoundingClientRect()
+      if (rect.width > 0 && rect.height > 0) {
+        doInit(containerElement)
+        return
+      }
+
+      // Use ResizeObserver to wait for non-zero dimensions (no polling cap)
+      resizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          const { width, height } = entry.contentRect
+          if (width > 0 && height > 0) {
+            resizeObserver?.disconnect()
+            resizeObserver = null
+            doInit(containerElement)
+            return
+          }
+        }
+      })
+      resizeObserver.observe(containerElement)
+    }
+
+    tryInit()
+
+    // Cleanup only on unmount (when tab is removed from DOM)
+    return () => {
+      mounted = false
+      if (retryTimer) {
+        clearTimeout(retryTimer)
+      }
+      if (resizeObserver) {
+        resizeObserver.disconnect()
+      }
+      if (cleanup) {
+        cleanup()
+      }
+      setIsReady(false)
+      messageBufferRef.current = []
+    }
+    // Empty deps = initialize once on mount, cleanup only on unmount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Flush buffered messages when terminal becomes ready
+  useEffect(() => {
+    if (terminal && messageBufferRef.current.length > 0) {
+      messageBufferRef.current.forEach((msg) => {
+        terminal.write(msg)
+      })
+      messageBufferRef.current = []
+    }
+  }, [terminal])
+
+  // WebGL is now loaded inline during initializeTerminal() - no toggle needed.
+  // Only one terminal is mounted at a time, so no GPU context exhaustion concern.
+
+  // Trigger fit when notes collapse/expand or footer tab changes (changes terminal height).
+  // Use a longer delay (300ms) so CSS transitions fully settle before refitting.
+  useEffect(() => {
+    if (isReady && terminal) {
+      const timeout = setTimeout(() => {
+        fitTerminal()
+      }, 300)
+      return () => clearTimeout(timeout)
+    }
+  }, [notesCollapsed, footerTab, isReady, terminal, fitTerminal])
+
+  // Handle terminal input
+  useEffect(() => {
+    if (!terminal || !isConnected) {
+      return
+    }
+
+    const disposable = terminal.onData((data) => {
+      sendMessage(data)
+    })
+
+    return () => {
+      disposable.dispose()
+    }
+  }, [terminal, isConnected, sendMessage])
+
+  // Copy selection to clipboard
+  const copySelection = useCallback(() => {
+    if (!terminal) return
+    const selection = terminal.getSelection()
+    if (selection) {
+      navigator.clipboard.writeText(selection)
+        .then(() => {
+          // Optionally show feedback
+          console.log('[Terminal] Copied selection to clipboard')
+        })
+        .catch(err => console.error('[Terminal] Failed to copy:', err))
+    }
+  }, [terminal])
+
+  // Paste from clipboard (with user gesture - required for mobile).
+  // Routed through terminal.paste() — the single paste path — which normalizes
+  // line endings and applies bracketed paste only when the app enabled it.
+  const pasteFromClipboard = useCallback(async () => {
+    if (!isConnected) return
+
+    try {
+      const text = await navigator.clipboard.readText()
+      const term = terminalInstanceRef.current
+      if (text && term) {
+        term.paste(text)
+        term.focus()
+      }
+    } catch (err) {
+      console.error('[Terminal] Failed to paste:', err)
+      // On mobile, clipboard access might fail - show user-friendly message
+      addToast({
+        type: 'warning',
+        title: 'Clipboard unavailable',
+        message: 'Unable to access clipboard. Try using the Prompt Builder tab to paste text.',
+      })
+    }
+  }, [isConnected, addToast])
+
+  // Handle terminal resize — only forward to server after history is loaded
+  // and only if dimensions actually changed (prevents tmux redraw storms)
+  useEffect(() => {
+    if (!terminal || !isConnected) return
+
+    const disposable = terminal.onResize(({ cols, rows }) => {
+      if (!historyCompleteRef.current) return
+      const last = lastSentSizeRef.current
+      if (last && last.cols === cols && last.rows === rows) return
+      lastSentSizeRef.current = { cols, rows }
+      sendMessage(createResizeMessage(cols, rows))
+    })
+
+    return () => {
+      disposable.dispose()
+    }
+  }, [terminal, isConnected, sendMessage])
+
+  // Mobile touch scroll handler - attach to document to capture all touches
+  useEffect(() => {
+    if (!isMobile || !terminal || !terminalRef.current) return
+
+    let touchStartY = 0
+    let isTouchingTerminal = false
+    const terminalElement = terminalRef.current
+
+    const handleTouchStart = (e: TouchEvent) => {
+      // The touch is the terminal's only if the element it landed on is inside the terminal. A bounding-box
+      // check also matched a hidden terminal (the chat is drawn over the same box), and the preventDefault
+      // below then stopped the chat from scrolling (#556).
+      if (isTouchOnTerminal(terminalElement, e.target)) {
+        isTouchingTerminal = true
+        touchStartY = e.touches[0].clientY
+      }
+    }
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (!isTouchingTerminal) return
+
+      const touchY = e.touches[0].clientY
+      const deltaY = touchStartY - touchY
+      const linesToScroll = Math.round(deltaY / 30) // 30px per line (slower scroll)
+
+      if (Math.abs(linesToScroll) > 0) {
+        // Plain xterm scroll (see the desktop wheel handler note): tmux
+        // copy-mode forwarding was removed — alt-screen panes have no history.
+        terminal.scrollLines(linesToScroll)
+        touchStartY = touchY
+      }
+
+      // CRITICAL: Always prevent default to stop page scroll
+      e.preventDefault()
+      e.stopPropagation()
+    }
+
+    const handleTouchEnd = () => {
+      if (isTouchingTerminal) {
+      }
+      isTouchingTerminal = false
+    }
+
+    // Attach to document with capture phase to intercept before xterm.js
+    document.addEventListener('touchstart', handleTouchStart, { passive: true, capture: true })
+    document.addEventListener('touchmove', handleTouchMove, { passive: false, capture: true })
+    document.addEventListener('touchend', handleTouchEnd, { passive: true, capture: true })
+    document.addEventListener('touchcancel', handleTouchEnd, { passive: true, capture: true })
+
+    return () => {
+      document.removeEventListener('touchstart', handleTouchStart, true)
+      document.removeEventListener('touchmove', handleTouchMove, true)
+      document.removeEventListener('touchend', handleTouchEnd, true)
+      document.removeEventListener('touchcancel', handleTouchEnd, true)
+    }
+  }, [isMobile, terminal, sendMessage])
+
+  // Load notes from localStorage ONCE on mount
+  // Tab-based architecture: notes stay in memory, no need to reload on session switch
+  useEffect(() => {
+    const key = `agent-notes-${storageId}`
+    const savedNotes = localStorage.getItem(key)
+    if (savedNotes !== null) {
+      setNotes(savedNotes)
+    } else {
+      setNotes('')
+    }
+    // Only load once on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    const key = `agent-prompt-${storageId}`
+    const savedPrompt = localStorage.getItem(key)
+    if (savedPrompt !== null) {
+      setPromptDraft(savedPrompt)
+    } else {
+      setPromptDraft('')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Save notes to localStorage when they change
+  useEffect(() => {
+    localStorage.setItem(`agent-notes-${storageId}`, notes)
+  }, [notes, storageId])
+
+  useEffect(() => {
+    localStorage.setItem(`agent-prompt-${storageId}`, promptDraft)
+  }, [promptDraft, storageId])
+
+  useEffect(() => {
+    if (notesCollapsed) return
+    if (footerTab !== 'prompt') return
+    const textarea = promptTextareaRef.current
+    if (!textarea) return
+    const timer = requestAnimationFrame(() => {
+      try {
+        textarea.focus()
+        const end = textarea.value.length
+        textarea.setSelectionRange(end, end)
+      } catch {}
+    })
+    return () => cancelAnimationFrame(timer)
+  }, [footerTab, notesCollapsed])
+
+  // Save collapsed state to localStorage
+  useEffect(() => {
+    localStorage.setItem(`agent-notes-collapsed-${storageId}`, String(notesCollapsed))
+  }, [notesCollapsed, storageId])
+
+  // Save logging state to localStorage
+  useEffect(() => {
+    localStorage.setItem(`agent-logging-${storageId}`, String(loggingEnabled))
+  }, [loggingEnabled, storageId])
+
+  useEffect(() => {
+    localStorage.setItem(FOOTER_TAB_STORAGE_KEY, footerTab)
+  }, [footerTab])
+
+  // Send logging state to server when it changes
+  useEffect(() => {
+    if (!isConnected) return
+
+    // Send logging state through WebSocket
+    const message = JSON.stringify({
+      type: 'set-logging',
+      enabled: loggingEnabled
+    })
+    sendMessage(message)
+  }, [loggingEnabled, isConnected, sendMessage])
+
+  // Toggle logging handler
+  const toggleLogging = () => {
+    setLoggingEnabled(!loggingEnabled)
+  }
+
+  const handlePromptSubmit = useCallback(
+    (mode: 'insert' | 'send') => {
+      if (!promptDraft || promptDraft.trim().length === 0) {
+        return
+      }
+
+      const normalized = promptDraft.replace(/\r\n?/g, '\n')
+      const withoutEscape = normalized.replace(/\u001b/g, '')
+      // Stage via terminal.paste() — the single paste path. It normalizes line
+      // endings and applies bracketed paste only if the app enabled it (manual
+      // ESC[200~ wrapping leaked literal "200~" into non-bracketed programs).
+      const term = terminalInstanceRef.current
+      if (!term || !isConnected) {
+        console.warn('[PromptBuilder] Terminal not connected, cannot stage text')
+        return
+      }
+      term.paste(withoutEscape)
+
+      if (mode === 'send') {
+        const executed = sendMessage('\r')
+        if (!executed) {
+          console.warn('[PromptBuilder] Failed to send Enter via WebSocket')
+          return
+        }
+        setPromptDraft('')
+        focusTerminal()
+      }
+    },
+    [focusTerminal, promptDraft, sendMessage, isConnected]
+  )
+
+  const handlePromptKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+        event.preventDefault()
+        handlePromptSubmit('insert')
+        return
+      }
+
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault()
+        handlePromptSubmit('send')
+      }
+    },
+    [handlePromptSubmit]
+  )
+
+  // The header dot is the agent's presence, the same rule as every other view
+  // (lib/agent-presence.ts); a lost terminal connection is said in words.
+  const presence = presenceOf({ name: session.id, id: session.agentId }, { online: true })
+
+  return (
+    <div className="flex-1 flex flex-col bg-terminal-bg overflow-hidden">
+      {/* Header: which agent, where, and the terminal's tools (shared with the chat tab) */}
+      {!hideHeader && (
+        <AgentHeaderBar
+          hostId={session.hostId}
+          remote={!!avatar?.hostUrl}
+          name={session.name || session.id}
+          workingDirectory={session.workingDirectory}
+          snapshot={snapshotOf({ name: session.id, id: session.agentId })}
+          presence={presence}
+          avatar={avatar && session.agentId ? { agentId: session.agentId, src: avatar.src, hostUrl: avatar.hostUrl, state: avatarStateForPresence(presence) } : undefined}
+          status={isConnected ? undefined : <span className="text-red-400">terminal disconnected</span>}
+          actions={terminal ? (<>
+              {/* Mobile: notes panel */}
+              {!hideFooter && (
+                <button
+                  onClick={() => setNotesCollapsed(!notesCollapsed)}
+                  className="md:hidden px-2 py-1 bg-gray-700 hover:bg-gray-600 text-gray-100 rounded text-xs"
+                  title={notesCollapsed ? 'Show notes' : 'Hide notes'}
+                >
+                  📝
+                </button>
+              )}
+              {/* Only when session logging is enabled for this install; otherwise it was a dead, greyed-out button */}
+              {globalLoggingEnabled && (
+                <button
+                  onClick={toggleLogging}
+                  className={`px-2 py-1 rounded text-xs transition-colors ${loggingEnabled ? 'bg-green-700 hover:bg-green-600 text-white' : 'text-gray-300 hover:bg-gray-700'}`}
+                  title={loggingEnabled ? 'Session logging on. Click to turn off' : 'Session logging off. Click to turn on'}
+                >
+                  {loggingEnabled ? 'Logging' : 'No log'}
+                </button>
+              )}
+              {/* Selecting inside tmux does not always reach the clipboard */}
+              <button
+                onClick={copySelection}
+                className="px-2.5 py-1 bg-gray-700 hover:bg-gray-600 text-gray-100 rounded-md text-xs font-medium"
+                title="Copy the selected text"
+              >
+                Copy
+              </button>
+              {/* ⌘V works on desktop; touch devices have no shortcut */}
+              {isTouch && (
+                <button
+                  onClick={pasteFromClipboard}
+                  className="px-2.5 py-1 bg-gray-700 hover:bg-gray-600 text-gray-100 rounded-md text-xs font-medium"
+                  title="Paste from the clipboard"
+                >
+                  Paste
+                </button>
+              )}
+              <button
+                onClick={() => terminal.clear()}
+                className="px-2 py-1 text-gray-400 hover:text-gray-100 hover:bg-gray-700 rounded-md text-xs"
+                title="Clear this view's scrollback (removes duplicate lines from Claude Code redraws; does not touch the agent or tmux)"
+              >
+                Clear
+              </button>
+            </>) : undefined}
+        />
+      )}
+
+      {/* Connection Status (retry messages for remote connections) */}
+      {connectionMessage && !connectionError && (
+        <div className="px-4 py-2 bg-yellow-900/20 border-b border-yellow-800">
+          <p className="text-sm text-yellow-400">
+            🔄 {connectionMessage}
+          </p>
+        </div>
+      )}
+
+      {/* Connection Error */}
+      {connectionError && (
+        <div className="px-4 py-3 bg-red-900/20 border-b border-red-800">
+          <p className="text-sm text-red-400 mb-2">
+            ⚠️ {connectionError.message}
+          </p>
+          {errorHint && (
+            <div className="mt-2 p-2 bg-gray-800/50 rounded border border-gray-700">
+              <p className="text-xs text-gray-300 font-mono">
+                💡 {errorHint}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Terminal Container */}
+      <div
+        className="flex-1 min-h-0 relative overflow-hidden"
+        style={{
+          // CRITICAL: flex-1 takes remaining space after footer
+          // min-h-0 allows flex item to shrink below content size
+          // overflow-hidden prevents terminal from escaping container bounds
+          flex: '1 1 0%',
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column'
+        }}
+      >
+        <div
+          ref={terminalRef}
+          // Paste and drop files onto the terminal (#270).
+          //
+          // The existing Cmd+V handler in useTerminal reads clipboard TEXT only,
+          // so an image on the clipboard silently produced nothing at all —
+          // which is exactly what this issue reported. Images arrive as files on
+          // the paste event, so they are intercepted here before xterm sees it;
+          // a text paste falls through untouched to the existing handler.
+          onPaste={(e) => {
+            const files = Array.from(e.clipboardData?.files ?? [])
+            if (files.length === 0) return
+            e.preventDefault()
+            e.stopPropagation()
+            void uploadFiles(files)
+          }}
+          onDragOver={(e) => {
+            if (!Array.from(e.dataTransfer.types).includes('Files')) return
+            e.preventDefault()
+            setIsDraggingFile(true)
+          }}
+          onDragLeave={(e) => {
+            // Only when the pointer actually leaves the terminal — dragging over
+            // a child fires dragleave for the child and would flicker the overlay.
+            if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
+            setIsDraggingFile(false)
+          }}
+          onDrop={(e) => {
+            const files = Array.from(e.dataTransfer.files ?? [])
+            setIsDraggingFile(false)
+            if (files.length === 0) return
+            e.preventDefault()
+            void uploadFiles(files)
+          }}
+          style={{
+            // Terminal takes full available space within container
+            flex: '1 1 0%',
+            minHeight: 0,
+            width: '100%',
+            position: 'relative',
+          }}
+        />
+
+        {/* Drop target feedback. Without it, dragging a file over a terminal
+            gives no sign anything will happen. */}
+        {isDraggingFile && (
+          <div className="absolute inset-0 z-30 flex items-center justify-center bg-blue-500/10 border-2 border-dashed border-blue-400/60 rounded-lg pointer-events-none">
+            <div className="px-4 py-2 rounded-lg bg-gray-900/90 text-blue-200 text-sm font-medium">
+              Drop to send to {session.name || session.id}
+            </div>
+          </div>
+        )}
+        {isUploading && (
+          <div className="absolute top-3 right-3 z-30 px-3 py-1.5 rounded-lg bg-gray-900/90 text-gray-200 text-xs font-medium pointer-events-none">
+            Sending file…
+          </div>
+        )}
+        {/* Touch clipboard toolbar - floating bottom-right */}
+        {isTouch && terminal && isReady && (
+          <div className="absolute bottom-3 right-3 z-20 flex gap-1.5">
+            <button
+              onClick={handleTerminalCopy}
+              className={`px-3 py-2 rounded-lg text-xs font-medium backdrop-blur-md transition-all active:scale-95 ${
+                copyFeedback
+                  ? 'bg-green-600/80 text-white'
+                  : 'bg-gray-800/80 text-gray-300 border border-gray-600/50'
+              }`}
+            >
+              {copyFeedback ? '✓ Copied' : '📋 Copy'}
+            </button>
+            <button
+              onClick={handleTerminalPaste}
+              className={`px-3 py-2 rounded-lg text-xs font-medium backdrop-blur-md transition-all active:scale-95 ${
+                pasteFeedback
+                  ? 'bg-green-600/80 text-white'
+                  : 'bg-gray-800/80 text-gray-300 border border-gray-600/50'
+              }`}
+            >
+              {pasteFeedback ? '✓ Pasted' : '📥 Paste'}
+            </button>
+          </div>
+        )}
+        {/* Use hoisted static JSX for loading state */}
+        {!isReady && LoadingSpinner}
+      </div>
+
+      {/* Essential Keys Toolbar for touch devices */}
+      <MobileKeyToolbar
+        visible={isTouch && isConnected && isReady}
+        onSendKey={sendMessage}
+      />
+
+      {/* Notes / Prompt Builder Footer */}
+      {!hideFooter && !notesCollapsed && (
+        <div
+          className="border-t border-gray-700 bg-gray-900 flex flex-col"
+          style={{
+            height: isMobile ? '40vh' : '220px',
+            minHeight: isMobile ? '40vh' : '220px',
+            maxHeight: isMobile ? '40vh' : '220px',
+            flexShrink: 0
+          }}
+        >
+          <div className="px-4 py-2 border-b border-gray-700 bg-gray-800 flex items-center justify-between flex-shrink-0">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setFooterTab('notes')}
+                className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                  footerTab === 'notes'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                }`}
+              >
+                Notes
+              </button>
+              <button
+                onClick={() => setFooterTab('prompt')}
+                className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                  footerTab === 'prompt'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                }`}
+              >
+                Prompt Builder
+              </button>
+            </div>
+            <button
+              onClick={() => setNotesCollapsed(true)}
+              className="text-gray-400 hover:text-gray-200 transition-colors"
+              title="Collapse footer"
+            >
+              <svg
+                className="w-4 h-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M19 9l-7 7-7-7"
+                />
+              </svg>
+            </button>
+          </div>
+          {footerTab === 'notes' ? (
+            <textarea
+              id={`agent-notes-${storageId}`}
+              name={`agentNotes-${storageId}`}
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Take notes while working with your agent..."
+              className="flex-1 px-4 py-3 bg-gray-900 text-gray-200 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset font-mono overflow-y-auto"
+              style={{
+                minHeight: 0,
+                maxHeight: '100%',
+                height: '100%',
+                WebkitOverflowScrolling: 'touch'
+              }}
+            />
+          ) : (
+            <div className="flex-1 flex flex-col">
+              <textarea
+                ref={promptTextareaRef}
+                value={promptDraft}
+                onChange={(e) => setPromptDraft(e.target.value)}
+                onKeyDown={handlePromptKeyDown}
+                placeholder="Compose your prompt here. Enter = send • Ctrl/Cmd+Enter = insert only • Shift+Enter = new line"
+                className="flex-1 px-4 py-3 bg-gray-900 text-gray-200 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-inset font-mono overflow-y-auto"
+                style={{
+                  minHeight: 0,
+                  maxHeight: '100%',
+                  height: '100%',
+                  WebkitOverflowScrolling: 'touch'
+                }}
+              />
+              <div className="px-4 py-2 border-t border-gray-800 bg-gray-800 flex items-center justify-between">
+                <p className="text-xs text-gray-400">
+                  {promptDraft.length} character{promptDraft.length === 1 ? '' : 's'}
+                </p>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setPromptDraft('')}
+                    className="rounded-md border border-gray-700 px-3 py-1.5 text-xs text-gray-300 hover:border-gray-600"
+                  >
+                    Clear
+                  </button>
+                  <button
+                    onClick={() => handlePromptSubmit('insert')}
+                    className="rounded-md border border-blue-500 px-3 py-1.5 text-xs font-medium text-blue-300 hover:bg-blue-500/10 disabled:opacity-50"
+                    disabled={promptDraft.trim().length === 0}
+                  >
+                    Insert Only
+                  </button>
+                  <button
+                    onClick={() => handlePromptSubmit('send')}
+                    className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+                    disabled={promptDraft.trim().length === 0}
+                  >
+                    Send
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {!hideFooter && notesCollapsed && (
+        <div
+          onClick={() => setNotesCollapsed(false)}
+          className="border-t border-gray-700 bg-gray-800 px-4 py-2 cursor-pointer hover:bg-gray-750 transition-colors flex items-center gap-2"
+          title="Click to expand footer"
+        >
+          <svg
+            className="w-4 h-4 text-gray-400"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M5 15l7-7 7 7"
+            />
+          </svg>
+          <span className="text-sm text-gray-400">
+            {footerTab === 'prompt' ? 'Show Prompt Builder' : 'Show Agent Notes'}
+          </span>
+        </div>
+      )}
+    </div>
+  )
+}

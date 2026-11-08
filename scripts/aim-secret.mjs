@@ -1,0 +1,133 @@
+#!/usr/bin/env node
+// aim-secret: store credentials locally and let agents use them without seeing them (F033).
+import {
+  VaultError, backendKind, backendSource, deleteSecret, execWithSecrets, hasSecret, listSecretNames, setSavedBackend, setSecret, doctorVault,
+} from '../lib/secret-vault.mjs'
+import { requestSecret } from '../lib/secret-request-client.mjs'
+
+const USAGE = `aim-secret - local secret vault. Agents use secrets; they never read them.
+
+  aim-secret set NAME            store a secret (typed at a hidden prompt, or piped with --stdin)
+  aim-secret list [--json]       names only
+  aim-secret has NAME            exit 0 if set, 1 if not
+  aim-secret delete NAME
+  aim-secret request NAME [--note TEXT]
+                                 (for agents) ask the user to store NAME; they type it into a card in
+                                 the AI Maestro chat, never into this command
+  aim-secret status              which store is in use, and why
+  aim-secret doctor              test that this machine can save a secret, and say what is wrong if it cannot
+  aim-secret backend NAME        keychain | libsecret | file | auto: remember the store for this machine
+                                 (use file on a headless server with no keyring)
+  aim-secret exec --use NAME [--use ENV=NAME ...] -- COMMAND [ARGS...]
+                                 run COMMAND with the secret in its environment; its output is
+                                 scrubbed before you see it
+
+Never pass a secret as an argument: it would show up in process listings and shell history.`
+
+function die(msg, code = 1) {
+  process.stderr.write(`aim-secret: ${msg}\n`)
+  process.exit(code)
+}
+
+async function readStdinAll() {
+  const chunks = []
+  for await (const c of process.stdin) chunks.push(c)
+  return Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, '')
+}
+
+function promptHidden(label) {
+  return new Promise((resolve, reject) => {
+    const stdin = process.stdin
+    process.stderr.write(label)
+    stdin.setRawMode(true)
+    stdin.resume()
+    stdin.setEncoding('utf8')
+    let value = ''
+    const onData = (ch) => {
+      for (const c of ch) {
+        if (c === '\r' || c === '\n' || c === '\u0004') {
+          stdin.setRawMode(false)
+          stdin.pause()
+          stdin.off('data', onData)
+          process.stderr.write('\n')
+          return resolve(value)
+        }
+        if (c === '\u0003') {
+          stdin.setRawMode(false)
+          process.stderr.write('\n')
+          return reject(new VaultError('cancelled', 130))
+        }
+        if (c === '\u007f' || c === '\b') value = value.slice(0, -1)
+        else value += c
+      }
+    }
+    stdin.on('data', onData)
+  })
+}
+
+async function main(argv) {
+  const [cmd, ...rest] = argv
+  if (!cmd || cmd === '-h' || cmd === '--help' || cmd === 'help') return console.log(USAGE)
+
+  if (cmd === 'set') {
+    const flags = rest.filter((a) => a.startsWith('--'))
+    const pos = rest.filter((a) => !a.startsWith('--'))
+    if (pos.length > 1) die('a secret value must not be given as an argument. Use the hidden prompt, or pipe it in with --stdin.', 2)
+    if (!pos[0]) die('usage: aim-secret set NAME [--stdin]', 2)
+    const useStdin = flags.includes('--stdin') || !process.stdin.isTTY
+    const value = useStdin ? await readStdinAll() : await promptHidden(`Value for ${pos[0]} (hidden): `)
+    await setSecret(pos[0], value)
+    return console.log(`stored ${pos[0]}`)
+  }
+  if (cmd === 'list') {
+    const names = listSecretNames()
+    return console.log(rest.includes('--json') ? JSON.stringify(names) : names.join('\n'))
+  }
+  if (cmd === 'has') {
+    if (!rest[0]) die('usage: aim-secret has NAME', 2)
+    return process.exit((await hasSecret(rest[0])) ? 0 : 1)
+  }
+  if (cmd === 'delete') {
+    if (!rest[0]) die('usage: aim-secret delete NAME', 2)
+    await deleteSecret(rest[0])
+    return console.log(`deleted ${rest[0]}`)
+  }
+  if (cmd === 'request') {
+    const i = rest.indexOf('--note')
+    const note = i >= 0 ? rest[i + 1] : undefined
+    const name = rest.find((a, k) => !a.startsWith('--') && (i < 0 || k !== i + 1))
+    if (!name) die('usage: aim-secret request NAME [--note TEXT]', 2)
+    const r = await requestSecret(name, note)
+    ;(r.code === 0 ? console.log : (m) => process.stderr.write(m + '\n'))(r.text)
+    return process.exit(r.code)
+  }
+  if (cmd === 'status') return console.log(`backend: ${backendKind()} (${backendSource()})`)
+  if (cmd === 'doctor') {
+    const r = await doctorVault()
+    if (r.ok) return console.log(`ok: ${r.backend} can save and read a secret on this machine`)
+    console.error(`problem: ${r.backend} cannot save a secret here\n${r.problem}\n${r.help}`)
+    process.exit(1)
+  }
+  if (cmd === 'backend') {
+    if (!rest[0]) die('usage: aim-secret backend keychain|libsecret|file|auto', 2)
+    setSavedBackend(rest[0])
+    return console.log(rest[0] === 'auto' ? 'backend: automatic' : `backend set to ${rest[0]}`)
+  }
+
+  if (cmd === 'exec') {
+    const sep = rest.indexOf('--')
+    if (sep === -1 || sep === rest.length - 1) die('usage: aim-secret exec --use NAME -- COMMAND [ARGS...]', 2)
+    const opts = rest.slice(0, sep)
+    const uses = []
+    for (let i = 0; i < opts.length; i++) {
+      if (opts[i] === '--use' && opts[i + 1]) uses.push(opts[++i])
+      else die(`unexpected option "${opts[i]}"`, 2)
+    }
+    if (!uses.length) die('exec needs at least one --use NAME', 2)
+    const [command, ...args] = rest.slice(sep + 1)
+    return process.exit(await execWithSecrets({ uses, command, args }))
+  }
+  die(`unknown command "${cmd}". Run aim-secret --help`, 2)
+}
+
+main(process.argv.slice(2)).catch((e) => die(e.message, e instanceof VaultError ? e.code : 1))

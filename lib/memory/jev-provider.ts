@@ -1,0 +1,553 @@
+/**
+ * Jev classifier provider (TypeSafe System One model, or any compatible API)
+ *
+ * Jev does not generate text. Instead of extracting memories, it classifies
+ * passages of each exchange (the user's turn, each paragraph of the reply),
+ * judged in the context of the user's request: is it worth remembering, which
+ * memory category, how important. Passages that pass are stored verbatim —
+ * no LLM rewrite.
+ *
+ * API: POST {url}/v1/systemone  { model, state, questions } → { answers }
+ */
+
+import type { MemoryCategory } from '../cozo-schema-memory'
+import type { ConversationMessage } from './types'
+import type { ClassifierSettings } from './settings'
+import { redactSecrets } from './redact'
+import { STATED_PREDICATES, type RelationPredicate } from './relations'
+
+export const MEMORY_QUESTIONS = {
+  durable: {
+    type: 'noul',
+    instructions: 'Would an engineer working on this project in a future session benefit from remembering this passage?',
+    criteria: {
+      true: 'Contains a lasting decision, fact, preference, pattern, insight or rationale about the project, codebase, user or workflow',
+      false: 'Transient: status chatter, tool output, one-off debugging steps, pleasantries, or nothing reusable',
+    },
+  },
+  category: {
+    type: 'choice',
+    instructions: 'What kind of memory is this passage primarily?',
+    criteria: {
+      fact: 'A stable fact about the project, system, environment or people',
+      decision: 'A choice that was made, with or without its rationale',
+      preference: 'How the user likes things done',
+      pattern: 'A recurring approach, convention or gotcha',
+      insight: 'A lesson learned or non-obvious understanding',
+      reasoning: 'The rationale or trade-off analysis behind something',
+      none: 'Nothing worth remembering',
+    },
+  },
+  importance: {
+    type: 'score',
+    instructions: 'How important is this to remember for future work?',
+    criteria: ['Irrelevant', 'Minor', 'Useful', 'Important', 'Critical'],
+  },
+} as const
+
+/**
+ * Asked only of a user turn that follows something the agent said. A
+ * correction ("no, that bucket is production", "stop using X, we moved to Y")
+ * is the rarest and most valuable thing to remember: the agent was wrong, and
+ * the user said what is right. Measured on real sessions, see
+ * MIN_CORRECTION below.
+ */
+export const CORRECTION_QUESTION = {
+  correction: {
+    type: 'noul',
+    instructions: 'In the PASSAGE TO JUDGE, is the user correcting the assistant: saying that something the assistant did, said, assumed or proposed was wrong, or telling it to do it differently?',
+    criteria: {
+      true: 'The user corrects or redirects the assistant (wrong assumption, wrong approach, wrong fact, do it this way instead, stop doing that)',
+      false: 'A new request, approval, question, thanks, or information that does not correct the assistant',
+    },
+  },
+} as const
+
+/**
+ * P(correction) at or above this makes a user turn a correction. Measured
+ * 2026-09-23 on 74 real user turns (IaC): 0.9+ were plainly corrections ("so
+ * you are saying we hardcode ALB internals?", "that is not a valid service
+ * name", "the key is inside each API folder"); 0.6-0.75 mixed in harness
+ * notifications and status updates. Corrections must also score durable >= 0.5.
+ */
+export const MIN_CORRECTION = 0.75
+
+export interface ChunkClassification {
+  durable: number
+  category: MemoryCategory | 'none'
+  categoryConfidence: number
+  importance: number
+  /** P(the user is correcting the assistant); only for user turns that follow a reply */
+  correction?: number
+  model: string
+  inputTokens: number
+}
+
+/** One verbatim passage: what gets stored, and what the classifier sees. */
+export interface Passage {
+  /** Stored as the memory, word for word */
+  text: string
+  /** The passage framed with the request it belongs to, sent to the classifier */
+  state: string
+  /** A user turn following something the agent said: asked whether it corrects the agent */
+  canCorrect?: boolean
+}
+
+export interface ConversationChunk {
+  /** Index of the exchange's first message (the user turn) */
+  startIndex: number
+  /** Index into the conversation's message array just past this exchange */
+  endIndex: number
+  /** The whole exchange, redacted: kept as the memory's source and given to the summarizer */
+  exchange: string
+  /** Classifiable passages of the exchange (may be empty) */
+  passages: Passage[]
+  timestamp?: number
+}
+
+/** Fatal errors abort the whole run (bad key, bad URL); others are per-chunk. */
+export class ClassifierError extends Error {
+  /**
+   * fatal: bad key or URL, stop the run.
+   * blocked: the API refused this content (a firewall in front of Jev answers
+   * 403 to text that looks like SQL injection or path traversal); skip this
+   * one passage rather than stalling its whole conversation.
+   */
+  constructor(message: string, public fatal: boolean, public blocked = false) { super(message) }
+}
+
+/**
+ * The same text with attack-looking sequences made inert for a firewall, used
+ * only for the copy sent to the classifier (what is stored stays original).
+ * Measured 2026-09-23: "' OR 1=1; DROP TABLE" and "../../etc/passwd" got a
+ * permanent 403; shell injection and <script> passed.
+ */
+export function defang(text: string): string {
+  return text
+    .replace(/'/g, '\u2019')          // ' → ’
+    .replace(/\.\.\//g, '..\u2044')   // ../ → ..⁄
+    .replace(/\.\.\\/g, '..\u2044')  // ..\ → ..⁄
+    .replace(/--/g, '\u2014')         // -- → —
+    .replace(/;/g, '\u037e')          // ; → ;
+}
+
+// ---------------------------------------------------------------------------
+// Chunking
+// ---------------------------------------------------------------------------
+
+const MAX_PASSAGE_CHARS = 2000
+const MAX_EXCHANGE_CHARS = 12000
+const MAX_CONTEXT_CHARS = 600
+const MIN_USER_PASSAGE_CHARS = 40
+const MIN_ASSISTANT_PASSAGE_CHARS = 120
+/** The agent's reply a user turn answers, shown so a correction can be recognised */
+const MAX_PREVIOUS_REPLY_CHARS = 1500
+
+/**
+ * Harness noise that is not part of what the user or agent said, and secrets,
+ * which must never reach the classifier, the memory store, or a later prompt.
+ */
+function cleanMessage(content: string, knownSecrets?: Set<string>): string {
+  return redactSecrets(content, knownSecrets)
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+    .replace(/<task-notification>[\s\S]*?<\/task-notification>/g, '')
+    .replace(/^Base directory for this skill:[\s\S]*/, '')
+    .replace(/^Caveat: The messages below were generated by the user[^\n]*/, '')
+    .replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/g, '')
+    .replace(/<command-(name|message|args)>[\s\S]*?<\/command-\1>/g, '')
+    .replace(/^\[Request interrupted[^\]]*\]$/gm, '')
+    // Notifications typed into the session by AI Maestro and the harness, not by the user
+    .replace(/^\d*You have a new message from [\s\S]*?(?:inbox[^\n]*|$)/gm, '')
+    // Pane notifications: "[#ref] [MESSAGE] <subject> — from <sender> — <body>",
+    // and the older "[MESSAGE] From: <sender> - <subject>" format
+    .replace(/^.*\[MESSAGE\] .*$/gm, '')
+    .replace(/^Read the output file to retrieve the result: .*$/gm, '')
+    .replace(/^This session is being continued from a previous conversation[\s\S]*/, '') // compaction summary
+    .trim()
+}
+
+/** Keep the head and the tail; the conclusion of a long reply is usually at the end. */
+function clip(text: string, max: number): string {
+  if (text.length <= max) return text
+  const half = Math.floor(max / 2)
+  return `${text.slice(0, half)}\n[…]\n${text.slice(-half)}`
+}
+
+/**
+ * Break one exchange into passages: the user's turn, and each substantial
+ * paragraph of the reply. Each passage is judged with the user's request as
+ * context, so "yes, do that" and a paragraph that says "decided: X" are both
+ * classifiable on their own, and a stored memory is the sentence that matters
+ * rather than a 4,000-character stretch of transcript.
+ */
+function toPassages(user: string, reply: string, previousReply = ''): Passage[] {
+  const context = `CONTEXT (the user's request this passage belongs to): ${clip(user, MAX_CONTEXT_CHARS)}`
+  const passages: Passage[] = []
+
+  if (user.length >= MIN_USER_PASSAGE_CHARS) {
+    const text = clip(user, MAX_PASSAGE_CHARS)
+    // A user turn is judged against what the agent said just before it: that
+    // is what makes "no, use the other bucket" recognisable as a correction.
+    const before = previousReply
+      ? `WHAT THE ASSISTANT SAID JUST BEFORE: ${clip(previousReply, MAX_PREVIOUS_REPLY_CHARS)}\n\n`
+      : ''
+    passages.push({ text: `USER: ${text}`, state: `${before}PASSAGE TO JUDGE (said by the user): ${text}`, canCorrect: Boolean(previousReply) })
+  }
+
+  const paragraphs = reply
+    .split(/\n{2,}/)
+    .map(p => p.trim())
+    .filter(p => p.length >= MIN_ASSISTANT_PASSAGE_CHARS && !p.startsWith('```'))
+  for (const para of paragraphs) {
+    const text = clip(para, MAX_PASSAGE_CHARS)
+    passages.push({ text, state: `${context}\n\nPASSAGE TO JUDGE (said by the assistant): ${text}` })
+  }
+  return passages
+}
+
+/**
+ * Split messages[startIndex..] into exchanges (a user turn plus every
+ * assistant text until the next user turn), each broken into passages.
+ * A trailing user turn with no reply yet is left for the next run.
+ */
+export function chunkConversation(messages: ConversationMessage[], startIndex: number, knownSecrets?: Set<string>): ConversationChunk[] {
+  const chunks: ConversationChunk[] = []
+  let user: string | null = null
+  let assistant: string[] = []
+  let ts: number | undefined
+  let start = startIndex
+  // The reply before this run's first turn, so a correction at the start of a
+  // run is still judged against what it corrects
+  let previousReply = ''
+  for (let i = startIndex - 1; i >= 0 && i >= startIndex - 20; i--) {
+    if (messages[i].role === 'user') break
+    if (messages[i].role === 'assistant') {
+      const c = cleanMessage(messages[i].content, knownSecrets)
+      if (c) previousReply = previousReply ? `${c}\n\n${previousReply}` : c
+    }
+  }
+
+  const flush = (endIndex: number) => {
+    if (user === null) return
+    const reply = assistant.join('\n\n')
+    chunks.push({
+      startIndex: start,
+      endIndex,
+      exchange: clip(`USER: ${user}\n\nASSISTANT: ${reply}`, MAX_EXCHANGE_CHARS),
+      passages: toPassages(user, reply, previousReply),
+      timestamp: ts,
+    })
+    previousReply = reply
+  }
+
+  for (let i = startIndex; i < messages.length; i++) {
+    const msg = messages[i]
+    const content = cleanMessage(msg.content, knownSecrets)
+    if (msg.role === 'user') {
+      if (!content) continue
+      if (user !== null && assistant.length === 0) {
+        user = `${user}\n\n${content}` // consecutive user messages are one turn
+        continue
+      }
+      flush(i)
+      user = content
+      assistant = []
+      ts = msg.timestamp
+      start = i
+    } else if (msg.role === 'assistant' && content && user !== null) {
+      assistant.push(content)
+    }
+  }
+  // The last exchange may still be in progress; only close it if it has a reply.
+  if (user !== null && assistant.length > 0) flush(messages.length)
+  // No real user turn at all (only harness noise): everything here is consumed.
+  if (user === null && startIndex < messages.length) {
+    chunks.push({ startIndex, endIndex: messages.length, exchange: '', passages: [] })
+  }
+
+  return chunks
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide concurrency limit — every agent's nightly run shares it
+// ---------------------------------------------------------------------------
+
+const MAX_CONCURRENT = 8
+let active = 0
+const waiting: Array<() => void> = []
+
+async function withSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (active >= MAX_CONCURRENT) await new Promise<void>(resolve => waiting.push(resolve))
+  active++
+  try {
+    return await fn()
+  } finally {
+    active--
+    waiting.shift()?.()
+  }
+}
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+// ---------------------------------------------------------------------------
+// Classifier
+// ---------------------------------------------------------------------------
+
+export class JevClassifier {
+  name = 'jev'
+  model: string
+
+  constructor(private settings: ClassifierSettings) {
+    this.model = settings.model
+  }
+
+  private endpoint(): string {
+    return `${this.settings.url.replace(/\/+$/, '')}/v1/systemone`
+  }
+
+  /** One classifier call with any set of typed questions. */
+  async ask(state: string, questions: Record<string, unknown>): Promise<{ answers: Record<string, any>; model: string; inputTokens: number }> {
+    return withSlot(async () => {
+      let lastError = ''
+      let defanged = false
+      let body = JSON.stringify({ model: this.settings.model, state, questions })
+      for (let attempt = 0; attempt < 4; attempt++) {
+        let res: Response
+        try {
+          res = await fetch(this.endpoint(), {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${this.settings.apiKey}`,
+              'Content-Type': 'application/json',
+            },
+            body,
+            signal: AbortSignal.timeout(30_000),
+          })
+        } catch (err) {
+          lastError = `network error: ${(err as Error).message}`
+          await sleep(500 * 2 ** attempt)
+          continue
+        }
+
+        if (res.status === 401) {
+          throw new ClassifierError('Classifier rejected the API key (HTTP 401). Check Settings → Memory.', true)
+        }
+        // 403 came back transiently on 2026-09-23 (02:10, the key worked before
+        // and after) and, treated as a bad key, aborted the agent's whole run.
+        // Retry it like a rate limit; if it persists it surfaces as a per-chunk error.
+        if (res.status === 403) {
+          // Content refused by the firewall: once more with the text defanged,
+          // then give up on this passage only.
+          if (!defanged) {
+            defanged = true
+            body = JSON.stringify({ model: this.settings.model, state: typeof state === 'string' ? defang(state) : state, questions })
+            continue
+          }
+          throw new ClassifierError('Classifier refused this content (HTTP 403, blocked by the API firewall)', false, true)
+        }
+        if (res.status === 429 || res.status >= 500) {
+          lastError = `HTTP ${res.status}`
+          await sleep(1000 * 2 ** attempt)
+          continue
+        }
+        if (res.status === 404) {
+          throw new ClassifierError(`Classifier endpoint not found: ${this.endpoint()} (HTTP 404). Check the URL in Settings → Memory.`, true)
+        }
+        if (!res.ok) {
+          const body = await res.text().catch(() => '')
+          throw new ClassifierError(`Classifier returned HTTP ${res.status}: ${body.slice(0, 200)}`, false)
+        }
+
+        const data = await res.json()
+        return {
+          answers: data?.answers || {},
+          model: String(data?.model || this.settings.model),
+          inputTokens: Number(data?.usage?.input_tokens ?? 0),
+        }
+      }
+      throw new ClassifierError(`Classifier unavailable after retries (${lastError})`, false)
+    })
+  }
+
+  async classify(state: string, opts: { canCorrect?: boolean } = {}): Promise<ChunkClassification> {
+    const questions = opts.canCorrect ? { ...MEMORY_QUESTIONS, ...CORRECTION_QUESTION } : MEMORY_QUESTIONS
+    const { answers: a, model, inputTokens } = await this.ask(state, questions)
+    if (!a.durable || !a.category || !a.importance) {
+      throw new ClassifierError('Classifier response is missing answers', false)
+    }
+    return {
+      durable: Number(a.durable.noul ?? 0),
+      category: a.category.choice as MemoryCategory | 'none',
+      categoryConfidence: Number(a.category.confidence ?? 0),
+      importance: Number(a.importance.score ?? 0),
+      ...(a.correction ? { correction: Number(a.correction.noul ?? 0) } : {}),
+      model,
+      inputTokens,
+    }
+  }
+
+  /** Is this user turn a correction of the agent? */
+  isCorrection(c: ChunkClassification): boolean {
+    return (c.correction ?? 0) >= MIN_CORRECTION
+  }
+
+  /**
+   * Should this classification become a memory candidate? A correction gets in
+   * on a lower bar: being corrected is itself the sign it matters, and a
+   * correction phrased casually ("no, the other one") scores low on
+   * "durable" and "important" on its own.
+   */
+  accepts(c: ChunkClassification): boolean {
+    if (this.isCorrection(c) && c.durable >= 0.5) return true
+    return c.category !== 'none'
+      && c.durable >= this.settings.minDurable
+      && c.importance >= this.settings.minImportance
+  }
+}
+
+export type MemoryRelation = 'supports' | 'contradicts' | 'supersedes' | 'leads_to'
+
+export interface RelationJudgement {
+  /** Index into the candidates passed in */
+  index: number
+  relation: MemoryRelation
+  confidence: number
+}
+
+const MAX_RELATION_CANDIDATES = 6
+const SUPPORTS_MIN_CONFIDENCE = 0.8
+const RELATION_CHARS = 700
+
+/**
+ * How a new memory relates to its nearest existing memories — the edges of
+ * the memory graph. One classifier call for all candidates. 'leads_to' means
+ * the EXISTING memory led to the new one (an earlier step or a cause).
+ */
+export async function classifyRelations(
+  classifier: JevClassifier,
+  newMemory: string,
+  candidates: string[],
+  minConfidence = 0.6
+): Promise<RelationJudgement[]> {
+  const list = candidates.slice(0, MAX_RELATION_CANDIDATES)
+  if (list.length === 0) return []
+
+  const state = [
+    `NEW MEMORY: ${clip(newMemory, RELATION_CHARS)}`,
+    ...list.map((c, i) => `EXISTING MEMORY ${i + 1}: ${clip(c, RELATION_CHARS)}`),
+  ].join('\n\n')
+
+  const questions: Record<string, unknown> = {}
+  list.forEach((_, i) => {
+    questions[`relation_${i + 1}`] = {
+      type: 'choice',
+      instructions: `How does the NEW MEMORY relate to EXISTING MEMORY ${i + 1}?`,
+      criteria: {
+        supports: `The new memory is independent evidence for the SAME claim as existing memory ${i + 1} (it confirms that exact point)`,
+        contradicts: `The new memory conflicts with existing memory ${i + 1}`,
+        supersedes: `The new memory replaces or updates existing memory ${i + 1} (a newer decision or fact on the same point)`,
+        leads_to: `Existing memory ${i + 1} is an earlier step, cause or reason that led to the new memory`,
+        related: `Same topic or system as existing memory ${i + 1}, but neither confirms, contradicts, replaces nor causes the other`,
+        none: 'Different topics',
+      },
+    }
+  })
+
+  const { answers } = await classifier.ask(state, questions)
+  const out: RelationJudgement[] = []
+  list.forEach((_, i) => {
+    const a = answers[`relation_${i + 1}`]
+    // "related" is not an edge: same-topic is what the entity graph already shows.
+    // "supports" was Jev's default for anything on-topic (352 of 382 links on the
+    // first real graph), so it must be confident.
+    if (!a || a.choice === 'none' || a.choice === 'related') return
+    const needed = a.choice === 'supports' ? Math.max(minConfidence, SUPPORTS_MIN_CONFIDENCE) : minConfidence
+    if (Number(a.confidence ?? 0) < needed) return
+    out.push({ index: i, relation: a.choice as MemoryRelation, confidence: Number(a.confidence) })
+  })
+  return out
+}
+
+/** Entity-to-entity verbs, the same vocabulary the summarizer uses. */
+/** Jev picks from the same verbs the summarizer uses */
+export const ENTITY_PREDICATES = STATED_PREDICATES
+
+export interface EntityRelationJudgement {
+  subject: string
+  predicate: RelationPredicate
+  object: string
+  confidence: number
+}
+
+/**
+ * The verbs between a memory's entities, when the summarizer stated none: one
+ * classifier call, one question per ordered pair (at most 6 pairs). Turns
+ * "mentioned together" into "X runs_on Y" where the statement says so.
+ */
+export async function classifyEntityRelations(
+  classifier: JevClassifier,
+  statement: string,
+  entities: string[],
+  minConfidence = 0.7,
+  /** Pairs that already have a relation, as "a|b" with names sorted */
+  alreadyRelated: Set<string> = new Set(),
+  /** The passages the statement came from: they often say more than the one-line card */
+  evidence = ''
+): Promise<EntityRelationJudgement[]> {
+  const names = [...new Set(entities)].slice(0, 4)
+  const pairs: Array<[string, string]> = []
+  for (let i = 0; i < names.length; i++) for (let j = i + 1; j < names.length; j++) {
+    if (!alreadyRelated.has([names[i], names[j]].sort().join('|'))) pairs.push([names[i], names[j]])
+  }
+  if (pairs.length === 0) return []
+  const chosen = pairs.slice(0, 6)
+
+  const questions: Record<string, unknown> = {}
+  chosen.forEach(([a, b], k) => {
+    const criteria: Record<string, string> = { none: `The statement does not say how ${a} and ${b} relate` }
+    for (const p of ENTITY_PREDICATES) {
+      criteria[`${p}`] = `${a} ${p.replace(/_/g, ' ')} ${b}`
+      criteria[`${p}__rev`] = `${b} ${p.replace(/_/g, ' ')} ${a}`
+    }
+    questions[`pair_${k + 1}`] = {
+      type: 'choice',
+      instructions: `According to the STATEMENT${evidence ? ' and its EVIDENCE' : ''}, how does "${a}" relate to "${b}"?`,
+      criteria,
+    }
+  })
+
+  const state = evidence
+    ? `STATEMENT: ${clip(statement, 1000)}\n\nEVIDENCE (where it was said):\n${clip(evidence, 2500)}`
+    : `STATEMENT: ${clip(statement, 1500)}`
+  const { answers } = await classifier.ask(state, questions)
+  const out: EntityRelationJudgement[] = []
+  chosen.forEach(([a, b], k) => {
+    const ans = answers[`pair_${k + 1}`]
+    if (!ans || !ans.choice || ans.choice === 'none') return
+    const confidence = Number(ans.confidence ?? 0)
+    if (confidence < minConfidence) return
+    const reversed = String(ans.choice).endsWith('__rev')
+    const predicate = String(ans.choice).replace(/__rev$/, '') as EntityRelationJudgement['predicate']
+    if (!(ENTITY_PREDICATES as readonly string[]).includes(predicate)) return
+    out.push(reversed ? { subject: b, predicate, object: a, confidence } : { subject: a, predicate, object: b, confidence })
+  })
+  return out
+}
+
+/** One cheap live call, used by Settings → Memory "Test connection". */
+export async function testClassifier(settings: ClassifierSettings): Promise<{ ok: boolean; message: string; latencyMs?: number; model?: string }> {
+  const start = Date.now()
+  try {
+    const c = await new JevClassifier(settings).classify(
+      'CONTEXT (the user\'s request this passage belongs to): testing\n\nPASSAGE TO JUDGE (said by the user): From now on always run the test suite before committing.'
+    )
+    return {
+      ok: true,
+      latencyMs: Date.now() - start,
+      model: c.model,
+      message: `Connected (${c.model}). Sample classified as "${c.category}", durable ${c.durable.toFixed(2)}.`,
+    }
+  } catch (err) {
+    return { ok: false, message: (err as Error).message }
+  }
+}

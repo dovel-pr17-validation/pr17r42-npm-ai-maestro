@@ -1,0 +1,285 @@
+'use client'
+
+import { PRESENCE_STYLE } from '@/lib/agent-presence'
+import { useState, useRef, useEffect } from 'react'
+import { Send, Users, User, X, Loader2, AlertTriangle, Check } from 'lucide-react'
+import type { Agent } from '@/types/agent'
+import { useSessionActivity } from '@/hooks/useSessionActivity'
+import type { MeetingDelivery } from '@/hooks/useMeetingMessages'
+
+interface ChatMessage {
+  id: string
+  from: string
+  fromAlias?: string
+  fromLabel?: string
+  to: string
+  toAlias?: string
+  timestamp: string
+  subject: string
+  preview: string
+  isMine: boolean
+  displayFrom: string
+}
+
+/** What happened to the last message, per agent, with a way to retry the ones that failed */
+export interface MeetingDeliveryProps {
+  lastDelivery: MeetingDelivery | null
+  retryFailed: () => Promise<void>
+  dismissDelivery: () => void
+  /** The message poll keeps failing: say so instead of looking quiet (B029) */
+  notUpdating?: boolean
+}
+
+export type MeetingChatPanelMode = 'sidebar' | 'overlay'
+
+interface MeetingChatPanelProps {
+  agents: Agent[]
+  messages: ChatMessage[]
+  onSendToAgent: (agentId: string, message: string) => Promise<void>
+  onBroadcastToAll: (message: string) => Promise<void>
+  mode?: MeetingChatPanelMode
+  delivery?: MeetingDeliveryProps
+  meetingId?: string
+  onClose?: () => void
+}
+
+export default function MeetingChatPanel({ agents, messages, onSendToAgent, onBroadcastToAll, delivery, mode = 'sidebar', onClose }: MeetingChatPanelProps) {
+  const [recipient, setRecipient] = useState<string>('all')
+  const [inputText, setInputText] = useState('')
+  const [sending, setSending] = useState(false)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const { getSessionActivity } = useSessionActivity()
+
+  // Auto-scroll on new messages
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages.length])
+
+  const handleSend = async () => {
+    const text = inputText.trim()
+    if (!text || sending) return
+
+    setSending(true)
+    try {
+      if (recipient === 'all') {
+        await onBroadcastToAll(text)
+      } else {
+        await onSendToAgent(recipient, text)
+      }
+      setInputText('')
+    } finally {
+      setSending(false)
+    }
+  }
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSend()
+    }
+  }
+
+  const isOverlay = mode === 'overlay'
+
+  // Filter messages based on selected recipient
+  const filteredMessages = recipient === 'all'
+    ? messages
+    : messages.filter(m =>
+        m.from === recipient || m.to === recipient ||
+        m.fromAlias === recipient || m.toAlias === recipient
+      )
+
+  const inner = (
+    <div className="flex flex-col h-full">
+      {/* Overlay header with close button */}
+      {isOverlay && (
+        <div className="flex items-center justify-between px-3 py-2 border-b border-gray-800 flex-shrink-0">
+          <h3 className="text-sm font-medium text-gray-200">Meeting chat</h3>
+          {onClose && (
+            <button
+              onClick={onClose}
+              className="p-1 hover:bg-gray-800 rounded text-gray-400 hover:text-gray-200 transition-colors"
+              title="Close (back to terminal)"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Recipient selector */}
+      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-gray-800 overflow-x-auto">
+        <button
+          onClick={() => setRecipient('all')}
+          className={`flex items-center gap-1 text-[11px] px-2 py-1 rounded-full whitespace-nowrap transition-colors ${
+            recipient === 'all'
+              ? 'bg-emerald-600/30 text-emerald-300'
+              : 'text-gray-500 hover:bg-gray-800 hover:text-gray-300'
+          }`}
+        >
+          <Users className="w-3 h-3" />
+          All
+        </button>
+        {agents.map(agent => {
+          const name = agent.label || agent.name || agent.alias || agent.id.slice(0, 8)
+          return (
+            <button
+              key={agent.id}
+              onClick={() => setRecipient(agent.id)}
+              className={`flex items-center gap-1 text-[11px] px-2 py-1 rounded-full whitespace-nowrap transition-colors ${
+                recipient === agent.id
+                  ? 'bg-blue-600/30 text-blue-300'
+                  : 'text-gray-500 hover:bg-gray-800 hover:text-gray-300'
+              }`}
+            >
+              <User className="w-3 h-3" />
+              {name.length > 15 ? name.slice(0, 15) + '...' : name}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* Messages area */}
+      <div className="flex-1 min-h-0 overflow-y-auto px-3 py-2 space-y-2">
+        {filteredMessages.length === 0 && (
+          <p className="text-[11px] text-gray-600 text-center py-8">
+            No messages yet. Send a message to get started.
+          </p>
+        )}
+        {filteredMessages.map(msg => (
+          <div
+            key={msg.id}
+            className={`flex flex-col ${msg.isMine ? 'items-end' : 'items-start'}`}
+          >
+            <span className="text-[9px] text-gray-600 mb-0.5">
+              {msg.displayFrom} {msg.toAlias ? `→ ${msg.toAlias}` : ''}
+            </span>
+            <div
+              className={`${isOverlay ? 'max-w-[700px]' : 'max-w-[85%]'} rounded-lg px-3 py-2 ${isOverlay ? 'text-sm' : 'text-[11px]'} leading-relaxed whitespace-pre-wrap break-words ${
+                msg.isMine
+                  ? 'bg-emerald-600/30 text-emerald-100'
+                  : 'bg-gray-800 text-gray-300'
+              }`}
+            >
+              {msg.preview}
+            </div>
+            <span className="text-[9px] text-gray-700 mt-0.5">
+              {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </span>
+          </div>
+        ))}
+        {/* Activity indicators - show real-time agent processing status */}
+        {(() => {
+          // Determine which agents to show status for
+          const targetAgents = recipient === 'all' ? agents : agents.filter(a => a.id === recipient)
+          const activeAgents = targetAgents.filter(a => {
+            const info = getSessionActivity(a.name, a.id)
+            return info?.status === 'active'
+          })
+          const waitingAgents = targetAgents.filter(a => {
+            const info = getSessionActivity(a.name, a.id)
+            return info?.status === 'waiting'
+          })
+
+          return (
+            <>
+              {activeAgents.map(a => (
+                <div key={`activity-${a.id}`} className="flex flex-col items-start">
+                  <div className="flex items-center gap-2 rounded-lg px-3 py-2 bg-gray-800/50 text-gray-400">
+                    <Loader2 className={`w-3 h-3 animate-spin ${PRESENCE_STYLE.working.text}`} />
+                    <span className={isOverlay ? 'text-sm' : 'text-[11px]'}>
+                      {a.label || a.name} is working…
+                    </span>
+                  </div>
+                </div>
+              ))}
+              {waitingAgents.map(a => (
+                <div key={`waiting-${a.id}`} className="flex flex-col items-start">
+                  <div className="flex items-center gap-2 rounded-lg px-3 py-2 bg-gray-800/50 text-gray-400">
+                    <span className={`w-2 h-2 rounded-full ${PRESENCE_STYLE['needs-you'].dot}`} />
+                    <span className={isOverlay ? 'text-sm' : 'text-[11px]'}>
+                      {a.label || a.name} needs you
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </>
+          )
+        })()}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {delivery?.notUpdating && (
+        <div className="mx-3 mb-2 px-3 py-1.5 rounded-md bg-yellow-900/30 text-yellow-200 text-xs">
+          Not updating: new messages could not be loaded. Retrying…
+        </div>
+      )}
+
+      {/* Who got the last message */}
+      {delivery?.lastDelivery && (() => {
+        const d = delivery.lastDelivery
+        const failed = d.results.filter(r => r.status === 'failed')
+        const waiting = d.results.filter(r => r.status === 'delivered' && r.deferred)
+        const nameOf = (r: { agentId: string; name: string }) => {
+          const a = agents.find(x => x.id === r.agentId)
+          return a ? (a.label || a.name) : r.name
+        }
+        const ok = failed.length === 0
+        return (
+          <div data-testid="meeting-delivery" className={`px-3 py-1.5 border-t text-[11px] ${ok ? 'border-gray-800 text-gray-400' : 'border-amber-900/60 bg-amber-950/30 text-amber-200'}`}>
+            <div className="flex items-center gap-1.5">
+              {ok ? <Check className="w-3 h-3 text-emerald-400 flex-shrink-0" /> : <AlertTriangle className="w-3 h-3 text-amber-400 flex-shrink-0" />}
+              <span className="flex-1">
+                Reached {d.results.length - failed.length} of {d.results.length}
+                {waiting.length > 0 && <> · waiting in the inbox: {waiting.map(nameOf).join(', ')}</>}
+              </span>
+              {!ok && (
+                <button onClick={() => { void delivery.retryFailed() }} className="px-2 py-0.5 rounded bg-amber-700/50 hover:bg-amber-700 text-amber-100">
+                  Retry {failed.length}
+                </button>
+              )}
+              <button onClick={delivery.dismissDelivery} className="p-0.5 text-gray-500 hover:text-gray-300" title="Dismiss"><X className="w-3 h-3" /></button>
+            </div>
+            {failed.map(r => (
+              <div key={r.agentId} className="pl-5 text-amber-300/90">{nameOf(r)}: {r.error || 'not delivered'}</div>
+            ))}
+          </div>
+        )
+      })()}
+
+      {/* Compose area */}
+      <div className="px-3 py-2 border-t border-gray-800">
+        <div className="flex items-end gap-2">
+          <textarea
+            value={inputText}
+            onChange={e => setInputText(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder={recipient === 'all' ? 'Message all agents...' : `Message ${agents.find(a => a.id === recipient)?.label || 'agent'}...`}
+            rows={1}
+            className="flex-1 text-xs bg-gray-800/50 text-gray-200 placeholder-gray-600 rounded-lg px-3 py-2 resize-none focus:outline-none focus:ring-1 focus:ring-gray-600 max-h-20"
+            style={{ minHeight: '36px' }}
+          />
+          <button
+            onClick={handleSend}
+            disabled={!inputText.trim() || sending}
+            className="p-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
+          >
+            <Send className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+
+  if (!isOverlay) return inner
+
+  return (
+    <div className="flex-1 flex flex-col bg-gray-950 min-w-0">
+      <div className="flex-1 flex justify-center overflow-hidden">
+        <div className="w-full max-w-[900px] flex flex-col h-full">
+          {inner}
+        </div>
+      </div>
+    </div>
+  )
+}

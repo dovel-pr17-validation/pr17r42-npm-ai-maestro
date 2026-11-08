@@ -1,0 +1,1430 @@
+/**
+ * Agents Core Service Tests
+ *
+ * Tests the pure business logic in services/agents-core-service.ts.
+ * This is the largest/most complex service — agent CRUD, wake/hibernate,
+ * session linking, unified multi-host queries.
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { makeAgent, makeAgentSession, resetFixtureCounter } from '../test-utils/fixtures'
+import { type ServiceError } from '@/services/service-errors'
+
+// ============================================================================
+// Mocks — vi.hoisted() ensures availability before vi.mock() runs
+// ============================================================================
+
+const {
+  mockRuntime,
+  mockAgentRegistry,
+  mockHostsConfig,
+  mockSessionPersistence,
+  mockAmpInboxWriter,
+  mockSharedState,
+  mockAgentStartup,
+  mockMessageQueue,
+  mockFs,
+  mockUuid,
+} = vi.hoisted(() => {
+  const mockRuntime = {
+    listSessions: vi.fn().mockResolvedValue([]),
+    sessionExists: vi.fn().mockResolvedValue(false),
+    createSession: vi.fn().mockResolvedValue(undefined),
+    killSession: vi.fn().mockResolvedValue(undefined),
+    renameSession: vi.fn().mockResolvedValue(undefined),
+    sendKeys: vi.fn().mockResolvedValue(undefined),
+    cancelCopyMode: vi.fn().mockResolvedValue(undefined),
+    setEnvironment: vi.fn().mockResolvedValue(undefined),
+    unsetEnvironment: vi.fn().mockResolvedValue(undefined),
+  }
+
+  let uuidCounter = 0
+
+  return {
+    mockRuntime,
+    mockAgentRegistry: {
+      loadAgents: vi.fn().mockReturnValue([]),
+      saveAgents: vi.fn(),
+      recordLastRuntimes: vi.fn(),
+      createAgent: vi.fn(),
+      getAgent: vi.fn(),
+      getAgentByName: vi.fn(),
+      getAgentBySession: vi.fn(),
+      updateAgent: vi.fn(),
+      deleteAgent: vi.fn(),
+      searchAgents: vi.fn().mockReturnValue([]),
+      linkSession: vi.fn(),
+      unlinkSession: vi.fn(),
+      trustProjectDirectory: vi.fn().mockReturnValue(true),
+      folderOwner: vi.fn().mockReturnValue(null),
+    },
+    mockHostsConfig: {
+      getHosts: vi.fn().mockReturnValue([{ id: 'test-host', name: 'Test Host', url: 'http://localhost:23000' }]),
+      getSelfHost: vi.fn().mockReturnValue({ id: 'test-host', name: 'Test Host', url: 'http://localhost:23000' }),
+      getSelfHostId: vi.fn().mockReturnValue('test-host'),
+      isSelf: vi.fn().mockReturnValue(true),
+    },
+    mockSessionPersistence: {
+      persistSession: vi.fn(),
+      unpersistSession: vi.fn(),
+    },
+    mockAmpInboxWriter: {
+      initAgentAMPHome: vi.fn().mockResolvedValue(undefined),
+      getAgentAMPDir: vi.fn().mockReturnValue('/tmp/amp/test'),
+    },
+    mockSharedState: {
+      sessionActivity: new Map<string, number>(),
+      agentActivity: new Map<string, number>(),
+    },
+    mockAgentStartup: {
+      initializeAllAgents: vi.fn().mockResolvedValue({ initialized: [], failed: [] }),
+      getStartupStatus: vi.fn().mockReturnValue({ initialized: true }),
+    },
+    mockMessageQueue: {
+      resolveAgentIdentifier: vi.fn(),
+    },
+    mockFs: {
+      default: {
+        readFileSync: vi.fn().mockReturnValue('{}'),
+        existsSync: vi.fn().mockReturnValue(false),
+        // the wake checks that the working directory is a folder
+        statSync: vi.fn().mockReturnValue({ isDirectory: () => true }),
+        readdirSync: vi.fn().mockReturnValue([]),
+        mkdirSync: vi.fn(),
+        writeFileSync: vi.fn(),
+        unlinkSync: vi.fn(),
+      },
+    },
+    mockUuid: {
+      v4: vi.fn(() => `uuid-${++uuidCounter}`),
+    },
+  }
+})
+
+vi.mock('@/lib/agent-runtime', () => ({
+  getRuntime: vi.fn().mockReturnValue(mockRuntime),
+}))
+vi.mock('@/lib/agent-registry', () => mockAgentRegistry)
+vi.mock('@/lib/hosts-config', () => mockHostsConfig)
+vi.mock('@/lib/session-persistence', () => mockSessionPersistence)
+vi.mock('@/lib/amp-inbox-writer', () => mockAmpInboxWriter)
+vi.mock('@/services/shared-state', () => mockSharedState)
+vi.mock('@/lib/agent-startup', () => mockAgentStartup)
+vi.mock('@/lib/messageQueue', () => mockMessageQueue)
+vi.mock('fs', () => mockFs)
+vi.mock('uuid', () => mockUuid)
+vi.mock('@/lib/container-utils', () => ({
+  capturePaneFromContainer: vi.fn().mockResolvedValue(''),
+  inspectContainerStatus: vi.fn().mockResolvedValue('missing'),
+  removeContainer: vi.fn().mockResolvedValue(undefined),
+  sendKeysToContainer: vi.fn().mockResolvedValue(undefined),
+  startContainer: vi.fn().mockResolvedValue(undefined),
+  stopContainer: vi.fn().mockResolvedValue(undefined),
+  tmuxHasSessionInContainer: vi.fn().mockResolvedValue(false),
+}))
+vi.mock('child_process', () => ({
+  exec: vi.fn((_cmd: string, cb: Function) => cb(null, { stdout: '', stderr: '' })),
+  execSync: vi.fn().mockReturnValue(''),
+}))
+
+// ============================================================================
+// Import module under test (after mocks)
+// ============================================================================
+
+import {
+  listAgents,
+  searchAgentsByQuery,
+  createNewAgent,
+  getAgentById,
+  updateAgentById,
+  deleteAgentById,
+  registerAgent,
+  lookupAgentByName,
+  wakeAgent,
+  hibernateAgent,
+  switchRuntimeMode,
+  sendAgentSessionCommand,
+  linkAgentSession,
+  unlinkOrDeleteAgentSession,
+  getAgentSessionStatus,
+  initializeStartup,
+  getStartupInfo,
+  proxyHealthCheck,
+} from '@/services/agents-core-service'
+
+// ============================================================================
+// Setup
+// ============================================================================
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  resetFixtureCounter()
+  mockSharedState.sessionActivity.clear()
+  mockSharedState.agentActivity.clear()
+  mockRuntime.listSessions.mockResolvedValue([])
+  mockRuntime.sessionExists.mockResolvedValue(false)
+  mockRuntime.createSession.mockResolvedValue(undefined)
+  mockAgentRegistry.loadAgents.mockReturnValue([])
+  mockHostsConfig.getSelfHost.mockReturnValue({ id: 'test-host', name: 'Test Host', url: 'http://localhost:23000' })
+  mockHostsConfig.getHosts.mockReturnValue([{ id: 'test-host', name: 'Test Host', url: 'http://localhost:23000' }])
+  mockHostsConfig.isSelf.mockReturnValue(true)
+  delete (globalThis as { _streamSessions?: unknown })._streamSessions
+})
+
+/** A fake streaming session in the map /stream-chat uses; it ends shortly after close() */
+function liveStream(key: string) {
+  const s = { closed: false, exited: false, close() { s.closed = true; setTimeout(() => { s.exited = true }, 20) } }
+  const g = globalThis as { _streamSessions?: Map<string, unknown> }
+  ;(g._streamSessions ||= new Map()).set(key, s)
+  return s
+}
+
+// ============================================================================
+// listAgents
+// ============================================================================
+
+describe('listAgents', () => {
+  it('says what kind of member each agent is: no kind means agent (#802)', async () => {
+    mockAgentRegistry.loadAgents.mockReturnValue([
+      makeAgent({ name: 'plain' }),
+      makeAgent({ name: 'amanda', kind: 'assistant', platform: 'muse', avatar: 'https://example.com/a.png' }),
+      makeAgent({ name: 'older', metadata: { kind: 'assistant', platform: 'grok' } }),
+    ])
+    const agents = ((await listAgents()).data as any).agents
+    const byName = (name: string) => agents.find((a: any) => a.name === name)
+    expect(byName('plain').kind).toBe('agent')
+    expect(byName('plain').platform).toBeUndefined()
+    expect(byName('amanda')).toMatchObject({ kind: 'assistant', platform: 'muse', avatar: 'https://example.com/a.png' })
+    expect(byName('older')).toMatchObject({ kind: 'assistant', platform: 'grok' })
+  })
+
+  describe('how an agent last ran (#792)', () => {
+    const list = async () => ((await listAgents()).data as any).agents[0]
+
+    it('a hibernated agent is not standalone, and says it last ran in its terminal', async () => {
+      mockAgentRegistry.loadAgents.mockReturnValue([makeAgent({ name: 'sleeper', sessions: [makeAgentSession({ status: 'offline' })] })])
+      const { session } = await list()
+      expect(session.status).toBe('offline')
+      expect(session.standalone).toBeUndefined()
+      expect(session.runtime).toBeNull()
+      expect(session.lastRuntime).toBe('terminal')
+    })
+
+    it('a stopped outside agent keeps saying outside, even with session history', async () => {
+      mockAgentRegistry.loadAgents.mockReturnValue([makeAgent({ name: 'away', lastRuntime: 'outside', sessions: [makeAgentSession({ status: 'offline' })] })])
+      expect((await list()).session.lastRuntime).toBe('outside')
+    })
+
+    it('an agent that only ever sent heartbeats stays standalone', async () => {
+      mockAgentRegistry.loadAgents.mockReturnValue([makeAgent({ name: 'beat', sessions: [] })])
+      const { session } = await list()
+      expect(session.standalone).toBe(true)
+      expect(session.lastRuntime).toBeNull()
+    })
+
+    it('records a new runtime once, and writes nothing when it has not changed', async () => {
+      const live = [{ name: 'busy', workingDirectory: '/home', createdAt: '2025-01-01T00:00:00Z', windows: 1 }]
+      mockRuntime.listSessions.mockResolvedValue(live)
+      const agent = makeAgent({ name: 'busy' })
+      mockAgentRegistry.loadAgents.mockReturnValue([agent])
+      await listAgents()
+      expect(mockAgentRegistry.recordLastRuntimes).toHaveBeenCalledWith(new Map([[agent.id, 'terminal']]))
+
+      mockAgentRegistry.recordLastRuntimes.mockClear()
+      mockAgentRegistry.loadAgents.mockReturnValue([{ ...agent, lastRuntime: 'terminal' }])
+      await listAgents()
+      expect(mockAgentRegistry.recordLastRuntimes).not.toHaveBeenCalled()
+    })
+  })
+
+  it('returns empty list when no agents and no sessions', async () => {
+    const result = await listAgents()
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.agents).toEqual([])
+    expect((result.data as any)?.stats.total).toBe(0)
+  })
+
+  it('returns agents from registry with session status', async () => {
+    const agent = makeAgent({ name: 'my-agent' })
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+    mockRuntime.listSessions.mockResolvedValue([
+      { name: 'my-agent', workingDirectory: '/home', createdAt: '2025-01-01T00:00:00Z', windows: 1 },
+    ])
+
+    const result = await listAgents()
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.agents).toHaveLength(1)
+    expect((result.data as any)?.agents[0].name).toBe('my-agent')
+  })
+
+  it('creates orphan agents for sessions without registry entries', async () => {
+    mockAgentRegistry.loadAgents.mockReturnValue([])
+    mockRuntime.listSessions.mockResolvedValue([
+      { name: 'orphan-session', workingDirectory: '/home', createdAt: '2025-01-01T00:00:00Z', windows: 1 },
+    ])
+
+    const result = await listAgents()
+
+    expect((result.data as any)?.agents).toHaveLength(1)
+    expect((result.data as any)?.agents[0].isOrphan).toBe(true)
+    expect((result.data as any)?.stats.orphans).toBe(1)
+    // Orphan should be saved to registry
+    expect(mockAgentRegistry.saveAgents).toHaveBeenCalled()
+  })
+
+  it('an orphan in a folder another agent owns is registered without that folder (B023)', async () => {
+    mockAgentRegistry.loadAgents.mockReturnValue([])
+    mockAgentRegistry.folderOwner.mockReturnValueOnce({ id: 'o', name: 'owner' })
+    mockRuntime.listSessions.mockResolvedValue([
+      { name: 'stray', workingDirectory: '/repo', createdAt: '2025-01-01T00:00:00Z', windows: 1 },
+    ])
+
+    await listAgents()
+
+    const saved = mockAgentRegistry.saveAgents.mock.calls.at(-1)![0].find((a: any) => a.name === 'stray')
+    expect(saved.workingDirectory).toBeUndefined()
+    expect(saved.preferences.defaultWorkingDirectory).toBeUndefined()
+    expect(saved.sessions[0].workingDirectory).toBeUndefined()
+  })
+
+  it('does NOT create orphan agents for __call sessions', async () => {
+    mockAgentRegistry.loadAgents.mockReturnValue([])
+    mockRuntime.listSessions.mockResolvedValue([
+      { name: 'my-agent__call', workingDirectory: '/home', createdAt: '2025-01-01T00:00:00Z', windows: 1 },
+    ])
+
+    const result = await listAgents()
+
+    expect((result.data as any)?.agents).toHaveLength(0)
+    expect((result.data as any)?.stats.orphans).toBe(0)
+    expect(mockAgentRegistry.saveAgents).not.toHaveBeenCalled()
+  })
+
+  it('filters __call sessions while keeping real sessions', async () => {
+    const agent = makeAgent({ name: 'my-agent' })
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+    mockRuntime.listSessions.mockResolvedValue([
+      { name: 'my-agent', workingDirectory: '/home', createdAt: '2025-01-01T00:00:00Z', windows: 1 },
+      { name: 'my-agent__call', workingDirectory: '/home', createdAt: '2025-01-01T00:00:00Z', windows: 1 },
+    ])
+
+    const result = await listAgents()
+
+    // Should only see the real agent, not the call fork
+    expect((result.data as any)?.agents).toHaveLength(1)
+    expect((result.data as any)?.agents[0].name).toBe('my-agent')
+    expect((result.data as any)?.agents[0].status).toBe('active')
+    expect((result.data as any)?.stats.orphans).toBe(0)
+  })
+
+  it('marks agents offline when no matching tmux session', async () => {
+    const agent = makeAgent({ name: 'offline-agent', sessions: [makeAgentSession()] })
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+    mockRuntime.listSessions.mockResolvedValue([])
+
+    const result = await listAgents()
+
+    expect((result.data as any)?.agents[0].status).toBe('offline')
+    expect((result.data as any)?.agents[0].session?.status).toBe('offline')
+  })
+
+  it('marks agents active when matching tmux session exists', async () => {
+    const agent = makeAgent({ name: 'active-agent' })
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+    mockRuntime.listSessions.mockResolvedValue([
+      { name: 'active-agent', workingDirectory: '/home', createdAt: '2025-01-01T00:00:00Z', windows: 1 },
+    ])
+
+    const result = await listAgents()
+
+    expect((result.data as any)?.agents[0].status).toBe('active')
+    expect((result.data as any)?.agents[0].session?.status).toBe('online')
+  })
+
+  it('sorts online agents before offline', async () => {
+    const offlineAgent = makeAgent({ name: 'aaa-offline' })
+    const onlineAgent = makeAgent({ name: 'zzz-online' })
+    mockAgentRegistry.loadAgents.mockReturnValue([offlineAgent, onlineAgent])
+    mockRuntime.listSessions.mockResolvedValue([
+      { name: 'zzz-online', workingDirectory: '/home', createdAt: '2025-01-01T00:00:00Z', windows: 1 },
+    ])
+
+    const result = await listAgents()
+
+    expect((result.data as any)?.agents[0].name).toBe('zzz-online')
+    expect((result.data as any)?.agents[1].name).toBe('aaa-offline')
+  })
+
+  it('includes host info in response', async () => {
+    const result = await listAgents()
+
+    expect((result.data as any)?.hostInfo).toEqual({
+      id: 'test-host',
+      name: 'Test Host',
+      url: 'http://localhost:23000',
+      isSelf: true,
+    })
+  })
+
+  it('returns 500 on unexpected error', async () => {
+    mockAgentRegistry.loadAgents.mockImplementation(() => { throw new Error('disk error') })
+
+    const result = await listAgents()
+
+    expect(result.status).toBe(500)
+  })
+})
+
+// ============================================================================
+// searchAgentsByQuery
+// ============================================================================
+
+describe('searchAgentsByQuery', () => {
+  it('returns matching agents', () => {
+    const agents = [makeAgent({ name: 'backend-api' })]
+    mockAgentRegistry.searchAgents.mockReturnValue(agents)
+
+    const result = searchAgentsByQuery('backend')
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.agents).toHaveLength(1)
+    expect(mockAgentRegistry.searchAgents).toHaveBeenCalledWith('backend')
+  })
+
+  it('returns empty list when no matches', () => {
+    mockAgentRegistry.searchAgents.mockReturnValue([])
+
+    const result = searchAgentsByQuery('nonexistent')
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.agents).toEqual([])
+  })
+})
+
+// ============================================================================
+// createNewAgent
+// ============================================================================
+
+describe('createNewAgent', () => {
+  it('creates agent successfully', () => {
+    const agent = makeAgent({ name: 'new-agent' })
+    mockAgentRegistry.createAgent.mockReturnValue(agent)
+
+    const result = createNewAgent({
+      name: 'new-agent',
+      program: 'claude-code',
+      taskDescription: 'Test agent',
+    })
+
+    expect(result.status).toBe(201)
+    expect((result.data as any)?.agent.name).toBe('new-agent')
+  })
+
+  it('returns 400 when createAgent throws (e.g., duplicate name)', () => {
+    mockAgentRegistry.createAgent.mockImplementation(() => { throw new Error('Agent name already exists') })
+
+    const result = createNewAgent({
+      name: 'duplicate',
+      program: 'claude-code',
+      taskDescription: 'Test',
+    })
+
+    expect(result.status).toBe(400)
+    expect((result.data as ServiceError).message).toMatch(/already exists/i)
+  })
+})
+
+// ============================================================================
+// getAgentById
+// ============================================================================
+
+describe('getAgentById', () => {
+  it('returns agent when found', () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'found' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+
+    const result = getAgentById('agent-1')
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.agent.name).toBe('found')
+  })
+
+  it('returns 404 when agent not found', () => {
+    mockAgentRegistry.getAgent.mockReturnValue(null)
+
+    const result = getAgentById('nonexistent')
+
+    expect(result.status).toBe(404)
+  })
+
+  it('returns 500 on unexpected error', () => {
+    mockAgentRegistry.getAgent.mockImplementation(() => { throw new Error('read error') })
+
+    const result = getAgentById('agent-1')
+
+    expect(result.status).toBe(500)
+  })
+})
+
+// ============================================================================
+// updateAgentById
+// ============================================================================
+
+describe('updateAgentById', () => {
+  it('updates agent successfully', () => {
+    const agent = makeAgent({ id: 'agent-1' })
+    const updated = { ...agent, taskDescription: 'Updated task' }
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.updateAgent.mockReturnValue(updated)
+
+    const result = updateAgentById('agent-1', { taskDescription: 'Updated task' })
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.agent.taskDescription).toBe('Updated task')
+  })
+
+  // F103: only the operator says who a device speaks for, and the shape is strict
+  it('accepts devicePeople, lets null clear it, and refuses anything else', () => {
+    const agent = makeAgent({ id: 'agent-1' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.updateAgent.mockReturnValue(agent)
+    const key = 'WCKlMemnV7JtD6Yln67ozz1F5Gt9PNpaGuX339hi5ag'
+    expect(updateAgentById('agent-1', { devicePeople: { [key]: { personId: '580dcebd-ac31-4b86-99a7-4abed9fdff57', name: 'Juan Pelaez' } } }).status).toBe(200)
+    expect(updateAgentById('agent-1', { devicePeople: null }).status).toBe(200)
+    for (const bad of [[], { 'not a key!': { personId: 'p1', name: 'Juan' } }, { [key]: { personId: 'p1' } }, { [key]: { personId: 'p1', name: 'Juan', admin: true } }, { [key]: 'Juan' }]) {
+      expect(updateAgentById('agent-1', { devicePeople: bad as any }).status).toBe(400)
+    }
+  })
+
+  // The voice moves with the agent: a key must never ride along in it
+  it('accepts a voice, lets null clear it, and refuses anything else', () => {
+    const agent = makeAgent({ id: 'agent-1' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.updateAgent.mockReturnValue(agent)
+
+    expect(updateAgentById('agent-1', { voice: { engine: 'local', voiceId: 'af_heart' } }).status).toBe(200)
+    expect(updateAgentById('agent-1', { voice: { engine: 'elevenlabs' } }).status).toBe(200)
+    expect(updateAgentById('agent-1', { voice: null }).status).toBe(200)
+    expect(mockAgentRegistry.updateAgent).toHaveBeenLastCalledWith('agent-1', { voice: null })
+    mockAgentRegistry.updateAgent.mockClear()
+
+    for (const voice of [{ engine: 'espeak' }, {}, 'local', { engine: 'local', voiceId: '../x' }, { engine: 'local', voiceId: 7 }, { engine: 'elevenlabs', apiKey: 'sk' }]) {
+      expect(updateAgentById('agent-1', { voice } as any).status, JSON.stringify(voice)).toBe(400)
+    }
+    expect(mockAgentRegistry.updateAgent).not.toHaveBeenCalled()
+  })
+
+  // The title is shown on a phone ("George (AI Maestro product owner) needs you"): one short line
+  it('accepts a title, trimmed, and refuses one that is too long or spans lines', () => {
+    const agent = makeAgent({ id: 'agent-1' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.updateAgent.mockReturnValue({ ...agent, title: 'AI Maestro product owner' })
+    expect(updateAgentById('agent-1', { title: '  AI Maestro product owner ' }).status).toBe(200)
+    expect(mockAgentRegistry.updateAgent).toHaveBeenLastCalledWith('agent-1', expect.objectContaining({ title: 'AI Maestro product owner' }))
+    expect(updateAgentById('agent-1', { title: 'x'.repeat(81) }).status).toBe(400)
+    expect(updateAgentById('agent-1', { title: 'two\nlines' }).status).toBe(400)
+    expect(updateAgentById('agent-1', { title: null }).status).toBe(200)
+  })
+
+  it('returns 404 when agent not found', () => {
+    mockAgentRegistry.getAgent.mockReturnValue(null)
+
+    const result = updateAgentById('nonexistent', { taskDescription: 'X' })
+
+    expect(result.status).toBe(404)
+  })
+
+  it('returns 410 when agent is soft-deleted', () => {
+    const deleted = makeAgent({ id: 'agent-1', deletedAt: '2025-01-01T00:00:00Z' })
+    mockAgentRegistry.getAgent.mockReturnValue(deleted)
+
+    const result = updateAgentById('agent-1', { taskDescription: 'X' })
+
+    expect(result.status).toBe(410)
+    expect((result.data as ServiceError).message).toMatch(/deleted/i)
+  })
+
+  it('returns 400 when updateAgent throws (e.g., duplicate name)', () => {
+    const agent = makeAgent({ id: 'agent-1' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.updateAgent.mockImplementation(() => { throw new Error('Name taken') })
+
+    const result = updateAgentById('agent-1', { name: 'taken' })
+
+    expect(result.status).toBe(400)
+    expect((result.data as ServiceError).message).toBe('Name taken')
+  })
+})
+
+// ============================================================================
+// deleteAgentById
+// ============================================================================
+
+describe('deleteAgentById', () => {
+  it('soft deletes agent', async () => {
+    const agent = makeAgent({ id: 'agent-1' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.deleteAgent.mockReturnValue(true)
+
+    const result = await deleteAgentById('agent-1', false)
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.success).toBe(true)
+    expect((result.data as any)?.hard).toBe(false)
+  })
+
+  it('hard deletes agent', async () => {
+    const agent = makeAgent({ id: 'agent-1' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.deleteAgent.mockReturnValue(true)
+
+    const result = await deleteAgentById('agent-1', true)
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.hard).toBe(true)
+  })
+
+  it('returns 404 when agent not found', async () => {
+    mockAgentRegistry.getAgent.mockReturnValue(null)
+
+    const result = await deleteAgentById('nonexistent', false)
+
+    expect(result.status).toBe(404)
+  })
+
+  it('returns 410 when already soft-deleted and not hard deleting', async () => {
+    const deleted = makeAgent({ id: 'agent-1', deletedAt: '2025-01-01T00:00:00Z' })
+    mockAgentRegistry.getAgent.mockReturnValue(deleted)
+
+    const result = await deleteAgentById('agent-1', false)
+
+    expect(result.status).toBe(410)
+    expect((result.data as ServiceError).message).toMatch(/deleted/i)
+  })
+
+  it('allows hard delete of already soft-deleted agent', async () => {
+    const deleted = makeAgent({ id: 'agent-1', deletedAt: '2025-01-01T00:00:00Z' })
+    mockAgentRegistry.getAgent.mockReturnValue(deleted)
+    mockAgentRegistry.deleteAgent.mockReturnValue(true)
+
+    const result = await deleteAgentById('agent-1', true)
+
+    expect(result.status).toBe(200)
+  })
+})
+
+// ============================================================================
+// registerAgent
+// ============================================================================
+
+describe('registerAgent', () => {
+  it('registers agent from session name', () => {
+    mockAgentRegistry.getAgentBySession.mockReturnValue(null)
+    mockAgentRegistry.createAgent.mockReturnValue(makeAgent({ id: 'new-id', name: 'my-agent' }))
+    mockFs.default.existsSync.mockReturnValue(false)
+
+    const result = registerAgent({ sessionName: 'my-agent', workingDirectory: '/home' })
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.success).toBe(true)
+    expect((result.data as any)?.agentId).toBe('my-agent')
+  })
+
+  it('links existing agent when found by session', () => {
+    const existing = makeAgent({ id: 'existing-id', name: 'my-agent' })
+    mockAgentRegistry.getAgentBySession.mockReturnValue(existing)
+    mockFs.default.existsSync.mockReturnValue(false)
+
+    const result = registerAgent({ sessionName: 'my-agent' })
+
+    expect(result.status).toBe(200)
+    // No folder given: none is recorded (it used to be the AI Maestro folder, B023)
+    expect(mockAgentRegistry.linkSession).toHaveBeenCalledWith('existing-id', 'my-agent', undefined)
+    expect((result.data as any)?.registryAgent?.id).toBe('existing-id')
+  })
+
+  it('registers cloud agent with websocket URL', () => {
+    mockFs.default.existsSync.mockReturnValue(false)
+
+    const result = registerAgent({
+      id: 'cloud-agent',
+      deployment: { cloud: { websocketUrl: 'wss://agent.cloud.com/term' } },
+    })
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.agentId).toBe('cloud-agent')
+  })
+
+  it('returns 400 when session name is missing (worktree format)', () => {
+    const result = registerAgent({ sessionName: '' })
+
+    // The code checks `!body.sessionName` which is falsy for empty string
+    // It falls through to the cloud path and fails there
+    expect(result.status).toBe(400)
+  })
+
+  it('returns 400 when cloud agent missing required fields', () => {
+    const result = registerAgent({ id: 'cloud', deployment: {} as any })
+
+    expect(result.status).toBe(400)
+    expect((result.data as ServiceError).message).toMatch(/required/i)
+  })
+
+  it('saves agent config to file', () => {
+    mockAgentRegistry.getAgentBySession.mockReturnValue(null)
+    mockAgentRegistry.createAgent.mockReturnValue(makeAgent())
+    mockFs.default.existsSync.mockReturnValue(false)
+
+    registerAgent({ sessionName: 'agent' })
+
+    expect(mockFs.default.writeFileSync).toHaveBeenCalled()
+  })
+})
+
+// ============================================================================
+// lookupAgentByName
+// ============================================================================
+
+describe('lookupAgentByName', () => {
+  it('returns agent when resolved and found', () => {
+    mockMessageQueue.resolveAgentIdentifier.mockReturnValue({ agentId: 'agent-1' })
+    mockAgentRegistry.getAgent.mockReturnValue(makeAgent({ id: 'agent-1', name: 'my-agent' }))
+
+    const result = lookupAgentByName('my-agent')
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.exists).toBe(true)
+    expect((result.data as any)?.agent?.name).toBe('my-agent')
+  })
+
+  it('returns exists=false when agent not resolved', () => {
+    mockMessageQueue.resolveAgentIdentifier.mockReturnValue(null)
+
+    const result = lookupAgentByName('unknown')
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.exists).toBe(false)
+  })
+
+  it('returns exists=false when resolved but not in registry', () => {
+    mockMessageQueue.resolveAgentIdentifier.mockReturnValue({ agentId: 'gone' })
+    mockAgentRegistry.getAgent.mockReturnValue(null)
+
+    const result = lookupAgentByName('gone-agent')
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.exists).toBe(false)
+  })
+})
+
+// ============================================================================
+// wakeAgent
+// ============================================================================
+
+describe('wakeAgent', () => {
+  it('wakes a hibernated agent', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', workingDirectory: '/home' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    // loadAgents for updateAgentSessionInRegistry
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    const result = await wakeAgent('agent-1', { startProgram: false })
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.woken).toBe(true)
+    expect((result.data as any)?.sessionName).toBe('my-agent')
+    expect(mockRuntime.createSession).toHaveBeenCalledWith('my-agent', '/home')
+    // Claude Code must not stop at "trust this folder" after the wake
+    expect(mockAgentRegistry.trustProjectDirectory).toHaveBeenCalledWith('/home')
+  })
+
+  it('an agent with no folder wakes in its own ~/agents/<name>, never the AI Maestro folder (B023)', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', workingDirectory: undefined })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+    const own = require('path').join(require('os').homedir(), 'agents', 'my-agent')
+    mockAgentRegistry.updateAgent.mockReset()
+
+    const result = await wakeAgent('agent-1', { startProgram: false })
+
+    expect(result.status).toBe(200)
+    expect(mockAgentRegistry.updateAgent).toHaveBeenCalledWith('agent-1', { workingDirectory: own })
+    expect(mockRuntime.createSession).toHaveBeenCalledWith('my-agent', own)
+  })
+
+  it('refuses to wake into a folder that does not exist, instead of starting in home', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', workingDirectory: '/no/such/folder' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+    mockFs.default.statSync.mockImplementationOnce(() => { throw new Error('ENOENT') })
+
+    const result = await wakeAgent('agent-1', { startProgram: false })
+
+    expect(result.status).toBe(400)
+    expect(JSON.stringify(result.error ?? result.data)).toContain('/no/such/folder')
+    expect(mockRuntime.createSession).not.toHaveBeenCalled()
+  })
+
+  it('returns already running when session exists', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    const result = await wakeAgent('agent-1', {})
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.alreadyRunning).toBe(true)
+    expect(mockRuntime.createSession).not.toHaveBeenCalled()
+  })
+
+  it('returns 404 when agent not found', async () => {
+    mockAgentRegistry.getAgent.mockReturnValue(null)
+
+    const result = await wakeAgent('nonexistent', {})
+
+    expect(result.status).toBe(404)
+  })
+
+  it('returns 400 when agent has no name', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: '' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+
+    const result = await wakeAgent('agent-1', {})
+
+    expect(result.status).toBe(400)
+  })
+
+  it('persists session metadata on wake', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    await wakeAgent('agent-1', { startProgram: false })
+
+    expect(mockSessionPersistence.persistSession).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'my-agent', agentId: 'agent-1' })
+    )
+  })
+
+  it('sets up AMP for the session', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    await wakeAgent('agent-1', { startProgram: false })
+
+    expect(mockAmpInboxWriter.initAgentAMPHome).toHaveBeenCalledWith('my-agent', 'agent-1')
+  })
+
+  it('uses session index for multi-brain sessions', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    const result = await wakeAgent('agent-1', { sessionIndex: 2, startProgram: false })
+
+    expect((result.data as any)?.sessionName).toBe('my-agent_2')
+    expect((result.data as any)?.sessionIndex).toBe(2)
+  })
+
+  it('returns 500 when tmux session creation fails', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockRuntime.createSession.mockRejectedValue(new Error('tmux error'))
+
+    const result = await wakeAgent('agent-1', { startProgram: false })
+
+    expect(result.status).toBe(500)
+  })
+
+  it('sends --permission-mode auto when agent.permissionMode is smartAuto', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', program: 'claude code', permissionMode: 'smartAuto' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    const result = await wakeAgent('agent-1', {})
+
+    expect(result.status).toBe(200)
+    // Find the sendKeys call that launches the program (the one with { enter: true })
+    const programCall = mockRuntime.sendKeys.mock.calls.find(
+      (call: any[]) => call[2]?.enter === true
+    )
+    expect(programCall).toBeDefined()
+    expect(programCall![1]).toContain('--permission-mode auto')
+  })
+
+  it('does NOT send --permission-mode flag when permissionMode is supervised', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', program: 'claude code', permissionMode: 'supervised' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    const result = await wakeAgent('agent-1', {})
+
+    expect(result.status).toBe(200)
+    const programCall = mockRuntime.sendKeys.mock.calls.find(
+      (call: any[]) => call[2]?.enter === true
+    )
+    expect(programCall).toBeDefined()
+    expect(programCall![1]).not.toContain('--permission-mode')
+  })
+
+  it('params.permissionMode overrides agent.permissionMode', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', program: 'claude code', permissionMode: 'supervised' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    const result = await wakeAgent('agent-1', { permissionMode: 'trustEdits' })
+
+    expect(result.status).toBe(200)
+    const programCall = mockRuntime.sendKeys.mock.calls.find(
+      (call: any[]) => call[2]?.enter === true
+    )
+    expect(programCall).toBeDefined()
+    expect(programCall![1]).toContain('--permission-mode acceptEdits')
+  })
+
+  it('does NOT inject --permission-mode for non-claude programs', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', program: 'codex', permissionMode: 'fullAutonomy' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    const result = await wakeAgent('agent-1', {})
+
+    expect(result.status).toBe(200)
+    const programCall = mockRuntime.sendKeys.mock.calls.find(
+      (call: any[]) => call[2]?.enter === true
+    )
+    expect(programCall).toBeDefined()
+    expect(programCall![1]).not.toContain('--permission-mode')
+  })
+
+  it('sends --permission-mode bypassPermissions for fullAutonomy', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', program: 'claude code', permissionMode: 'fullAutonomy' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    const result = await wakeAgent('agent-1', {})
+
+    expect(result.status).toBe(200)
+    const programCall = mockRuntime.sendKeys.mock.calls.find(
+      (call: any[]) => call[2]?.enter === true
+    )
+    expect(programCall).toBeDefined()
+    expect(programCall![1]).toContain('--permission-mode bypassPermissions')
+  })
+})
+
+// ============================================================================
+// hibernateAgent
+// ============================================================================
+
+describe('hibernateAgent', () => {
+  it('hibernates an active agent', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    const result = await hibernateAgent('agent-1', {})
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.hibernated).toBe(true)
+    expect(mockRuntime.killSession).toHaveBeenCalledWith('my-agent')
+  })
+
+  it('handles agent with no active session gracefully', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    const result = await hibernateAgent('agent-1', {})
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.hibernated).toBe(true)
+    expect((result.data as any)?.message).toMatch(/already terminated/i)
+  })
+
+  it('returns 404 when agent not found', async () => {
+    mockAgentRegistry.getAgent.mockReturnValue(null)
+
+    const result = await hibernateAgent('nonexistent', {})
+
+    expect(result.status).toBe(404)
+  })
+
+  it('returns 400 when agent has no name', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: '' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+
+    const result = await hibernateAgent('agent-1', {})
+
+    expect(result.status).toBe(400)
+  })
+
+  it('unpersists session after hibernate', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    await hibernateAgent('agent-1', {})
+
+    expect(mockSessionPersistence.unpersistSession).toHaveBeenCalledWith('my-agent')
+  })
+
+  it('attempts graceful shutdown before kill', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+
+    await hibernateAgent('agent-1', {})
+
+    // Should send Ctrl-C then "exit" before kill
+    expect(mockRuntime.sendKeys).toHaveBeenCalledWith('my-agent', 'C-c')
+    expect(mockRuntime.sendKeys).toHaveBeenCalledWith('my-agent', '"exit"', { enter: true })
+  })
+})
+
+// ============================================================================
+// sendAgentSessionCommand
+// ============================================================================
+
+describe('sendAgentSessionCommand', () => {
+  it('sends command to idle session', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+
+    const result = await sendAgentSessionCommand('agent-1', { command: 'ls -la' })
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.success).toBe(true)
+    expect((result.data as any)?.commandSent).toBe('ls -la')
+    expect((result.data as any)?.sessionName).toBe('my-agent')
+  })
+
+  it('returns 409 when session is busy', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+    mockSharedState.sessionActivity.set('my-agent', Date.now())
+
+    const result = await sendAgentSessionCommand('agent-1', { command: 'ls' })
+
+    expect(result.status).toBe(409)
+    expect((result.data as any)?.idle).toBe(false)
+  })
+
+  it('allows command when requireIdle is false', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+    mockSharedState.sessionActivity.set('my-agent', Date.now())
+
+    const result = await sendAgentSessionCommand('agent-1', { command: 'ls', requireIdle: false })
+
+    expect(result.status).toBe(200)
+  })
+
+  it('returns 404 when agent not found', async () => {
+    mockAgentRegistry.getAgent.mockReturnValue(null)
+
+    const result = await sendAgentSessionCommand('nonexistent', { command: 'ls' })
+
+    expect(result.status).toBe(404)
+  })
+
+  it('returns 400 when command is missing', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+
+    const result = await sendAgentSessionCommand('agent-1', { command: '' })
+
+    expect(result.status).toBe(400)
+  })
+
+  it('returns 404 when tmux session not found', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+
+    const result = await sendAgentSessionCommand('agent-1', { command: 'ls' })
+
+    expect(result.status).toBe(404)
+  })
+
+  it('cancels copy mode before sending command', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+
+    await sendAgentSessionCommand('agent-1', { command: 'ls' })
+
+    expect(mockRuntime.cancelCopyMode).toHaveBeenCalledWith('my-agent')
+  })
+
+  it('updates activity timestamp', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+
+    await sendAgentSessionCommand('agent-1', { command: 'ls' })
+
+    expect(mockSharedState.sessionActivity.get('my-agent')).toBeDefined()
+  })
+
+  it('returns 400 when agent has no name', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: '' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+
+    const result = await sendAgentSessionCommand('agent-1', { command: 'ls' })
+
+    expect(result.status).toBe(400)
+    expect((result.data as ServiceError).message).toMatch(/no name/i)
+  })
+})
+
+// ============================================================================
+// linkAgentSession
+// ============================================================================
+
+describe('linkAgentSession', () => {
+  it('links session to agent', () => {
+    mockAgentRegistry.linkSession.mockReturnValue(true)
+
+    const result = linkAgentSession('agent-1', { sessionName: 'my-session' })
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.success).toBe(true)
+  })
+
+  it('returns 400 when sessionName is missing', () => {
+    const result = linkAgentSession('agent-1', { sessionName: '' })
+
+    expect(result.status).toBe(400)
+  })
+
+  it('returns 404 when agent not found', () => {
+    mockAgentRegistry.linkSession.mockReturnValue(false)
+
+    const result = linkAgentSession('nonexistent', { sessionName: 'my-session' })
+
+    expect(result.status).toBe(404)
+  })
+})
+
+// ============================================================================
+// unlinkOrDeleteAgentSession
+// ============================================================================
+
+describe('unlinkOrDeleteAgentSession', () => {
+  it('unlinks session from agent', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.unlinkSession.mockReturnValue(true)
+
+    const result = await unlinkOrDeleteAgentSession('agent-1', {})
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.sessionUnlinked).toBe(true)
+  })
+
+  it('kills session and unlinks when kill=true', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.unlinkSession.mockReturnValue(true)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+
+    const result = await unlinkOrDeleteAgentSession('agent-1', { kill: true })
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.sessionKilled).toBe(true)
+    expect(mockRuntime.killSession).toHaveBeenCalledWith('my-agent')
+  })
+
+  it('deletes agent when deleteAgent=true', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.deleteAgent.mockReturnValue(true)
+
+    const result = await unlinkOrDeleteAgentSession('agent-1', { deleteAgent: true })
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.deleted).toBe(true)
+    expect(mockAgentRegistry.deleteAgent).toHaveBeenCalledWith('agent-1', true)
+  })
+
+  it('returns 404 when agent not found', async () => {
+    mockAgentRegistry.getAgent.mockReturnValue(null)
+
+    const result = await unlinkOrDeleteAgentSession('nonexistent', {})
+
+    expect(result.status).toBe(404)
+  })
+
+  it('returns 404 when unlink fails', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.unlinkSession.mockReturnValue(false)
+
+    const result = await unlinkOrDeleteAgentSession('agent-1', {})
+
+    expect(result.status).toBe(404)
+  })
+})
+
+// ============================================================================
+// getAgentSessionStatus
+// ============================================================================
+
+describe('getAgentSessionStatus', () => {
+  it('returns session status for agent with tmux session', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+
+    const result = await getAgentSessionStatus('agent-1')
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.hasSession).toBe(true)
+    expect((result.data as any)?.exists).toBe(true)
+  })
+
+  it('returns hasSession=false when agent has no name', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: '' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+
+    const result = await getAgentSessionStatus('agent-1')
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.hasSession).toBe(false)
+  })
+
+  it('returns 404 when agent not found', async () => {
+    mockAgentRegistry.getAgent.mockReturnValue(null)
+
+    const result = await getAgentSessionStatus('nonexistent')
+
+    expect(result.status).toBe(404)
+  })
+
+  it('returns idle status based on activity', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+    // No activity = idle
+
+    const result = await getAgentSessionStatus('agent-1')
+
+    expect((result.data as any)?.idle).toBe(true)
+  })
+})
+
+// ============================================================================
+// initializeStartup
+// ============================================================================
+
+describe('initializeStartup', () => {
+  it('initializes all agents', async () => {
+    mockAgentStartup.initializeAllAgents.mockResolvedValue({
+      initialized: ['agent-1', 'agent-2'],
+      failed: [],
+    })
+
+    const result = await initializeStartup()
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.initialized).toHaveLength(2)
+    expect((result.data as any)?.failed).toHaveLength(0)
+  })
+
+  it('reports partial failures', async () => {
+    mockAgentStartup.initializeAllAgents.mockResolvedValue({
+      initialized: ['agent-1'],
+      failed: [{ agentId: 'agent-2', error: 'no session' }],
+    })
+
+    const result = await initializeStartup()
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.failed).toHaveLength(1)
+  })
+
+  it('returns 500 on unexpected error', async () => {
+    mockAgentStartup.initializeAllAgents.mockRejectedValue(new Error('init failed'))
+
+    const result = await initializeStartup()
+
+    expect(result.status).toBe(500)
+  })
+})
+
+// ============================================================================
+// getStartupInfo
+// ============================================================================
+
+describe('getStartupInfo', () => {
+  it('returns startup status', () => {
+    mockAgentStartup.getStartupStatus.mockReturnValue({ initialized: true, agents: 5 })
+
+    const result = getStartupInfo()
+
+    expect(result.status).toBe(200)
+    expect((result.data as any)?.initialized).toBe(true)
+  })
+
+  it('returns 500 on error', () => {
+    mockAgentStartup.getStartupStatus.mockImplementation(() => { throw new Error('fail') })
+
+    const result = getStartupInfo()
+
+    expect(result.status).toBe(500)
+  })
+})
+
+// ============================================================================
+// proxyHealthCheck
+// ============================================================================
+
+describe('proxyHealthCheck', () => {
+  it('returns 400 when URL is missing', async () => {
+    const result = await proxyHealthCheck('')
+
+    expect(result.status).toBe(400)
+  })
+
+  it('returns 400 when URL is not a string', async () => {
+    const result = await proxyHealthCheck(null as any)
+
+    expect(result.status).toBe(400)
+  })
+})
+
+// ============================================================================
+// Terminal and streaming never run at the same time
+// ============================================================================
+
+describe('one mode at a time', () => {
+  beforeEach(() => {
+    mockAgentRegistry.updateAgent.mockReset()
+    mockRuntime.createSession.mockReset().mockResolvedValue(undefined)
+  })
+
+  it('a wake is refused while the agent runs as a streaming session', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', workingDirectory: '/home' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    liveStream('agent-1')
+    const result = await wakeAgent('agent-1', { startProgram: false })
+    expect(result.status).toBe(409)
+    expect(mockRuntime.createSession).not.toHaveBeenCalled()
+  })
+
+  it('a wake is refused while the agent runs outside tmux (its own terminal or app)', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', workingDirectory: '/home', claudeSessionId: 'sess-1' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(false)
+    mockFs.default.readFileSync.mockImplementation((f: string) => String(f).includes('chat-state')
+      ? JSON.stringify({ sessionId: 'sess-1', status: 'active', pid: process.pid, updatedAt: new Date().toISOString() })
+      : '{}')
+    const result = await wakeAgent('agent-1', { startProgram: false })
+    mockFs.default.readFileSync.mockReturnValue('{}')
+    expect(result.status).toBe(409)
+    expect(mockRuntime.createSession).not.toHaveBeenCalled()
+  })
+
+  it('restore does not start a terminal for an agent set to run streaming', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', workingDirectory: '/home', runtimeMode: 'streaming' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    const result = await wakeAgent('agent-1', { startProgram: false, automatic: true })
+    expect((result.data as any)?.woken).toBe(false)
+    expect(mockRuntime.createSession).not.toHaveBeenCalled()
+  })
+
+  it('hibernating stops a streaming session too', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    const s = liveStream('my-agent')
+    const result = await hibernateAgent('agent-1', {})
+    expect(result.status).toBe(200)
+    expect(s.closed && s.exited).toBe(true)
+  })
+
+  it('switching to streaming stops the terminal first, and confirms it stopped', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', workingDirectory: '/home' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+    mockRuntime.sessionExists.mockResolvedValueOnce(true).mockResolvedValueOnce(true).mockResolvedValue(false)
+    const result = await switchRuntimeMode('agent-1', 'streaming')
+    expect(result.status).toBe(200)
+    expect(mockRuntime.killSession).toHaveBeenCalledWith('my-agent')
+    expect(mockAgentRegistry.updateAgent).toHaveBeenCalledWith('agent-1', expect.objectContaining({ runtimeMode: 'streaming' }))
+  })
+
+  it('the agent\'s own terminal process is not "running outside" (found by switching a real agent)', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', workingDirectory: '/home', claudeSessionId: 'sess-1' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+    // The hook state for its folder: its own conversation, run by a live process (the terminal's Claude)
+    mockFs.default.readFileSync.mockImplementation((f: string) => String(f).includes('chat-state')
+      ? JSON.stringify({ sessionId: 'sess-1', status: 'active', pid: process.pid, updatedAt: new Date().toISOString() })
+      : '{}')
+    mockRuntime.sessionExists.mockResolvedValueOnce(true).mockResolvedValueOnce(true).mockResolvedValue(false)
+    const result = await switchRuntimeMode('agent-1', 'streaming')
+    mockFs.default.readFileSync.mockReturnValue('{}')
+    expect(result.status).toBe(200)
+    expect(mockRuntime.killSession).toHaveBeenCalledWith('my-agent')
+  })
+
+  it('switching to streaming fails, and records nothing, when the terminal will not stop', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', workingDirectory: '/home' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockRuntime.sessionExists.mockResolvedValue(true)
+    const result = await switchRuntimeMode('agent-1', 'streaming')
+    expect(result.status).not.toBe(200)
+    expect(mockAgentRegistry.updateAgent).not.toHaveBeenCalledWith('agent-1', expect.objectContaining({ runtimeMode: 'streaming' }))
+  })
+
+  it('switching to terminal stops the stream before the terminal starts', async () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent', workingDirectory: '/home', runtimeMode: 'streaming' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.loadAgents.mockReturnValue([agent])
+    mockAgentRegistry.updateAgent.mockReturnValue({ ...agent, runtimeMode: 'terminal' })
+    const s = liveStream('agent-1')
+    mockRuntime.createSession.mockImplementation(async () => { expect(s.exited).toBe(true) })
+    const result = await switchRuntimeMode('agent-1', 'terminal')
+    expect(result.status).toBe(200)
+    expect(mockRuntime.createSession).toHaveBeenCalledWith('my-agent', '/home')
+  })
+
+  it('refuses a bad mode', async () => {
+    expect((await switchRuntimeMode('agent-1', 'both')).status).toBe(400)
+  })
+
+  it('agent PATCH cannot set the mode or its switch time', () => {
+    const agent = makeAgent({ id: 'agent-1', name: 'my-agent' })
+    mockAgentRegistry.getAgent.mockReturnValue(agent)
+    mockAgentRegistry.updateAgent.mockReturnValue(agent)
+    updateAgentById('agent-1', { label: 'X', runtimeMode: 'streaming', runtimeSwitchedAt: '2030-01-01T00:00:00Z' } as any)
+    const patch = mockAgentRegistry.updateAgent.mock.calls.at(-1)![1]
+    expect(patch).toMatchObject({ label: 'X' })
+    expect(patch).not.toHaveProperty('runtimeMode')
+    expect(patch).not.toHaveProperty('runtimeSwitchedAt')
+  })
+})

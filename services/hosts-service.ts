@@ -1,0 +1,1315 @@
+/**
+ * Hosts Service
+ *
+ * Pure business logic extracted from app/api/hosts/** routes.
+ * No HTTP concepts (Request, Response, NextResponse, headers) leak into this module.
+ * API routes become thin wrappers that call these functions.
+ *
+ * Covers:
+ *   GET    /api/hosts                  -> listHosts
+ *   POST   /api/hosts                  -> addNewHost
+ *   PUT    /api/hosts/[id]             -> updateExistingHost
+ *   DELETE /api/hosts/[id]             -> deleteExistingHost
+ *   GET    /api/hosts/identity         -> getHostIdentity
+ *   GET    /api/hosts/connect-info     -> getConnectInfo
+ *   GET    /api/hosts/health           -> checkRemoteHealth
+ *   POST   /api/hosts/sync             -> triggerMeshSync
+ *   GET    /api/hosts/sync             -> getMeshStatus
+ *   POST   /api/hosts/register-peer    -> registerPeer
+ *   POST   /api/hosts/exchange-peers   -> exchangePeers
+ */
+
+import { execFile } from 'child_process'
+import { promisify } from 'util'
+import fs from 'fs'
+import path from 'path'
+import {
+  getHosts,
+  saveHosts,
+  addHost,
+  updateHost,
+  deleteHost,
+  isSelf,
+  getSelfHost,
+  getLocalIPs,
+  addHostAsync,
+  getHostById,
+  clearHostsCache,
+  findHostByAnyIdentifier,
+  getSelfAliases,
+  getOrganizationInfo,
+  hasOrganization,
+  adoptOrganization,
+  loadAllHostsRaw,
+  updateHostRaw,
+} from '@/lib/hosts-config'
+import { addHostWithSync, syncWithAllPeers, getPublicUrl, hasProcessedPropagation, markPropagationProcessed } from '@/lib/host-sync'
+import type { Host } from '@/types/host'
+import type {
+  PeerRegistrationRequest,
+  PeerRegistrationResponse,
+  PeerExchangeRequest,
+  PeerExchangeResponse,
+  HostIdentity,
+  HostIdentityResponse,
+} from '@/types/host-sync'
+import { loadAgents } from '@/lib/agent-registry'
+import { buildConnectInfo, type ConnectInfo } from '@/lib/connect-info'
+import { resolveBindHost } from '@/lib/bind-host.mjs'
+import { readHostLoad, type HostLoad } from '@/lib/host-load'
+import { type ServiceResult, missingField, invalidField, notFound, operationFailed, invalidRequest } from '@/services/service-errors'
+import { resetCircuitBreaker, isCircuitOpen } from '@/services/agents-core-service'
+
+const execFileAsync = promisify(execFile)
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Maximum propagation depth to prevent infinite loops */
+const MAX_PROPAGATION_DEPTH = 3
+
+// ---------------------------------------------------------------------------
+// Docker cache (moved from hosts/route.ts)
+// ---------------------------------------------------------------------------
+
+let dockerCache: { available: boolean; version?: string; checkedAt: number } | null = null
+const DOCKER_CACHE_TTL = 60000 // 60 seconds
+// Concurrent callers share one probe instead of each spawning docker.
+let dockerProbe: Promise<{ available: boolean; version?: string; checkedAt: number }> | null = null
+
+async function getDockerStatus(): Promise<{ available: boolean; version?: string; checkedAt: number }> {
+  if (dockerCache && Date.now() - dockerCache.checkedAt < DOCKER_CACHE_TTL) {
+    return dockerCache
+  }
+  dockerProbe ??= (async () => {
+    try {
+      const { stdout } = await execFileAsync('docker', ['version', '--format', '{{.Server.Version}}'], { timeout: 3000 })
+      dockerCache = { available: true, version: stdout.trim(), checkedAt: Date.now() }
+    } catch {
+      dockerCache = { available: false, checkedAt: Date.now() }
+    }
+    return dockerCache
+  })().finally(() => { dockerProbe = null })
+  return dockerProbe
+}
+
+// ---------------------------------------------------------------------------
+// Cloud capability detection (terraform + AWS CLI)
+// ---------------------------------------------------------------------------
+
+let cloudCache: { terraform: boolean; aws: boolean; awsRegion: string; checkedAt: number } | null = null
+const CLOUD_CACHE_TTL = 60000 // 60 seconds
+let cloudProbe: Promise<{ terraform: boolean; aws: boolean; awsRegion: string; checkedAt: number }> | null = null
+
+async function getCloudStatus(): Promise<{ terraform: boolean; aws: boolean; awsRegion: string }> {
+  if (cloudCache && Date.now() - cloudCache.checkedAt < CLOUD_CACHE_TTL) {
+    return cloudCache
+  }
+  cloudProbe ??= probeCloud().finally(() => { cloudProbe = null })
+  return cloudProbe
+}
+
+async function probeCloud(): Promise<{ terraform: boolean; aws: boolean; awsRegion: string; checkedAt: number }> {
+  let terraformAvailable = false
+  try {
+    await execFileAsync('terraform', ['version'], { timeout: 3000 })
+    terraformAvailable = true
+  } catch {}
+
+  let awsAvailable = false
+  let awsRegion = 'us-east-1'
+  if (terraformAvailable) {
+    try {
+      await execFileAsync('aws', ['sts', 'get-caller-identity'], { timeout: 5000 })
+      awsAvailable = true
+      try {
+        const { stdout } = await execFileAsync('aws', ['configure', 'get', 'region'], { timeout: 3000 })
+        if (stdout.trim()) awsRegion = stdout.trim()
+      } catch {}
+    } catch {}
+  }
+
+  cloudCache = { terraform: terraformAvailable, aws: awsAvailable, awsRegion, checkedAt: Date.now() }
+  return cloudCache
+}
+
+// ---------------------------------------------------------------------------
+// Package version (read once at module load)
+// ---------------------------------------------------------------------------
+
+const packageJson = JSON.parse(
+  fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf-8')
+)
+const AI_MAESTRO_VERSION: string = packageJson.version || '0.0.0'
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Get self host identity for response.
+ * Uses centralized getPublicUrl for consistent URL detection.
+ * Includes all aliases for duplicate detection on remote hosts.
+ */
+function getLocalHostIdentity(): HostIdentity {
+  const selfHost = getSelfHost()
+  const aliases = getSelfAliases()
+  return {
+    id: selfHost.id,
+    name: selfHost.name,
+    url: getPublicUrl(selfHost),
+    description: selfHost.description,
+    aliases,
+  }
+}
+
+/**
+ * Get organization info formatted for response payloads.
+ */
+function getOrgInfo(): { organization?: string; organizationSetAt?: string; organizationSetBy?: string } {
+  const orgInfo = getOrganizationInfo()
+  return {
+    organization: orgInfo.organization || undefined,
+    organizationSetAt: orgInfo.setAt || undefined,
+    organizationSetBy: orgInfo.setBy || undefined,
+  }
+}
+
+/**
+ * Get all known peer hosts as identities for peer exchange.
+ * Excludes the requesting host to avoid circular references.
+ */
+function getKnownHostIdentities(excludeId?: string): HostIdentity[] {
+  const hosts = getHosts()
+  return hosts
+    .filter(h => !isSelf(h.id) && h.enabled && h.id !== excludeId)
+    .map(h => ({
+      id: h.id,
+      name: h.name,
+      url: h.url,
+      description: h.description,
+    }))
+}
+
+/**
+ * Make health check request using native fetch.
+ * Also extracts session count from /api/sessions response.
+ */
+async function makeHealthCheckRequest(
+  url: URL,
+  timeout: number
+): Promise<{ success: boolean; error?: string; sessionCount?: number }> {
+  try {
+    // local=true: the peer's own sessions only; without it every health check made the peer ask all of its peers
+    const sessionsUrl = `${url.protocol}//${url.host}/api/sessions?local=true`
+
+    const response = await fetch(sessionsUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'AI-Maestro-Health-Check',
+        'Accept': 'application/json'
+      },
+      signal: AbortSignal.timeout(timeout),
+      cache: 'no-store'
+    })
+
+    if (response.ok || response.status < 500) {
+      let sessionCount: number | undefined
+      try {
+        const json = await response.json()
+        if (json.sessions && Array.isArray(json.sessions)) {
+          sessionCount = json.sessions.length
+        }
+      } catch {
+        // Failed to parse, but host is still online
+      }
+      return { success: true, sessionCount }
+    } else {
+      return { success: false, error: `HTTP ${response.status}` }
+    }
+  } catch (error) {
+    if (error instanceof Error) {
+      if (error.name === 'TimeoutError' || error.name === 'AbortError') {
+        return { success: false, error: 'Connection timeout' }
+      }
+      return { success: false, error: error.message }
+    }
+    return { success: false, error: 'Unknown error' }
+  }
+}
+
+/**
+ * Fetch version info from remote host's /api/config endpoint.
+ */
+async function fetchVersionInfo(
+  url: URL,
+  timeout: number
+): Promise<{ version?: string }> {
+  try {
+    const configUrl = `${url.protocol}//${url.host}/api/config`
+
+    const response = await fetch(configUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'AI-Maestro-Health-Check',
+        'Accept': 'application/json'
+      },
+      signal: AbortSignal.timeout(timeout),
+      cache: 'no-store'
+    })
+
+    if (response.ok) {
+      const config = await response.json()
+      return { version: config.version }
+    }
+    return {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Fetch Docker availability from remote host's /api/docker/info endpoint.
+ */
+async function fetchDockerInfo(
+  url: URL,
+  timeout: number
+): Promise<{ available: boolean; version?: string }> {
+  try {
+    const dockerUrl = `${url.protocol}//${url.host}/api/docker/info`
+
+    const response = await fetch(dockerUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'AI-Maestro-Health-Check',
+        'Accept': 'application/json'
+      },
+      signal: AbortSignal.timeout(timeout),
+      cache: 'no-store'
+    })
+
+    if (response.ok) {
+      const data = await response.json()
+      return { available: !!data.available, version: data.version }
+    }
+    return { available: false }
+  } catch {
+    return { available: false }
+  }
+}
+
+/**
+ * Check if a single host is reachable via health check.
+ */
+async function checkHostHealth(url: string, timeoutMs: number = 5000): Promise<boolean> {
+  try {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), timeoutMs)
+
+    const response = await fetch(`${url}/api/config`, {
+      signal: controller.signal,
+    })
+    clearTimeout(timeout)
+
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Check health of multiple hosts concurrently.
+ */
+async function checkHostsHealthConcurrent(
+  hosts: HostIdentity[],
+  timeoutMs: number = 5000
+): Promise<Map<string, boolean>> {
+  const results = new Map<string, boolean>()
+
+  const checks = hosts.map(async (host) => {
+    const isHealthy = await checkHostHealth(host.url, timeoutMs)
+    results.set(host.id, isHealthy)
+  })
+
+  await Promise.all(checks)
+  return results
+}
+
+// ===========================================================================
+// PUBLIC API — called by API routes
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GET /api/hosts — list hosts with docker status + isSelf flag
+// ---------------------------------------------------------------------------
+
+export async function listHosts(): Promise<ServiceResult<{ hosts: any[] }>> {
+  try {
+    const hosts = getHosts()
+
+    // Start Docker + Cloud checks in parallel
+    const dockerStatusPromise = getDockerStatus()
+    const cloudStatusPromise = getCloudStatus()
+
+    // Add isSelf flag to each host right away
+    const hostsWithSelf = hosts.map(host => ({
+      ...host,
+      isSelf: isSelf(host.id),
+    }))
+
+    // Await Docker + Cloud status (returns from cache instantly after first check)
+    const [docker, cloud] = await Promise.all([dockerStatusPromise, cloudStatusPromise])
+    for (const host of hostsWithSelf) {
+      if (host.isSelf) {
+        (host as any).capabilities = {
+          docker: docker.available,
+          dockerVersion: docker.version,
+          cloud: {
+            aws: cloud.aws && cloud.terraform,
+            terraform: cloud.terraform,
+            awsRegion: cloud.awsRegion,
+          },
+        }
+      }
+
+      // Add online/offline/unknown status based on cached sync data
+      if (host.isSelf) {
+        (host as any).status = 'online'
+      } else if (host.lastSyncSuccess) {
+        const syncAge = Date.now() - new Date(host.lastSyncSuccess).getTime();
+        // 5 minute threshold for considering a host online
+        (host as any).status = syncAge < 300000 ? 'online' : 'offline'
+      } else if (host.lastSyncError) {
+        (host as any).status = 'offline'
+      } else {
+        (host as any).status = 'unknown'
+      }
+    }
+
+    // Append disabled (circuit-broken) hosts so the UI can show them
+    const allRaw = loadAllHostsRaw()
+    const enabledIds = new Set(hostsWithSelf.map(h => h.id.toLowerCase()))
+    const disabledHosts = allRaw
+      .filter(h => h.enabled === false && !enabledIds.has(h.id.toLowerCase()))
+      .map(h => ({
+        ...h,
+        isSelf: false,
+        status: 'disabled' as const,
+      }))
+
+    return { data: { hosts: [...hostsWithSelf, ...disabledHosts] }, status: 200 }
+  } catch (error) {
+    console.error('[Hosts API] Failed to fetch hosts:', error)
+    return operationFailed('fetch hosts')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/hosts — add host with optional sync
+// ---------------------------------------------------------------------------
+
+export interface AddHostParams {
+  host: Host
+  syncEnabled: boolean
+}
+
+export async function addNewHost(params: AddHostParams): Promise<ServiceResult<any>> {
+  try {
+    const { host, syncEnabled } = params
+
+    // Validate required fields
+    if (!host.id || !host.name || !host.url) {
+      return invalidRequest('Missing required fields: id, name, url')
+    }
+
+    // Validate ID format (alphanumeric, dash, underscore)
+    if (!/^[a-zA-Z0-9_-]+$/.test(host.id)) {
+      return invalidField('id', 'Host ID can only contain letters, numbers, dashes, and underscores')
+    }
+
+    // Validate URL format
+    try {
+      new URL(host.url)
+    } catch {
+      return invalidField('url', 'Invalid URL format')
+    }
+
+    // Use sync-enabled add for remote hosts, regular add for local
+    if (syncEnabled && host.type !== 'local') {
+      const syncResult = await addHostWithSync(host)
+
+      return {
+        data: {
+          success: syncResult.success,
+          host: syncResult.host,
+          sync: {
+            localAdd: syncResult.localAdd,
+            backRegistered: syncResult.backRegistered,
+            peersExchanged: syncResult.peersExchanged,
+            peersShared: syncResult.peersShared,
+            errors: syncResult.errors,
+          }
+        },
+        status: 200,
+      }
+    } else {
+      // Legacy: local-only add (for local host or when sync disabled)
+      const result = addHost(host)
+      if (!result.success) {
+        return invalidRequest(result.error || 'Failed to add host')
+      }
+
+      return {
+        data: {
+          success: true,
+          host,
+          sync: { localAdd: true, backRegistered: false, peersExchanged: 0, peersShared: 0, errors: [] }
+        },
+        status: 200,
+      }
+    }
+  } catch (error) {
+    console.error('[Hosts API] Failed to add host:', error)
+    return operationFailed('add host')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PUT /api/hosts/[id] — update host
+// ---------------------------------------------------------------------------
+
+export async function updateExistingHost(
+  id: string,
+  hostData: Partial<Host>
+): Promise<ServiceResult<{ success: boolean; host?: Host }>> {
+  try {
+    // Validate URL if provided
+    if (hostData.url) {
+      try {
+        new URL(hostData.url)
+      } catch {
+        return invalidField('url', 'Invalid URL format')
+      }
+    }
+
+    const result = updateHost(id, hostData)
+    if (!result.success) {
+      return result.error?.includes('not found')
+        ? notFound('Host', id)
+        : invalidRequest(result.error || 'Failed to update host')
+    }
+
+    return { data: { success: true, host: result.host }, status: 200 }
+  } catch (error) {
+    console.error(`[Hosts API] Failed to update host:`, error)
+    return operationFailed('update host')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/hosts/[id] — delete host
+// ---------------------------------------------------------------------------
+
+export async function deleteExistingHost(id: string): Promise<ServiceResult<{ success: boolean }>> {
+  try {
+    const result = deleteHost(id)
+    if (!result.success) {
+      return result.error?.includes('not found')
+        ? notFound('Host', id)
+        : invalidRequest(result.error || 'Failed to delete host')
+    }
+
+    return { data: { success: true }, status: 200 }
+  } catch (error) {
+    console.error(`[Hosts API] Failed to delete host:`, error)
+    return operationFailed('delete host')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/hosts/identity — self host identity with org info
+// ---------------------------------------------------------------------------
+
+/** GET /api/hosts/load: this host's RAM, swap, load average and online agents, measured now. */
+export function getHostLoad(): ServiceResult<HostLoad> {
+  let online = 0
+  try {
+    online = loadAgents().filter(a => !a.deletedAt && a.sessions?.some(s => s.status === 'online')).length
+  } catch { /* an unreadable registry reads as 0 agents, the machine numbers are still true */ }
+  return { data: readHostLoad(online), status: 200 }
+}
+
+export function getHostIdentity(): ServiceResult<HostIdentityResponse> {
+  const selfHost = getSelfHost()
+  const orgInfo = getOrganizationInfo()
+
+  // ALWAYS use the configured URL from hosts.json
+  // NEVER use localhost - it's useless in a mesh network
+  const url = selfHost.url
+
+  // Detect if running on Tailscale (IPs start with 100.)
+  const tailscale = selfHost.tailscale || url.includes('100.')
+
+  return {
+    data: {
+      host: {
+        id: selfHost.id,
+        name: selfHost.name,
+        url,
+        description: selfHost.description,
+        version: AI_MAESTRO_VERSION,
+        tailscale,
+        isSelf: true as const,
+      },
+      organization: orgInfo.organization || undefined,
+      organizationSetAt: orgInfo.setAt || undefined,
+      organizationSetBy: orgInfo.setBy || undefined,
+    },
+    status: 200,
+  }
+}
+
+// The Mac app keeps its command inside the app, off the PATH
+const TAILSCALE_COMMANDS = ['tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale']
+
+/** `tailscale <args>` as JSON, or undefined when there is no Tailscale: a host on a local network only is fine */
+async function readTailscale(args: string[]): Promise<any> {
+  for (const command of TAILSCALE_COMMANDS) {
+    try {
+      const { stdout } = await execFileAsync(command, args, { timeout: 3000 })
+      return JSON.parse(stdout)
+    } catch { /* try the next one */ }
+  }
+  return undefined
+}
+
+export async function getConnectInfo(): Promise<ServiceResult<ConnectInfo>> {
+  const selfHost = getSelfHost()
+  const [tailscaleStatus, tailscaleServe] = await Promise.all([readTailscale(['status', '--json']), readTailscale(['serve', 'status', '--json'])])
+  return {
+    data: buildConnectInfo({
+      hostId: selfHost.id,
+      name: selfHost.name,
+      organization: getOrganizationInfo().organization || undefined,
+      port: Number(process.env.PORT) || 23000,
+      bindHost: resolveBindHost(),
+      localIPs: getLocalIPs(),
+      tailscaleStatus,
+      tailscaleServe,
+    }),
+    status: 200,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/hosts/health — proxy health check to remote host
+// ---------------------------------------------------------------------------
+
+export async function checkRemoteHealth(hostUrl: string): Promise<ServiceResult<any>> {
+  try {
+    if (!hostUrl) {
+      return missingField('url')
+    }
+
+    // Validate URL format
+    let parsedUrl: URL
+    try {
+      parsedUrl = new URL(hostUrl)
+    } catch {
+      return invalidField('url', 'Invalid URL format')
+    }
+
+    // Make health check request using fetch
+    // Note: /api/sessions can take 5+ seconds on remote hosts due to tmux queries
+    const result = await makeHealthCheckRequest(parsedUrl, 10000)
+
+    if (result.success) {
+      // Also fetch version info and Docker capabilities
+      const [versionResult, dockerResult] = await Promise.all([
+        fetchVersionInfo(parsedUrl, 3000),
+        fetchDockerInfo(parsedUrl, 3000),
+      ])
+
+      return {
+        data: {
+          success: true,
+          status: 'online',
+          url: hostUrl,
+          version: versionResult.version || null,
+          sessionCount: result.sessionCount ?? null,
+          capabilities: {
+            docker: dockerResult.available,
+            dockerVersion: dockerResult.version,
+          },
+        },
+        status: 200,
+      }
+    } else {
+      return {
+        data: {
+          success: false,
+          status: 'offline',
+          url: hostUrl,
+          error: result.error,
+        },
+        status: 503,
+      }
+    }
+  } catch (error) {
+    console.error('[Health API] Error:', error)
+    return {
+      data: {
+        success: false,
+        status: 'offline',
+        error: error instanceof Error ? error.message : 'Unknown error',
+      },
+      status: 500,
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/hosts/sync — trigger mesh sync
+// ---------------------------------------------------------------------------
+
+export async function triggerMeshSync(): Promise<ServiceResult<any>> {
+  try {
+    const selfHost = getSelfHost()
+    const allHosts = getHosts()
+    const remotePeers = allHosts.filter(h => !isSelf(h.id) && h.enabled)
+
+    console.log(`[Mesh Sync] Starting manual sync with ${remotePeers.length} peers`)
+    console.log(`[Mesh Sync] Self: ${selfHost.name} (${selfHost.id})`)
+    console.log(`[Mesh Sync] Public URL: ${getPublicUrl(selfHost)}`)
+    console.log(`[Mesh Sync] Peers to sync:`, remotePeers.map(p => `${p.name} (${p.url})`))
+
+    const result = await syncWithAllPeers()
+
+    console.log(`[Mesh Sync] Completed: ${result.synced.length} synced, ${result.failed.length} failed`)
+
+    return {
+      data: {
+        success: true,
+        self: {
+          id: selfHost.id,
+          name: selfHost.name,
+          publicUrl: getPublicUrl(selfHost),
+        },
+        totalPeers: remotePeers.length,
+        synced: result.synced,
+        failed: result.failed,
+        peers: remotePeers.map(p => ({
+          id: p.id,
+          name: p.name,
+          url: p.url,
+          status: result.synced.includes(p.id) ? 'synced' : 'failed',
+        })),
+      },
+      status: 200,
+    }
+  } catch (error) {
+    console.error('[Mesh Sync] Error during manual sync:', error)
+    return operationFailed('mesh sync', (error as Error).message)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/hosts/sync — get mesh status without triggering sync
+// ---------------------------------------------------------------------------
+
+export async function getMeshStatus(): Promise<ServiceResult<any>> {
+  try {
+    const selfHost = getSelfHost()
+    const allHosts = getHosts()
+    const remotePeers = allHosts.filter(h => !isSelf(h.id) && h.enabled)
+
+    // Check health of all peers concurrently
+    const healthChecks = await Promise.all(
+      remotePeers.map(async (peer) => {
+        try {
+          const controller = new AbortController()
+          const timeout = setTimeout(() => controller.abort(), 5000)
+
+          const response = await fetch(`${peer.url}/api/config`, {
+            signal: controller.signal,
+          })
+          clearTimeout(timeout)
+
+          return {
+            id: peer.id,
+            name: peer.name,
+            url: peer.url,
+            reachable: response.ok,
+            type: peer.type,
+            syncedAt: peer.syncedAt,
+            syncSource: peer.syncSource,
+          }
+        } catch {
+          return {
+            id: peer.id,
+            name: peer.name,
+            url: peer.url,
+            reachable: false,
+            type: peer.type,
+            syncedAt: peer.syncedAt,
+            syncSource: peer.syncSource,
+          }
+        }
+      })
+    )
+
+    const reachableCount = healthChecks.filter(p => p.reachable).length
+    const unreachableCount = healthChecks.filter(p => !p.reachable).length
+
+    return {
+      data: {
+        self: {
+          id: selfHost.id,
+          name: selfHost.name,
+          publicUrl: getPublicUrl(selfHost),
+        },
+        meshStatus: {
+          totalPeers: remotePeers.length,
+          reachable: reachableCount,
+          unreachable: unreachableCount,
+          healthy: unreachableCount === 0,
+        },
+        peers: healthChecks,
+      },
+      status: 200,
+    }
+  } catch (error) {
+    console.error('[Mesh Status] Error getting mesh status:', error)
+    return operationFailed('get mesh status', (error as Error).message)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/hosts/register-peer — accept peer registration
+// ---------------------------------------------------------------------------
+
+export async function registerPeer(body: PeerRegistrationRequest): Promise<ServiceResult<PeerRegistrationResponse>> {
+  try {
+    // Validate request
+    if (!body.host || !body.host.id || !body.host.name || !body.host.url) {
+      return {
+        data: {
+          success: false,
+          registered: false,
+          alreadyKnown: false,
+          host: getLocalHostIdentity(),
+          knownHosts: [],
+          ...getOrgInfo(),
+          error: 'Missing required fields: host.id, host.name, host.url',
+        },
+        status: 400,
+      }
+    }
+
+    // Check propagation depth to prevent infinite loops
+    const propagationDepth = body.source?.propagationDepth || 0
+    if (propagationDepth > MAX_PROPAGATION_DEPTH) {
+      console.log(`[Host Sync] Max propagation depth (${MAX_PROPAGATION_DEPTH}) reached, rejecting`)
+      return {
+        data: {
+          success: true,
+          registered: false,
+          alreadyKnown: true,
+          host: getLocalHostIdentity(),
+          knownHosts: [],
+          ...getOrgInfo(),
+          error: 'Max propagation depth reached',
+        },
+        status: 200,
+      }
+    }
+
+    // Check if we've already processed this propagation ID
+    const propagationId = body.source?.propagationId
+    if (propagationId && hasProcessedPropagation(propagationId)) {
+      console.log(`[Host Sync] Already processed propagation ${propagationId}, skipping`)
+      return {
+        data: {
+          success: true,
+          registered: false,
+          alreadyKnown: true,
+          host: getLocalHostIdentity(),
+          knownHosts: [],
+          ...getOrgInfo(),
+        },
+        status: 200,
+      }
+    }
+
+    // Mark propagation as processed
+    if (propagationId) {
+      markPropagationProcessed(propagationId)
+    }
+
+    // Prevent self-registration - use ID only (not URL, as URL can vary)
+    const selfHost = getSelfHost()
+    if (body.host.id === selfHost.id || isSelf(body.host.id)) {
+      return {
+        data: {
+          success: false,
+          registered: false,
+          alreadyKnown: false,
+          host: getLocalHostIdentity(),
+          knownHosts: [],
+          ...getOrgInfo(),
+          error: 'Cannot register self as peer',
+        },
+        status: 400,
+      }
+    }
+
+    // Adopt organization from peer if we don't have one
+    let organizationAdopted = false
+    if (body.organization && body.organizationSetAt && body.organizationSetBy) {
+      if (!hasOrganization()) {
+        const adoptResult = adoptOrganization(
+          body.organization,
+          body.organizationSetAt,
+          body.organizationSetBy
+        )
+        if (adoptResult.success && adoptResult.adopted) {
+          organizationAdopted = true
+          console.log(`[Host Sync] Adopted organization "${body.organization}" from peer ${body.host.id}`)
+        } else if (!adoptResult.success) {
+          console.warn(`[Host Sync] Failed to adopt organization: ${adoptResult.error}`)
+        }
+      } else {
+        // Check for organization mismatch
+        const currentOrg = getOrganizationInfo()
+        if (currentOrg.organization && currentOrg.organization !== body.organization) {
+          console.warn(`[Host Sync] Organization mismatch: local="${currentOrg.organization}" vs peer="${body.organization}"`)
+          return {
+            data: {
+              success: false,
+              registered: false,
+              alreadyKnown: false,
+              host: getLocalHostIdentity(),
+              knownHosts: [],
+              ...getOrgInfo(),
+              error: `Organization mismatch: this network is "${currentOrg.organization}" but peer is from "${body.organization}"`,
+            },
+            status: 409,
+          }
+        }
+      }
+    }
+
+    // Check if this peer was circuit-broken — re-enable it
+    const allRaw = loadAllHostsRaw()
+    const circuitBroken = allRaw.find(
+      h => h.id.toLowerCase() === body.host.id.toLowerCase() && h.enabled === false
+    )
+    if (circuitBroken) {
+      console.log(`[Host Sync] Re-enabling circuit-broken host '${circuitBroken.id}' via peer registration`)
+      updateHostRaw(circuitBroken.id, {
+        enabled: true,
+        offlineReason: undefined,
+        offlineSince: undefined,
+        lastSyncError: undefined,
+        url: body.host.url,
+        aliases: body.host.aliases || circuitBroken.aliases,
+        syncedAt: new Date().toISOString(),
+        syncSource: body.source?.initiator || 'peer-registration',
+      })
+      resetCircuitBreaker(circuitBroken.id)
+      clearHostsCache()
+      return {
+        data: {
+          success: true,
+          registered: false,
+          alreadyKnown: true,
+          host: getLocalHostIdentity(),
+          knownHosts: getKnownHostIdentities(body.host.id),
+          ...getOrgInfo(),
+        },
+        status: 200,
+      }
+    }
+
+    // Build list of all identifiers to check for duplicates
+    const incomingIdentifiers: string[] = [
+      body.host.id,
+      body.host.url,
+      ...(body.host.aliases || []),
+    ].filter(Boolean)
+
+    // Check if we already know this host by any identifier (ID, URL, IP, or alias)
+    const existingHostById = getHostById(body.host.id)
+    if (existingHostById) {
+      console.log(`[Host Sync] Peer ${body.host.name} (${body.host.id}) already known by ID`)
+      // Peer is alive — reset circuit breaker if it was tripped
+      resetCircuitBreaker(body.host.id)
+      return {
+        data: {
+          success: true,
+          registered: false,
+          alreadyKnown: true,
+          host: getLocalHostIdentity(),
+          knownHosts: getKnownHostIdentities(body.host.id),
+          ...getOrgInfo(),
+        },
+        status: 200,
+      }
+    }
+
+    // Check against all incoming identifiers (URL, aliases, IPs)
+    for (const identifier of incomingIdentifiers) {
+      const existingHost = findHostByAnyIdentifier(identifier)
+      if (existingHost && !isSelf(existingHost.id)) {
+        console.log(`[Host Sync] Host with identifier "${identifier}" already exists as ${existingHost.id}`)
+        return {
+          data: {
+            success: true,
+            registered: false,
+            alreadyKnown: true,
+            host: getLocalHostIdentity(),
+            knownHosts: getKnownHostIdentities(body.host.id),
+            ...getOrgInfo(),
+          },
+          status: 200,
+        }
+      }
+    }
+
+    // Sanitize description to remove control characters
+    const sanitizedDescription = (body.host.description || `Peer registered from ${body.source?.initiator || 'unknown'}`)
+      .replace(/[\x00-\x1F\x7F]/g, '')
+      .substring(0, 500)
+
+    // Add the new peer (include aliases for future duplicate detection)
+    const newHost: Host = {
+      id: body.host.id,
+      name: body.host.name,
+      url: body.host.url,
+      type: 'remote',
+      aliases: body.host.aliases || [],
+      enabled: true,
+      description: sanitizedDescription,
+      syncedAt: new Date().toISOString(),
+      syncSource: body.source?.initiator || 'peer-registration',
+    }
+
+    // Use async version with lock for concurrent safety
+    const result = await addHostAsync(newHost)
+    if (!result.success) {
+      return {
+        data: {
+          success: false,
+          registered: false,
+          alreadyKnown: false,
+          host: getLocalHostIdentity(),
+          knownHosts: [],
+          ...getOrgInfo(),
+          error: result.error || 'Failed to add peer',
+        },
+        status: 500,
+      }
+    }
+
+    // Clear cache to ensure subsequent reads see the new host
+    clearHostsCache()
+
+    console.log(`[Host Sync] Registered new peer: ${body.host.name} (${body.host.id}) from ${body.host.url}`)
+
+    return {
+      data: {
+        success: true,
+        registered: true,
+        alreadyKnown: false,
+        host: getLocalHostIdentity(),
+        knownHosts: getKnownHostIdentities(body.host.id),
+        ...getOrgInfo(),
+        organizationAdopted,
+      },
+      status: 200,
+    }
+  } catch (error) {
+    console.error('[Host Sync] Error in register-peer:', error)
+    return {
+      data: {
+        success: false,
+        registered: false,
+        alreadyKnown: false,
+        host: getLocalHostIdentity(),
+        knownHosts: [],
+        ...getOrgInfo(),
+        error: error instanceof Error ? error.message : 'Internal server error',
+      },
+      status: 500,
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/hosts/:id/reactivate — re-enable a circuit-broken host
+// ---------------------------------------------------------------------------
+
+export async function reactivateHost(id: string): Promise<ServiceResult<{ success: boolean; host?: Host }>> {
+  try {
+    if (!id) {
+      return missingField('id')
+    }
+
+    const allHosts = loadAllHostsRaw()
+    const host = allHosts.find(h => h.id.toLowerCase() === id.toLowerCase())
+
+    if (!host) {
+      return notFound('Host', id)
+    }
+
+    const isDisabled = host.enabled === false
+    const isCircuitBroken = isCircuitOpen(host.id)
+
+    if (!isDisabled && !isCircuitBroken) {
+      return invalidRequest(`Host '${id}' is already enabled and circuit is closed`)
+    }
+
+    if (isDisabled) {
+      const result = updateHostRaw(id, {
+        enabled: true,
+        offlineReason: undefined,
+        offlineSince: undefined,
+        lastSyncError: undefined,
+      })
+      if (!result.success) {
+        return operationFailed('reactivate host', result.error)
+      }
+    } else {
+      // Host is enabled but circuit-broken — just clear error metadata
+      updateHostRaw(id, {
+        offlineReason: undefined,
+        offlineSince: undefined,
+        lastSyncError: undefined,
+      })
+    }
+
+    resetCircuitBreaker(id)
+    clearHostsCache()
+
+    console.log(`[Hosts] Reactivated host: ${id} (was ${isDisabled ? 'disabled' : 'circuit-broken'})`)
+    return { data: { success: true, host }, status: 200 }
+  } catch (error) {
+    console.error(`[Hosts] Failed to reactivate host '${id}':`, error)
+    return operationFailed('reactivate host')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/hosts/exchange-peers — exchange peer lists
+// ---------------------------------------------------------------------------
+
+export async function exchangePeers(body: PeerExchangeRequest): Promise<ServiceResult<PeerExchangeResponse>> {
+  try {
+    // Validate request
+    if (!body.fromHost || !body.knownHosts) {
+      return {
+        data: {
+          success: false,
+          newlyAdded: [],
+          alreadyKnown: [],
+          unreachable: [],
+          error: 'Missing required fields: fromHost, knownHosts',
+        },
+        status: 400,
+      }
+    }
+
+    // Check if we've already processed this propagation
+    const propagationId = body.propagationId
+    if (propagationId && hasProcessedPropagation(propagationId)) {
+      console.log(`[Host Sync] Already processed propagation ${propagationId} in exchange-peers, skipping`)
+      return {
+        data: {
+          success: true,
+          newlyAdded: [],
+          alreadyKnown: [],
+          unreachable: [],
+        },
+        status: 200,
+      }
+    }
+
+    // Mark propagation as processed
+    if (propagationId) {
+      markPropagationProcessed(propagationId)
+    }
+
+    const selfHost = getSelfHost()
+    const newlyAdded: string[] = []
+    const alreadyKnown: string[] = []
+    const unreachable: string[] = []
+    let organizationAdopted = false
+
+    // Handle organization sync - adopt from peer if we don't have one
+    if (body.organization && body.organizationSetAt && body.organizationSetBy) {
+      const adoptResult = adoptOrganization(
+        body.organization,
+        body.organizationSetAt,
+        body.organizationSetBy
+      )
+      if (adoptResult.success && adoptResult.adopted) {
+        organizationAdopted = true
+        console.log(`[Host Sync] Adopted organization "${body.organization}" from peer exchange`)
+      } else if (!adoptResult.success && adoptResult.error?.includes('mismatch')) {
+        // Organization mismatch - this is a serious error
+        console.error(`[Host Sync] Organization mismatch with peer: ${adoptResult.error}`)
+        const orgInfo = getOrganizationInfo()
+        return {
+          data: {
+            success: false,
+            newlyAdded: [],
+            alreadyKnown: [],
+            unreachable: [],
+            organization: orgInfo.organization || undefined,
+            organizationSetAt: orgInfo.setAt || undefined,
+            organizationSetBy: orgInfo.setBy || undefined,
+            error: adoptResult.error,
+          },
+          status: 409,
+        }
+      }
+    }
+
+    // Deduplicate incoming hosts by ID
+    const seenIds = new Set<string>()
+    const uniqueHosts: HostIdentity[] = []
+    for (const host of body.knownHosts) {
+      if (!seenIds.has(host.id)) {
+        seenIds.add(host.id)
+        uniqueHosts.push(host)
+      }
+    }
+
+    // Filter hosts that need processing
+    const hostsToProcess: HostIdentity[] = []
+    console.log(`[Host Sync] Processing ${uniqueHosts.length} unique hosts from ${body.fromHost.name}`)
+
+    for (const peerHost of uniqueHosts) {
+      // Skip if it's us (by ID or isSelf check - URL can vary)
+      if (peerHost.id === selfHost.id || isSelf(peerHost.id)) {
+        console.log(`[Host Sync] Skipping ${peerHost.name} (${peerHost.id}): is self`)
+        continue
+      }
+
+      // Skip if it's the sender (we already know them from register-peer)
+      if (peerHost.id === body.fromHost.id) {
+        console.log(`[Host Sync] Skipping ${peerHost.name} (${peerHost.id}): is sender`)
+        continue
+      }
+
+      // Check if we already know this host by ID
+      const existing = getHostById(peerHost.id)
+      if (existing) {
+        console.log(`[Host Sync] Skipping ${peerHost.name} (${peerHost.id}): already known by ID`)
+        alreadyKnown.push(peerHost.id)
+        continue
+      }
+
+      // Check if URL already exists
+      const hosts = getHosts()
+      const hostWithSameUrl = hosts.find(h => h.url === peerHost.url && !isSelf(h.id))
+      if (hostWithSameUrl) {
+        console.log(`[Host Sync] Skipping ${peerHost.name} (${peerHost.id}): URL ${peerHost.url} already exists as ${hostWithSameUrl.id}`)
+        alreadyKnown.push(peerHost.id)
+        continue
+      }
+
+      console.log(`[Host Sync] Will process ${peerHost.name} (${peerHost.id}) at ${peerHost.url}`)
+      hostsToProcess.push(peerHost)
+    }
+
+    // Concurrent health checks for all hosts to process
+    if (hostsToProcess.length > 0) {
+      console.log(`[Host Sync] Running health checks for ${hostsToProcess.length} hosts...`)
+      const healthResults = await checkHostsHealthConcurrent(hostsToProcess)
+
+      // Log all health check results
+      for (const [hostId, isHealthy] of healthResults.entries()) {
+        const host = hostsToProcess.find(h => h.id === hostId)
+        console.log(`[Host Sync] Health check ${host?.name} (${host?.url}): ${isHealthy ? 'REACHABLE' : 'UNREACHABLE'}`)
+      }
+
+      for (const peerHost of hostsToProcess) {
+        const isReachable = healthResults.get(peerHost.id)
+        if (!isReachable) {
+          console.log(`[Host Sync] Peer ${peerHost.name} (${peerHost.url}) is UNREACHABLE from this host, skipping`)
+          unreachable.push(peerHost.id)
+          continue
+        }
+
+        // Sanitize description
+        const sanitizedDescription = (peerHost.description || `Discovered via peer exchange from ${body.fromHost.name}`)
+          .replace(/[\x00-\x1F\x7F]/g, '')
+          .substring(0, 500)
+
+        // Add the new host (include aliases for hostname/IP resolution)
+        const newHost: Host = {
+          id: peerHost.id,
+          name: peerHost.name,
+          url: peerHost.url,
+          type: 'remote',
+          enabled: true,
+          description: sanitizedDescription,
+          aliases: peerHost.aliases || [],
+          syncedAt: new Date().toISOString(),
+          syncSource: `peer-exchange:${body.fromHost.id}`,
+        }
+
+        // Use async version with lock for concurrent safety
+        const result = await addHostAsync(newHost)
+        if (result.success) {
+          console.log(`[Host Sync] Added peer from exchange: ${peerHost.name} (${peerHost.id})`)
+          newlyAdded.push(peerHost.id)
+        } else {
+          console.error(`[Host Sync] Failed to add peer ${peerHost.id}:`, result.error)
+        }
+      }
+
+      // Clear cache if we added any new hosts
+      if (newlyAdded.length > 0) {
+        clearHostsCache()
+      }
+    }
+
+    console.log(`[Host Sync] Peer exchange from ${body.fromHost.name}: +${newlyAdded.length} new, ${alreadyKnown.length} known, ${unreachable.length} unreachable`)
+
+    // Include our organization info in response
+    const orgInfo = getOrganizationInfo()
+
+    return {
+      data: {
+        success: true,
+        newlyAdded,
+        alreadyKnown,
+        unreachable,
+        organization: orgInfo.organization || undefined,
+        organizationSetAt: orgInfo.setAt || undefined,
+        organizationSetBy: orgInfo.setBy || undefined,
+        organizationAdopted,
+      },
+      status: 200,
+    }
+  } catch (error) {
+    console.error('[Host Sync] Error in exchange-peers:', error)
+    const orgInfo = getOrganizationInfo()
+    return {
+      data: {
+        success: false,
+        newlyAdded: [],
+        alreadyKnown: [],
+        unreachable: [],
+        organization: orgInfo.organization || undefined,
+        organizationSetAt: orgInfo.setAt || undefined,
+        organizationSetBy: orgInfo.setBy || undefined,
+        error: error instanceof Error ? error.message : 'Internal server error',
+      },
+      status: 500,
+    }
+  }
+}

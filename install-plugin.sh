@@ -1,0 +1,1145 @@
+#!/bin/bash
+# AI Maestro Plugin Installer — 23blocks default plugin
+#
+# Installs the AI Maestro plugin: all skills, scripts, and CLI tools.
+# This is the default plugin configuration maintained by 23blocks.
+# Users can customize their own plugin builds by forking the plugin builder:
+#
+#   Repo:    https://github.com/23blocks-OS/ai-maestro-plugins
+#   Website: https://aimaestro.sh/plugin-builder.html
+#
+# The plugin builder lets you compose custom skill sets from any source
+# (GitHub repos, local files, private repos) into a single plugin.
+# This installer ships the default set that supports AI Maestro.
+#
+# Usage:
+#   ./install-plugin.sh           # Interactive mode
+#   ./install-plugin.sh -y        # Non-interactive (install all)
+#   ./install-plugin.sh --migrate # Migrate from old messaging system
+
+set -e
+
+# Parse command line arguments
+NON_INTERACTIVE=false
+MIGRATE_ONLY=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -y|--yes|--non-interactive)
+            NON_INTERACTIVE=true
+            shift
+            ;;
+        --migrate)
+            MIGRATE_ONLY=true
+            shift
+            ;;
+        -h|--help)
+            echo "AI Maestro Plugin Installer (23blocks default)"
+            echo ""
+            echo "Usage: ./install-plugin.sh [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  -y, --yes          Non-interactive mode (install all, assume yes)"
+            echo "  --migrate          Migrate from old messaging system only"
+            echo "  -h, --help         Show this help message"
+            echo ""
+            echo "This installer sets up the AI Maestro plugin which provides:"
+            echo "  - Agent Messaging Protocol (AMP) — local + federated messaging"
+            echo "  - Agent Identity Protocol (AID) — OAuth 2.0 with Ed25519 keys"
+            echo "  - Agent Actions Protocol (AAP) — canvas interactions and UI actions"
+            echo "  - Memory search, code graph, docs search, agent management tools"
+            echo ""
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Icons
+CHECK="✅"
+CROSS="❌"
+INFO="ℹ️ "
+WARN="⚠️ "
+
+echo ""
+echo "╔════════════════════════════════════════════════════════════════╗"
+echo "║                                                                ║"
+echo "║         AI Maestro Plugin Installer (23blocks default)        ║"
+echo "║                                                                ║"
+echo "║   Skills, scripts, and CLI tools for your AI agents           ║"
+echo "║   Customize: aimaestro.sh/plugin-builder.html                 ║"
+echo "║                                                                ║"
+echo "╚════════════════════════════════════════════════════════════════╝"
+echo ""
+
+# Function to print colored messages
+# Write a new file and rename it over the old one. A plain cp onto a script that an agent is running
+# at that moment fails on Linux with "Text file busy" and stopped a whole update (mini-lola, 0.106.47).
+install_exec() {
+    local src="$1" dir="$2" tmp
+    tmp="$dir/.$(basename "$src").$$"
+    cp "$src" "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$dir/$(basename "$src")"
+}
+
+print_success() {
+    echo -e "${GREEN}${CHECK} $1${NC}"
+}
+
+print_error() {
+    echo -e "${RED}${CROSS} $1${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}${WARN} $1${NC}"
+}
+
+print_info() {
+    echo -e "${BLUE}${INFO}$1${NC}"
+}
+
+# Derive absolute path from script location so it works when called from any CWD
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_DIR="$SCRIPT_DIR/plugin/plugins/ai-maestro"
+if [ ! -d "$PLUGIN_DIR" ] || [ ! -d "$PLUGIN_DIR/scripts" ]; then
+    # Try to auto-initialize the submodule
+    if [ -f "$SCRIPT_DIR/.gitmodules" ] && command -v git &> /dev/null; then
+        print_warning "Plugin submodule not initialized. Initializing now..."
+        git -C "$SCRIPT_DIR" submodule update --init --recursive
+        if [ -d "$PLUGIN_DIR" ] && [ -d "$PLUGIN_DIR/scripts" ]; then
+            print_success "Submodule initialized"
+        else
+            print_error "Error: Failed to initialize plugin submodule."
+            echo ""
+            echo "Try manually:"
+            echo "  git submodule update --init --recursive"
+            exit 1
+        fi
+    else
+        print_error "Error: Plugin not found. Run from AI Maestro root directory."
+        echo ""
+        echo "If this is a fresh clone, initialize submodules:"
+        echo "  git submodule update --init --recursive"
+        echo ""
+        echo "Then run:"
+        echo "  ./install-plugin.sh"
+        exit 1
+    fi
+fi
+
+# Validate agent name to prevent path traversal (only alphanumeric, hyphens, underscores)
+_validate_agent_name() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        return 1
+    fi
+    if echo "$name" | grep -qE '^[a-zA-Z0-9_-]+$'; then
+        return 0
+    fi
+    return 1
+}
+
+# Migration function
+# Extract the recipient agent name from a message JSON file (for inbox placement)
+# Checks: toAlias, toSession, .to (plain name), envelope.to (extract name before @)
+_extract_recipient() {
+    local msg_file="$1"
+    local recipient=""
+
+    # Try toAlias first (old flat format)
+    recipient=$(jq -r '.toAlias // empty' "$msg_file" 2>/dev/null)
+    if [ -n "$recipient" ] && _validate_agent_name "$recipient"; then echo "$recipient"; return; fi
+
+    # Try toSession (some messages have this)
+    recipient=$(jq -r '.toSession // empty' "$msg_file" 2>/dev/null)
+    if [ -n "$recipient" ] && _validate_agent_name "$recipient"; then echo "$recipient"; return; fi
+
+    # Try .to as plain agent name (old format where to is a name, not UUID)
+    local to_val
+    to_val=$(jq -r '.to // empty' "$msg_file" 2>/dev/null)
+    if [ -n "$to_val" ] && ! echo "$to_val" | grep -qE '^[0-9a-f]{8}-'; then
+        # Not a UUID, treat as agent name
+        # Strip @domain if present
+        recipient=$(echo "$to_val" | cut -d'@' -f1)
+        if [ -n "$recipient" ] && _validate_agent_name "$recipient"; then echo "$recipient"; return; fi
+    fi
+
+    # Try AMP envelope format
+    local env_to
+    env_to=$(jq -r '.envelope.to // empty' "$msg_file" 2>/dev/null)
+    if [ -n "$env_to" ]; then
+        recipient=$(echo "$env_to" | cut -d'@' -f1)
+        if [ -n "$recipient" ] && _validate_agent_name "$recipient"; then echo "$recipient"; return; fi
+    fi
+
+    echo ""
+}
+
+# Extract the sender agent name from a message JSON file (for inbox subdirectory)
+# Checks: fromAlias, .from (plain name), envelope.from (extract name before @)
+_extract_sender() {
+    local msg_file="$1"
+    local sender=""
+
+    # Try fromAlias first (old flat format)
+    sender=$(jq -r '.fromAlias // empty' "$msg_file" 2>/dev/null)
+    if [ -n "$sender" ] && _validate_agent_name "$sender"; then echo "$sender"; return; fi
+
+    # Try .from as plain agent name
+    local from_val
+    from_val=$(jq -r '.from // empty' "$msg_file" 2>/dev/null)
+    if [ -n "$from_val" ] && ! echo "$from_val" | grep -qE '^[0-9a-f]{8}-'; then
+        sender=$(echo "$from_val" | cut -d'@' -f1)
+        if [ -n "$sender" ] && _validate_agent_name "$sender"; then echo "$sender"; return; fi
+    fi
+
+    # Try AMP envelope format
+    local env_from
+    env_from=$(jq -r '.envelope.from // empty' "$msg_file" 2>/dev/null)
+    if [ -n "$env_from" ]; then
+        sender=$(echo "$env_from" | cut -d'@' -f1)
+        if [ -n "$sender" ] && _validate_agent_name "$sender"; then echo "$sender"; return; fi
+    fi
+
+    echo ""
+}
+
+# Distribute messages from shared directory to per-agent directories
+# This is the critical Phase 2 that ensures messages end up where agents read them
+# Convert old flat-format message to AMP envelope format
+# If message already has .envelope, returns it unchanged
+_convert_to_amp_format() {
+    local msg_file="$1"
+    local now_ts
+    now_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Check if already in AMP envelope format
+    local has_envelope
+    has_envelope=$(jq -r 'has("envelope")' "$msg_file" 2>/dev/null)
+    if [ "$has_envelope" = "true" ]; then
+        cat "$msg_file"
+        return
+    fi
+
+    # Convert old flat format to AMP envelope
+    jq --arg now "$now_ts" '
+    {
+        envelope: {
+            version: "amp/0.1",
+            id: .id,
+            from: ((.fromAlias // .from // "unknown") + "@local"),
+            to: ((.toAlias // .to // "unknown") + "@local"),
+            subject: (.subject // ""),
+            priority: (.priority // "normal"),
+            timestamp: (.timestamp // $now),
+            thread_id: (.inReplyTo // .id),
+            in_reply_to: (.inReplyTo // null),
+            expires_at: null,
+            signature: null
+        },
+        payload: (
+            if (.content | type) == "object" then
+                {
+                    type: (.content.type // .type // "notification"),
+                    message: (.content.message // ""),
+                    context: (.content.context // null)
+                }
+            elif (.content | type) == "string" then
+                {
+                    type: (.type // "notification"),
+                    message: .content,
+                    context: null
+                }
+            else
+                {
+                    type: (.type // "notification"),
+                    message: "",
+                    context: null
+                }
+            end
+        ),
+        metadata: {
+            status: (.status // "unread"),
+            migrated_from: "flat_format",
+            migrated_at: $now
+        },
+        local: {
+            status: (.status // "unread"),
+            received_at: (.timestamp // $now)
+        }
+    }' "$msg_file" 2>/dev/null
+}
+
+distribute_shared_to_per_agent() {
+    local SHARED_INBOX="$HOME/.agent-messaging/messages/inbox"
+    local SHARED_SENT="$HOME/.agent-messaging/messages/sent"
+    local AGENTS_BASE="$HOME/.agent-messaging/agents"
+    local DISTRIBUTED=0
+    local SKIPPED=0
+
+    # Distribute inbox messages
+    if [ -d "$SHARED_INBOX" ]; then
+        while IFS= read -r msg_file; do
+            local recipient
+            recipient=$(_extract_recipient "$msg_file")
+            local sender
+            sender=$(_extract_sender "$msg_file")
+
+            if [ -n "$recipient" ] && [ -n "$sender" ]; then
+                local dest_dir="$AGENTS_BASE/$recipient/messages/inbox/$sender"
+                local msg_basename
+                msg_basename=$(basename "$msg_file")
+
+                # Skip if already exists in destination
+                if [ -f "$dest_dir/$msg_basename" ]; then
+                    continue
+                fi
+
+                mkdir -p "$dest_dir"
+                # Convert to AMP format and write
+                _convert_to_amp_format "$msg_file" > "$dest_dir/$msg_basename"
+                DISTRIBUTED=$((DISTRIBUTED + 1))
+            else
+                SKIPPED=$((SKIPPED + 1))
+            fi
+        done < <(find "$SHARED_INBOX" -name "*.json" -type f 2>/dev/null)
+    fi
+
+    # Distribute sent messages
+    if [ -d "$SHARED_SENT" ]; then
+        while IFS= read -r msg_file; do
+            local sender
+            sender=$(_extract_sender "$msg_file")
+            local recipient
+            recipient=$(_extract_recipient "$msg_file")
+
+            if [ -n "$sender" ] && [ -n "$recipient" ]; then
+                local dest_dir="$AGENTS_BASE/$sender/messages/sent/$recipient"
+                local msg_basename
+                msg_basename=$(basename "$msg_file")
+
+                if [ -f "$dest_dir/$msg_basename" ]; then
+                    continue
+                fi
+
+                mkdir -p "$dest_dir"
+                _convert_to_amp_format "$msg_file" > "$dest_dir/$msg_basename"
+                DISTRIBUTED=$((DISTRIBUTED + 1))
+            else
+                SKIPPED=$((SKIPPED + 1))
+            fi
+        done < <(find "$SHARED_SENT" -name "*.json" -type f 2>/dev/null)
+    fi
+
+    if [ "$DISTRIBUTED" -gt 0 ]; then
+        # Redirect informational output to stderr so stdout only contains the count
+        print_success "Distributed $DISTRIBUTED messages to per-agent directories (AMP format)" >&2
+    fi
+    if [ "$SKIPPED" -gt 0 ]; then
+        # Redirect informational output to stderr so stdout only contains the count
+        print_warning "Skipped $SKIPPED messages (could not determine recipient/sender)" >&2
+    fi
+
+    # Only the numeric count goes to stdout for $() capture
+    echo "$DISTRIBUTED"
+}
+
+migrate_old_messages() {
+    echo ""
+    print_info "Checking for messages to migrate..."
+
+    local OLD_INBOX="$HOME/.aimaestro/messages/inbox"
+    local OLD_SENT="$HOME/.aimaestro/messages/sent"
+    local SHARED_INBOX="$HOME/.agent-messaging/messages/inbox"
+    local SHARED_SENT="$HOME/.agent-messaging/messages/sent"
+    local PHASE1_DONE=false
+
+    # ── Phase 1: Migrate from old ~/.aimaestro/messages/ to shared location ──
+    if [ -d "$OLD_INBOX" ] || [ -d "$OLD_SENT" ]; then
+        local OLD_COUNT=0
+        if [ -d "$OLD_INBOX" ]; then
+            OLD_COUNT=$(find "$OLD_INBOX" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+        fi
+        local OLD_SENT_COUNT=0
+        if [ -d "$OLD_SENT" ]; then
+            OLD_SENT_COUNT=$(find "$OLD_SENT" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+        fi
+
+        if [ "$((OLD_COUNT + OLD_SENT_COUNT))" -gt 0 ]; then
+            print_warning "Found $((OLD_COUNT + OLD_SENT_COUNT)) messages in old format (~/.aimaestro/messages/)"
+
+            if [ "$NON_INTERACTIVE" = true ]; then
+                local MIGRATE_CHOICE="y"
+            else
+                echo ""
+                echo "  Messages will be migrated to per-agent directories."
+                echo ""
+                read -p "Migrate old messages? [Y/n]: " MIGRATE_CHOICE
+                MIGRATE_CHOICE=${MIGRATE_CHOICE:-Y}
+            fi
+
+            if [[ "$MIGRATE_CHOICE" =~ ^[Yy]$ ]]; then
+                mkdir -p "$SHARED_INBOX" "$SHARED_SENT"
+
+                # Copy inbox messages to shared (preserving them for Phase 2)
+                if [ -d "$OLD_INBOX" ]; then
+                    for agent_dir in "$OLD_INBOX"/*; do
+                        if [ -d "$agent_dir" ]; then
+                            for msg in "$agent_dir"/*.json; do
+                                if [ -f "$msg" ]; then
+                                    cp -n "$msg" "$SHARED_INBOX/" 2>/dev/null || true
+                                fi
+                            done
+                        fi
+                    done
+                fi
+
+                # Copy sent messages to shared
+                if [ -d "$OLD_SENT" ]; then
+                    for agent_dir in "$OLD_SENT"/*; do
+                        if [ -d "$agent_dir" ]; then
+                            for msg in "$agent_dir"/*.json; do
+                                if [ -f "$msg" ]; then
+                                    cp -n "$msg" "$SHARED_SENT/" 2>/dev/null || true
+                                fi
+                            done
+                        fi
+                    done
+                fi
+
+                # Backup old messages
+                local BACKUP_DIR="$HOME/.aimaestro/messages.backup.$(date +%Y%m%d-%H%M%S)"
+                if [ -d "$HOME/.aimaestro/messages" ]; then
+                    mv "$HOME/.aimaestro/messages" "$BACKUP_DIR"
+                    print_info "Old messages backed up to: $BACKUP_DIR"
+                fi
+                PHASE1_DONE=true
+            fi
+        fi
+    fi
+
+    # ── Phase 2: Distribute from shared to per-agent directories ──
+    # This runs regardless of Phase 1 - catches messages that were
+    # previously migrated to shared but never distributed
+    local SHARED_COUNT=0
+    if [ -d "$SHARED_INBOX" ]; then
+        SHARED_COUNT=$(find "$SHARED_INBOX" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    local SHARED_SENT_COUNT=0
+    if [ -d "$SHARED_SENT" ]; then
+        SHARED_SENT_COUNT=$(find "$SHARED_SENT" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
+    if [ "$((SHARED_COUNT + SHARED_SENT_COUNT))" -gt 0 ]; then
+        print_info "Distributing $((SHARED_COUNT + SHARED_SENT_COUNT)) messages to per-agent directories..."
+        local result
+        result=$(distribute_shared_to_per_agent)
+
+        if [ "$result" -gt 0 ] 2>/dev/null; then
+            # Backup shared messages and clean up
+            local SHARED_BACKUP="$HOME/.agent-messaging/messages.backup.$(date +%Y%m%d-%H%M%S)"
+            mv "$HOME/.agent-messaging/messages" "$SHARED_BACKUP"
+            print_info "Shared messages backed up to: $SHARED_BACKUP"
+            print_success "Messages are now in per-agent directories (~/.agent-messaging/agents/<name>/messages/)"
+        fi
+    else
+        if [ "$PHASE1_DONE" != true ]; then
+            print_info "No messages to migrate."
+        fi
+    fi
+}
+
+# Handle migrate-only mode
+if [ "$MIGRATE_ONLY" = true ]; then
+    migrate_old_messages
+    echo ""
+    print_success "Migration complete!"
+    exit 0
+fi
+
+echo "🔍 Checking prerequisites..."
+echo ""
+
+# Track what needs to be installed
+INSTALL_SCRIPTS=false
+INSTALL_SKILL=false
+PREREQUISITES_OK=true
+
+# Check curl
+print_info "Checking for curl..."
+if command -v curl &> /dev/null; then
+    print_success "curl installed"
+else
+    print_error "curl not found (required)"
+    PREREQUISITES_OK=false
+fi
+
+# Check jq
+print_info "Checking for jq..."
+if command -v jq &> /dev/null; then
+    print_success "jq installed"
+else
+    print_error "jq not found (required for AMP)"
+    echo "         Install with: brew install jq"
+    PREREQUISITES_OK=false
+fi
+
+# Check openssl
+print_info "Checking for openssl..."
+if command -v openssl &> /dev/null; then
+    OPENSSL_VERSION=$(openssl version | cut -d' ' -f2)
+    print_success "openssl installed (version $OPENSSL_VERSION)"
+else
+    print_error "openssl not found (required for cryptographic signing)"
+    PREREQUISITES_OK=false
+fi
+
+# Check tmux (optional but recommended)
+print_info "Checking for tmux..."
+if command -v tmux &> /dev/null; then
+    TMUX_VERSION=$(tmux -V | cut -d' ' -f2)
+    print_success "tmux installed (version $TMUX_VERSION)"
+else
+    print_warning "tmux not found (optional, for terminal notifications)"
+fi
+
+# Check Claude Code (optional)
+print_info "Checking for Claude Code..."
+# The native installer's ~/.local/bin/claude first: an older copy earlier on PATH can hang on --version
+# (mac-mini's Homebrew 2.0.33), and the 15 s limit keeps a broken install from stalling the updater.
+CLAUDE_BIN="$HOME/.local/bin/claude"
+[ -x "$CLAUDE_BIN" ] || CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
+if [ -n "$CLAUDE_BIN" ]; then
+    CLAUDE_VERSION=$(perl -e 'alarm 15; exec @ARGV' "$CLAUDE_BIN" --version 2>/dev/null | head -n1)
+    CLAUDE_VERSION=${CLAUDE_VERSION:-unknown}
+    print_success "Claude Code installed ($CLAUDE_VERSION)"
+    INSTALL_SKILL=true
+else
+    print_warning "Claude Code not found"
+    echo "         Skills will not be available (CLI still works)"
+    echo "         Install from: https://claude.ai/download"
+fi
+
+echo ""
+
+if [ "$PREREQUISITES_OK" = false ]; then
+    print_error "Missing required prerequisites. Please install them and try again."
+    exit 1
+fi
+
+# Migrate messages: old format → shared → per-agent directories
+# Runs if old messages exist OR if shared messages need distribution
+if [ -d "$HOME/.aimaestro/messages" ] || [ -d "$HOME/.agent-messaging/messages/inbox" ] || [ -d "$HOME/.agent-messaging/messages/sent" ]; then
+    migrate_old_messages
+fi
+
+# Ask user what to install (or auto-select in non-interactive mode)
+if [ "$NON_INTERACTIVE" = true ]; then
+    print_info "Non-interactive mode: installing scripts and skills..."
+    CHOICE=3
+else
+    echo "📦 What would you like to install?"
+    echo ""
+    echo "  1) AMP scripts only (amp-send, amp-inbox, etc.)"
+    echo "  2) Claude Code skills only (requires Claude Code)"
+    echo "  3) Both scripts and skills (recommended)"
+    echo "  4) Cancel installation"
+    echo ""
+    read -p "Enter your choice (1-4): " CHOICE
+fi
+
+case $CHOICE in
+    1)
+        INSTALL_SCRIPTS=true
+        INSTALL_SKILL=false
+        ;;
+    2)
+        INSTALL_SCRIPTS=false
+        INSTALL_SKILL=true
+        if [ -z "$CLAUDE_BIN" ]; then
+            print_error "Claude Code not found. Cannot install skills."
+            exit 1
+        fi
+        ;;
+    3)
+        INSTALL_SCRIPTS=true
+        INSTALL_SKILL=true
+        if [ -z "$CLAUDE_BIN" ]; then
+            print_warning "Claude Code not found. Will install scripts only."
+            INSTALL_SKILL=false
+        fi
+        ;;
+    4)
+        echo "Installation cancelled."
+        exit 0
+        ;;
+    *)
+        print_error "Invalid choice. Installation cancelled."
+        exit 1
+        ;;
+esac
+
+echo ""
+echo "🚀 Starting installation..."
+echo ""
+
+# Install AMP scripts
+if [ "$INSTALL_SCRIPTS" = true ]; then
+    print_info "Installing AMP scripts to ~/.local/bin/..."
+
+    # Create directory if it doesn't exist
+    mkdir -p ~/.local/bin
+
+    # Copy AMP scripts from plugin
+    SCRIPT_COUNT=0
+    for script in "$PLUGIN_DIR"/scripts/amp-*.sh "$PLUGIN_DIR"/scripts/afp-*.sh; do
+        if [ -f "$script" ]; then
+            SCRIPT_NAME=$(basename "$script")
+            install_exec "$script" ~/.local/bin
+
+            # Create symlink without .sh extension for convenience
+            # e.g., amp-init -> amp-init.sh
+            LINK_NAME="${SCRIPT_NAME%.sh}"
+            if [ "$LINK_NAME" != "$SCRIPT_NAME" ]; then
+                ln -sf "$SCRIPT_NAME" ~/.local/bin/"$LINK_NAME"
+            fi
+
+            print_success "Installed: $SCRIPT_NAME"
+            SCRIPT_COUNT=$((SCRIPT_COUNT + 1))
+        fi
+    done
+
+    echo ""
+    print_success "Installed $SCRIPT_COUNT AMP scripts (with symlinks)"
+
+    # Remove old messaging scripts that have been replaced by AMP
+    echo ""
+    print_info "Cleaning up old messaging scripts..."
+    OLD_SCRIPTS=(
+        "send-aimaestro-message.sh"
+        "check-aimaestro-messages.sh"
+        "read-aimaestro-message.sh"
+        "aimaestro-message-send.sh"
+        "aimaestro-message-check.sh"
+        "check-and-show-messages.sh"
+        "check-new-messages-arrived.sh"
+        "send-tmux-message.sh"
+        "forward-aimaestro-message.sh"
+        "reply-aimaestro-message.sh"
+        "messaging-helper.sh"
+    )
+    OLD_REMOVED=0
+    for old_script in "${OLD_SCRIPTS[@]}"; do
+        if [ -f "$HOME/.local/bin/$old_script" ]; then
+            # Safety check: only delete if script has AI Maestro header marker
+            # to avoid accidentally deleting user scripts with the same name
+            if head -5 "$HOME/.local/bin/$old_script" | grep -qi "AI Maestro" 2>/dev/null; then
+                rm -f "$HOME/.local/bin/$old_script"
+                print_success "Removed old script: $old_script"
+                OLD_REMOVED=$((OLD_REMOVED + 1))
+            else
+                print_warning "Skipped $old_script (no AI Maestro header - may be a user script)"
+            fi
+        fi
+    done
+    if [ "$OLD_REMOVED" -gt 0 ]; then
+        print_success "Removed $OLD_REMOVED old messaging script(s)"
+    else
+        echo "  No old scripts found"
+    fi
+
+    # Also install other AI Maestro tools (graph, memory, docs, agent management)
+    echo ""
+    print_info "Installing additional AI Maestro tools..."
+
+    TOOL_COUNT=0
+    for script in "$PLUGIN_DIR"/scripts/*.sh; do
+        if [ -f "$script" ]; then
+            SCRIPT_NAME=$(basename "$script")
+            # Skip old messaging scripts (they're replaced by AMP)
+            if [[ "$SCRIPT_NAME" == *"aimaestro-message"* ]] || \
+               [[ "$SCRIPT_NAME" == "check-and-show-messages.sh" ]] || \
+               [[ "$SCRIPT_NAME" == "check-new-messages-arrived.sh" ]] || \
+               [[ "$SCRIPT_NAME" == "send-tmux-message.sh" ]]; then
+                continue
+            fi
+            install_exec "$script" ~/.local/bin
+            print_success "Installed: $SCRIPT_NAME"
+            TOOL_COUNT=$((TOOL_COUNT + 1))
+        fi
+    done
+
+    echo ""
+    print_success "Installed $TOOL_COUNT additional tools (graph, memory, docs, agent management)"
+
+    # Install shell helpers
+    echo ""
+    print_info "Installing shell helpers..."
+    mkdir -p ~/.local/share/aimaestro/shell-helpers
+    if [ -f "$SCRIPT_DIR/scripts/shell-helpers/common.sh" ]; then
+        install_exec "$SCRIPT_DIR/scripts/shell-helpers/common.sh" ~/.local/share/aimaestro/shell-helpers
+        print_success "Installed: shell-helpers/common.sh"
+    fi
+
+    # Setup PATH
+    echo ""
+    print_info "Configuring PATH..."
+
+    # Dual guard: check runtime PATH and shell config marker to avoid duplicates
+    if [[ ":$PATH:" == *":$HOME/.local/bin:"* ]]; then
+        # Already in runtime PATH - no action needed
+        print_info "~/.local/bin already in PATH"
+    else
+        # Detect shell config file
+        SHELL_RC=""
+        if [ -n "$ZSH_VERSION" ] || [ "$SHELL" = "/bin/zsh" ]; then
+            SHELL_RC="$HOME/.zshrc"
+        elif [ -n "$BASH_VERSION" ] || [ "$SHELL" = "/bin/bash" ]; then
+            SHELL_RC="$HOME/.bashrc"
+        fi
+
+        if [ -n "$SHELL_RC" ] && [ -f "$SHELL_RC" ]; then
+            # Check for AI Maestro marker OR existing PATH entry to prevent duplicates
+            if grep -qF "# AI Maestro" "$SHELL_RC" 2>/dev/null || grep -qF '/.local/bin' "$SHELL_RC" 2>/dev/null; then
+                print_info "PATH already configured in $SHELL_RC"
+            else
+                echo '' >> "$SHELL_RC"
+                echo '# AI Maestro PATH (added by installer)' >> "$SHELL_RC"
+                echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_RC"
+                print_success "Added ~/.local/bin to PATH in $SHELL_RC"
+            fi
+        fi
+
+        # Also add to current session
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+fi
+
+# Install Claude Code skills
+if [ "$INSTALL_SKILL" = true ]; then
+    echo ""
+    print_info "Installing Claude Code skills to ~/.claude/skills/..."
+
+    mkdir -p ~/.claude/skills
+
+    # Skill backups live OUTSIDE ~/.claude/skills.
+    #
+    # WHY
+    #
+    # Each install copies the current skill to <skill>.backup-<timestamp> before
+    # replacing it. Those copies used to sit next to the skill, in
+    # ~/.claude/skills, which is a namespace Claude Code ENUMERATES: every backup
+    # was offered to agents as an invokable skill. By September 2026 the hosts
+    # held 313, 304 and 447 of them; pruning to two per skill (v0.38) still left
+    # 16 duplicates of the 8 AI Maestro skills on every machine, competing with
+    # the real ones for the same prompts. Measured on skill sets, duplicates and
+    # near-duplicates lower how often the right skill is chosen
+    # (docs/COST-OPTIMIZATION.md sources; coder-eval.com skill trigger study).
+    #
+    # So backups now go to ~/.aimaestro/backups/skills, two kept per skill, and
+    # any old in-place backups are moved there on the next install.
+    SKILL_BACKUP_DIR="${SKILL_BACKUP_DIR:-$HOME/.aimaestro/backups/skills}"
+    mkdir -p "$SKILL_BACKUP_DIR"
+    moved_legacy=0
+    for legacy in ~/.claude/skills/*.backup-*; do
+        [ -d "$legacy" ] || continue
+        if mv "$legacy" "$SKILL_BACKUP_DIR/" 2>/dev/null; then
+            moved_legacy=$((moved_legacy + 1))
+        else
+            rm -rf "$legacy"
+        fi
+    done
+    [ "$moved_legacy" -gt 0 ] && print_info "Moved $moved_legacy old skill backup(s) out of ~/.claude/skills to $SKILL_BACKUP_DIR"
+
+    # Keep the most recent SKILL_BACKUPS_KEEP backups of one skill, delete the rest.
+    # Sorted lexically, which is chronological: the timestamp is %Y%m%d%H%M%S.
+    prune_skill_backups() {
+        local skill="$1"
+        local keep="${SKILL_BACKUPS_KEEP:-2}"
+        local -a backups
+        # shellcheck disable=SC2207
+        backups=($(ls -1d "$SKILL_BACKUP_DIR/$skill".backup-* 2>/dev/null | sort))
+        local total=${#backups[@]}
+        [ "$total" -le "$keep" ] && return 0
+        local remove=$(( total - keep ))
+        local i
+        for (( i = 0; i < remove; i++ )); do
+            rm -rf "${backups[$i]}"
+        done
+        print_info "Pruned $remove old $skill backup(s), kept $keep"
+    }
+
+    # A renamed skill: its old folder would compete with the new one for the same prompts.
+    # Only once the new one is in place. The old folder goes to the backups, as customizations may be in it.
+    retire_skill() {
+        local old="$1" new="$2"
+        [ -d ~/.claude/skills/"$old" ] && [ -f ~/.claude/skills/"$new"/SKILL.md ] || return 0
+        if mv ~/.claude/skills/"$old" "$SKILL_BACKUP_DIR/$old.backup-$(date +%Y%m%d%H%M%S)"; then
+            print_info "Skill $old is now $new; the old one is in the backups"
+            prune_skill_backups "$old"
+        fi
+    }
+
+    # Install AMP messaging skill from plugin
+    if [ -d "$PLUGIN_DIR/skills/agent-messaging" ]; then
+        SKILL_INSTALL_OK=true
+        # Back up existing skill before replacing (preserves user customizations)
+        if [ -d ~/.claude/skills/agent-messaging ]; then
+            if ! cp -r ~/.claude/skills/agent-messaging "$SKILL_BACKUP_DIR/agent-messaging.backup-$(date +%Y%m%d%H%M%S)" 2>/dev/null; then
+                print_warning "Backup failed for agent-messaging skill, skipping install (existing skill preserved)"
+                SKILL_INSTALL_OK=false
+            fi
+        fi
+
+        if [ "$SKILL_INSTALL_OK" = true ]; then
+            # Copy new version to temp location first, then swap (safe against cp failure)
+            TEMP_SKILL_DIR=$(mktemp -d "$SKILL_BACKUP_DIR/agent-messaging.tmp.XXXXXX")
+            if cp -r "$PLUGIN_DIR/skills/agent-messaging/." "$TEMP_SKILL_DIR/"; then
+                # Copy succeeded - remove old and rename temp to final
+                rm -rf ~/.claude/skills/agent-messaging
+                mv "$TEMP_SKILL_DIR" ~/.claude/skills/agent-messaging
+                print_success "Installed: agent-messaging skill (AMP protocol)"
+
+                if [ -f ~/.claude/skills/agent-messaging/SKILL.md ]; then
+                    SKILL_SIZE=$(wc -c < ~/.claude/skills/agent-messaging/SKILL.md)
+                    print_success "Skill file verified (${SKILL_SIZE} bytes)"
+                fi
+
+                # Only after the new skill is in place — never prune a rollback
+                # we might still need.
+                prune_skill_backups agent-messaging
+            else
+                # Copy failed - clean up temp, restore backup if we made one
+                rm -rf "$TEMP_SKILL_DIR"
+                if [ ! -d ~/.claude/skills/agent-messaging ]; then
+                    # Original was removed somehow, restore from latest backup
+                    LATEST_BACKUP=$(ls -1d "$SKILL_BACKUP_DIR"/agent-messaging.backup-* 2>/dev/null | tail -1)
+                    if [ -n "$LATEST_BACKUP" ]; then
+                        mv "$LATEST_BACKUP" ~/.claude/skills/agent-messaging
+                        print_warning "Install failed, restored agent-messaging from backup"
+                    fi
+                fi
+                print_error "Failed to install agent-messaging skill"
+            fi
+        fi
+    else
+        print_error "AMP messaging skill not found in plugin"
+    fi
+
+    # Install all other AI Maestro skills (auto-discovered from plugin)
+    for skill_dir in "$PLUGIN_DIR"/skills/*/; do
+        [ -d "$skill_dir" ] || continue
+        skill=$(basename "$skill_dir")
+        # agent-messaging already installed above
+        [ "$skill" = "agent-messaging" ] && continue
+        if [ -d "$PLUGIN_DIR/skills/$skill" ]; then
+            SKILL_INSTALL_OK=true
+            # Back up existing skill before replacing (preserves user customizations)
+            if [ -d ~/.claude/skills/"$skill" ]; then
+                if ! cp -r ~/.claude/skills/"$skill" "$SKILL_BACKUP_DIR/$skill.backup-$(date +%Y%m%d%H%M%S)" 2>/dev/null; then
+                    print_warning "Backup failed for $skill skill, skipping install (existing skill preserved)"
+                    SKILL_INSTALL_OK=false
+                fi
+            fi
+
+            if [ "$SKILL_INSTALL_OK" = true ]; then
+                # Copy new version to temp location first, then swap (safe against cp failure)
+                TEMP_SKILL_DIR=$(mktemp -d "$SKILL_BACKUP_DIR/$skill.tmp.XXXXXX")
+                if cp -r "$PLUGIN_DIR/skills/$skill/." "$TEMP_SKILL_DIR/"; then
+                    # Copy succeeded - remove old and rename temp to final
+                    rm -rf ~/.claude/skills/"$skill"
+                    mv "$TEMP_SKILL_DIR" ~/.claude/skills/"$skill"
+                    print_success "Installed: $skill skill"
+                    prune_skill_backups "$skill"
+                else
+                    # Copy failed - clean up temp, restore backup if needed
+                    rm -rf "$TEMP_SKILL_DIR"
+                    if [ ! -d ~/.claude/skills/"$skill" ]; then
+                        LATEST_BACKUP=$(ls -1d "$SKILL_BACKUP_DIR/$skill".backup-* 2>/dev/null | tail -1)
+                        if [ -n "$LATEST_BACKUP" ]; then
+                            mv "$LATEST_BACKUP" ~/.claude/skills/"$skill"
+                            print_warning "Install failed for $skill, restored from backup"
+                        fi
+                    fi
+                    print_error "Failed to install $skill skill"
+                fi
+            fi
+        fi
+    done
+
+    retire_skill canvas-actions agent-actions
+fi
+
+echo ""
+echo "🧪 Verifying installation..."
+echo ""
+
+# Verify AMP scripts
+if [ "$INSTALL_SCRIPTS" = true ]; then
+    print_info "Checking AMP scripts..."
+
+    SCRIPTS_OK=true
+
+    for script_path in "$PLUGIN_DIR"/scripts/amp-*.sh "$PLUGIN_DIR"/scripts/afp-*.sh; do
+        [ -f "$script_path" ] || continue
+        script=$(basename "$script_path")
+        if [ -x ~/.local/bin/"$script" ]; then
+            print_success "$script"
+        else
+            print_error "$script not found"
+            SCRIPTS_OK=false
+        fi
+    done
+
+    echo ""
+    if command -v amp-init.sh &> /dev/null; then
+        print_success "AMP scripts accessible in PATH"
+    else
+        print_warning "Restart terminal or run: source ~/.zshrc (or ~/.bashrc)"
+    fi
+fi
+
+# Verify skills
+if [ "$INSTALL_SKILL" = true ]; then
+    echo ""
+    print_info "Checking installed skills..."
+
+    for skill_dir in "$PLUGIN_DIR"/skills/*/; do
+        [ -d "$skill_dir" ] || continue
+        skill=$(basename "$skill_dir")
+        if [ -f ~/.claude/skills/"$skill"/SKILL.md ]; then
+            print_success "$skill"
+        else
+            print_warning "$skill not found"
+        fi
+    done
+fi
+
+# Install Claude Code status line (shows agent identity + unread count)
+if [ "$INSTALL_SCRIPTS" = true ] && command -v amp-statusline.sh &> /dev/null; then
+    echo ""
+    print_info "Configuring Claude Code status line..."
+    if amp-statusline.sh --install 2>/dev/null; then
+        print_success "Status line configured (shows agent identity + unread messages)"
+    else
+        print_warning "Status line setup skipped (run 'amp-statusline.sh --install' manually)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Claude Code permissions for the AMP read-and-respond loop (issue #337)
+# ---------------------------------------------------------------------------
+#
+# Without these, Claude Code asks for approval every single time an agent runs
+# amp-inbox.sh or amp-read.sh. That is not merely annoying — it BLOCKS the
+# subconscious inbox poll, because the injected "check your inbox" prompt makes
+# the agent try to run a command it then cannot run unattended. Messages sit
+# unread behind a dialog nobody is watching.
+#
+# What is allowed, and what deliberately is not:
+#
+#   allowed   inbox, read, reply, send, download, status, fetch, identity
+#             — the routine loop an agent must complete without a human
+#   NOT       amp-init.sh, amp-register.sh — these mutate the agent's identity,
+#             and after the identity defects fixed in 0.37.13 that is a boundary
+#             worth keeping a human on
+#   NOT       amp-delete.sh — deleting mail is irreversible, and losing messages
+#             is the exact failure this release cycle has been about
+#
+# Each command is allowed in three invocation forms, because agents are launched
+# in different ways: bare, and with the CLAUDE_AGENT_NAME= or AMP_DIR= prefix
+# that AI Maestro's launcher and the detached-session hint use. An allow rule
+# does not match past an assignment of a variable Claude Code doesn't know is
+# safe, so the prefixed forms need their own rules.
+#
+# Rule syntax: the prefixed forms used to be written `Bash(AMP_DIR=* cmd:*)`.
+# The `:*` suffix can't be combined with another `*` (the `*` is then read
+# literally), so those rules never matched anything, and Claude Code printed a
+# warning for each of the 16 on every session start. The space form allows `*`
+# anywhere; it needs one rule without arguments and one with, because a
+# trailing ` *` only also matches the bare command when it is the rule's only
+# wildcard (code.claude.com/docs/en/permissions, "Wildcard patterns").
+configure_amp_permissions() {
+    local settings="$HOME/.claude/settings.json"
+    local cmds=(amp-inbox.sh amp-read.sh amp-reply.sh amp-send.sh amp-download.sh amp-status.sh amp-fetch.sh amp-identity.sh)
+
+    # AFP (agent-files): only the commands that read. put, rm and config change
+    # state and stay behind the usual prompt.
+    local afp_cmds=(afp-ls.sh afp-get.sh afp-link.sh afp-capabilities.sh)
+
+    local entries=() legacy=()
+    for c in "${afp_cmds[@]}"; do
+        entries+=("Bash(${c}:*)")
+    done
+    for c in "${cmds[@]}"; do
+        entries+=("Bash(${c}:*)")
+        for v in CLAUDE_AGENT_NAME AMP_DIR; do
+            entries+=("Bash(${v}=* ${c})" "Bash(${v}=* ${c} *)")
+            legacy+=("Bash(${v}=* ${c}:*)")
+        done
+    done
+
+    # Remove the old rules that never matched, from this file and from the
+    # project settings in the current directory, without asking: they grant
+    # nothing, and each one prints a warning on every session start.
+    local f
+    for f in "$settings" "$PWD/.claude/settings.local.json" "$PWD/.claude/settings.json"; do
+        [ -f "$f" ] || continue
+        node -e "
+            const fs=require('fs'); const file=process.argv[1]; const bad=new Set(process.argv.slice(2));
+            let s; try { s = JSON.parse(fs.readFileSync(file,'utf8')); } catch (_) { process.exit(0); }
+            const allow = (s.permissions && s.permissions.allow) || [];
+            const kept = allow.filter(a => !bad.has(a));
+            if (kept.length === allow.length) process.exit(0);
+            fs.copyFileSync(file, file + '.bak-' + Date.now());
+            s.permissions.allow = kept;
+            fs.writeFileSync(file, JSON.stringify(s, null, 2) + '\n');
+            console.log('Removed ' + (allow.length - kept.length) + ' invalid AMP permission rule(s) from ' + file);
+        " "$f" "${legacy[@]}" 2>/dev/null || true
+    done
+
+    # What is genuinely missing? Re-running the installer must not re-ask.
+    local missing=()
+    for e in "${entries[@]}"; do
+        if [ -f "$settings" ] && node -e "
+            const fs=require('fs');
+            let s={}; try { s = JSON.parse(fs.readFileSync(process.argv[1],'utf8')); } catch (_) {}
+            const allow = (s.permissions && s.permissions.allow) || [];
+            process.exit(allow.includes(process.argv[2]) ? 0 : 1);
+        " "$settings" "$e" 2>/dev/null; then
+            continue
+        fi
+        missing+=("$e")
+    done
+
+    if [ ${#missing[@]} -eq 0 ]; then
+        print_success "AMP permissions already configured (${#entries[@]} entries)"
+        return 0
+    fi
+
+    echo ""
+    print_info "Claude Code asks for approval every time an agent runs an AMP command."
+    echo "  That blocks the subconscious inbox poll, so messages sit unread behind a"
+    echo "  dialog nobody is watching."
+    echo ""
+    echo "  ${#missing[@]} permission entries would be added to ${settings}:"
+    echo "    amp-inbox, amp-read, amp-reply, amp-send, amp-download, amp-status, amp-fetch, amp-identity"
+    echo ""
+    echo "  NOT included, on purpose: amp-init and amp-register (they change the"
+    echo "  agent's identity) and amp-delete (deleting mail is irreversible)."
+    echo ""
+
+    if [ "$NON_INTERACTIVE" != true ]; then
+        read -r -p "  Add these permissions? [Y/n] " reply
+        case "$reply" in
+            [Nn]*)
+                print_warning "Skipped. Agents will prompt on every AMP command."
+                echo "  Re-run this installer, or add them by hand under permissions.allow"
+                return 0
+                ;;
+        esac
+    fi
+
+    mkdir -p "$(dirname "$settings")"
+    [ -f "$settings" ] && cp "$settings" "${settings}.bak-$(date +%Y%m%d%H%M%S)"
+
+    # Merge structurally. A sed/append would corrupt the file or duplicate
+    # entries, and this file also holds the Stop hook that delivers messages to
+    # detached agents — breaking it would silence them entirely.
+    if node -e "
+        const fs = require('fs');
+        const file = process.argv[1];
+        const add = process.argv.slice(2);
+        let s = {};
+        if (fs.existsSync(file)) {
+            try { s = JSON.parse(fs.readFileSync(file, 'utf8')); }
+            catch (e) { console.error('settings.json is not valid JSON: ' + e.message); process.exit(1); }
+        }
+        s.permissions = s.permissions || {};
+        const allow = new Set(s.permissions.allow || []);
+        for (const a of add) allow.add(a);
+        s.permissions.allow = [...allow];
+        fs.writeFileSync(file, JSON.stringify(s, null, 2) + '\n');
+    " "$settings" "${missing[@]}"; then
+        print_success "Added ${#missing[@]} AMP permission entries to settings.json"
+    else
+        print_warning "Could not update ${settings} — add the entries by hand"
+    fi
+}
+
+if [ "$INSTALL_SCRIPTS" = true ]; then
+    configure_amp_permissions
+fi
+
+echo ""
+echo "╔════════════════════════════════════════════════════════════════╗"
+echo "║                    Installation Complete!                      ║"
+echo "╚════════════════════════════════════════════════════════════════╝"
+echo ""
+
+# Show next steps
+echo -e "${CYAN}📚 Getting Started with AMP${NC}"
+echo ""
+
+if [ "$INSTALL_SCRIPTS" = true ]; then
+    echo "1️⃣  Initialize your agent identity (first time only):"
+    echo ""
+    echo "   $ amp-init.sh --auto"
+    echo ""
+    echo "2️⃣  Send a message to another agent:"
+    echo ""
+    echo "   $ amp-send.sh alice \"Hello\" \"How are you?\""
+    echo ""
+    echo "3️⃣  Check your inbox:"
+    echo ""
+    echo "   $ amp-inbox.sh"
+    echo ""
+    echo "4️⃣  Read a message:"
+    echo ""
+    echo "   $ amp-read.sh <message-id>"
+    echo ""
+fi
+
+if [ "$INSTALL_SKILL" = true ]; then
+    echo "5️⃣  Or use natural language with Claude Code:"
+    echo ""
+    echo "   > \"Check my messages\"              (AMP messaging)"
+    echo "   > \"Show me a test results dashboard\" (AAP canvas)"
+    echo "   > \"Visualize the API coverage\"       (AAP canvas)"
+    echo ""
+fi
+
+echo "📖 Documentation:"
+echo ""
+echo "   AI Maestro:   https://getaimaestro.com"
+echo "   AMP Protocol: https://agentmessaging.org"
+echo "   AID Protocol: https://agentids.org"
+echo "   AAP Protocol: https://agentactions.org"
+echo ""
+
+# External provider registration (optional)
+echo -e "${CYAN}🌐 Optional: Connect to External Providers${NC}"
+echo ""
+echo "   To send messages to agents outside your local network:"
+echo ""
+echo "   $ amp-register.sh --provider crabmail.ai --tenant mycompany"
+echo ""
+
+if [ "$INSTALL_SCRIPTS" = true ] && ! command -v amp-init.sh &> /dev/null; then
+    echo ""
+    print_warning "Remember to restart your terminal or run: source ~/.zshrc (or ~/.bashrc)"
+fi
+
+echo ""
+echo "🎉 Happy agent messaging!"
+echo ""

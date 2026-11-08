@@ -1,0 +1,103 @@
+/**
+ * One rule for what an agent is doing, shared by every view
+ * (lib/agent-presence.ts): green working, orange needs you, yellow ready,
+ * grey offline. Before, green meant "working" in the sidebar and "ready" in
+ * the chat, and a minute of idleness showed as "waiting".
+ */
+
+import { describe, it, expect } from 'vitest'
+import { presenceFrom, hookNeedsYou, PRESENCE_STYLE, normalizeActivityStatus } from '@/lib/agent-presence'
+import { avatarStateForPresence, avatarStateFrom } from '@/components/LiveAvatar'
+
+describe('hookNeedsYou', () => {
+  it('is a real block: an approval or an open question', () => {
+    expect(hookNeedsYou('permission_request')).toBe(true)
+    expect(hookNeedsYou('waiting_for_input', 'permission_prompt')).toBe(true)
+    expect(hookNeedsYou('waiting_for_input', 'elicitation_dialog')).toBe(true)
+  })
+  it('is not "still idle after a minute" (Claude Code idle_prompt) nor a finished turn', () => {
+    expect(hookNeedsYou('waiting_for_input', 'idle_prompt')).toBe(false)
+    expect(hookNeedsYou('idle')).toBe(false)
+    expect(hookNeedsYou('active')).toBe(false)
+  })
+})
+
+describe('presenceFrom', () => {
+  it('maps each situation to one presence', () => {
+    expect(presenceFrom({ online: false })).toBe('offline')
+    expect(presenceFrom({ online: true, activity: 'active' })).toBe('working')
+    expect(presenceFrom({ online: true, hookStatus: 'working' })).toBe('working')
+    expect(presenceFrom({ online: true, hookStatus: 'permission_request' })).toBe('needs-you')
+    expect(presenceFrom({ online: true, activity: 'waiting' })).toBe('needs-you')
+    expect(presenceFrom({ online: true, activity: 'idle' })).toBe('ready')
+    expect(presenceFrom({ online: true, activity: 'waiting', hookStatus: 'waiting_for_input', notificationType: 'idle_prompt' })).toBe('ready')
+  })
+
+  it('uses distinct colours: green, orange, yellow, grey', () => {
+    expect(PRESENCE_STYLE.working.dot).toContain('emerald')
+    expect(PRESENCE_STYLE['needs-you'].dot).toContain('orange')
+    expect(PRESENCE_STYLE.ready.dot).toContain('yellow')
+    expect(PRESENCE_STYLE.offline.dot).toContain('gray')
+    expect(PRESENCE_STYLE.ready.dot).not.toContain('animate-pulse') // ready is steady
+  })
+})
+
+describe('the avatar follows the same presence', () => {
+  it('plays the matching loop', () => {
+    expect(avatarStateForPresence('working')).toBe('working')
+    expect(avatarStateForPresence('needs-you')).toBe('waiting')
+    expect(avatarStateForPresence('ready')).toBe('idle')
+    expect(avatarStateForPresence('offline')).toBe('sleeping')
+    expect(avatarStateFrom({ online: true, activity: 'waiting', hookStatus: 'waiting_for_input', notificationType: 'idle_prompt' })).toBe('idle')
+  })
+})
+
+describe('normalizeActivityStatus (every broadcast goes through it)', () => {
+  it('turns raw hook words into the sidebar vocabulary', () => {
+    expect(normalizeActivityStatus('waiting_for_input', 'permission_prompt')).toBe('waiting')
+    expect(normalizeActivityStatus('waiting_for_input', 'idle_prompt')).toBe('idle')
+    expect(normalizeActivityStatus('permission_request')).toBe('waiting')
+    expect(normalizeActivityStatus('active')).toBe('active')
+    expect(normalizeActivityStatus('working')).toBe('active')
+    expect(normalizeActivityStatus('idle')).toBe('idle')
+    expect(normalizeActivityStatus('waiting')).toBe('waiting')
+  })
+
+  it('reads a raw word that reached the sidebar anyway (older server) correctly', () => {
+    // The Titania case: header said "Needs you", sidebar said "Ready"
+    expect(presenceFrom({ online: true, activity: 'waiting_for_input', notificationType: 'permission_prompt' })).toBe('needs-you')
+    expect(presenceFrom({ online: true, activity: 'permission_request' })).toBe('needs-you')
+    expect(presenceFrom({ online: true, activity: 'waiting_for_input', notificationType: 'idle_prompt' })).toBe('ready')
+  })
+})
+
+describe('transcriptResumedSince (fallback for hosts without the PostToolBatch hook)', () => {
+  it('is true only when the transcript grew well after the block was reported', async () => {
+    const fs = await import('fs'); const os = await import('os'); const path = await import('path')
+    const { transcriptResumedSince } = await import('@/services/sessions-service')
+    const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'resume-')), 't.jsonl')
+    fs.writeFileSync(f, '{}')
+    const now = Date.now()
+    fs.utimesSync(f, new Date(now), new Date(now))
+    expect(transcriptResumedSince(f, now - 60_000)).toBe(true)   // written a minute after the block
+    expect(transcriptResumedSince(f, now - 1_000)).toBe(false)   // within the margin: not proof
+    expect(transcriptResumedSince(undefined, now)).toBe(false)
+    expect(transcriptResumedSince('/nope/none.jsonl', 0)).toBe(false)
+  })
+})
+
+describe('presenceFromActivity: the one mapping every view uses', () => {
+  it('reads an agent by session name, then by id, with the full hook detail', async () => {
+    const { presenceFromActivity } = await import('@/hooks/useSessionActivity')
+    const activity: any = {
+      'api-jarvis': { status: 'active', lastActivity: '' },
+      'b-id': { status: 'waiting', hookStatus: 'waiting_for_input', notificationType: 'permission_prompt', lastActivity: '' },
+    }
+    const online = { status: 'online' }
+    expect(presenceFromActivity(activity, { name: 'api-jarvis', id: 'a-id', session: online })).toBe('working')
+    expect(presenceFromActivity(activity, { name: 'other', id: 'b-id', session: online })).toBe('needs-you')
+    expect(presenceFromActivity(activity, { name: 'nobody', id: 'x', session: online })).toBe('ready')
+    expect(presenceFromActivity(activity, { name: 'api-jarvis', id: 'a-id', session: { status: 'offline' } })).toBe('offline')
+    expect(presenceFromActivity(activity, { name: 'api-jarvis' }, { online: true })).toBe('working')
+  })
+})
